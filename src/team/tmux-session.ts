@@ -234,7 +234,11 @@ export function mitigateCopyModeUnderlineArtifacts(sessionTarget: string): boole
 }
 
 export function hasCurrentTmuxClientContext(): boolean {
-  const tmuxPaneTarget = process.env.TMUX_PANE?.trim();
+  const rawTmuxPaneTarget = process.env.TMUX_PANE?.trim();
+  const tmuxPaneTarget = rawTmuxPaneTarget
+    ? parseCanonicalTmuxPaneId(rawTmuxPaneTarget)
+    : null;
+  if (rawTmuxPaneTarget && !tmuxPaneTarget) return false;
   const displayArgs = tmuxPaneTarget
     ? ['display-message', '-p', '-t', tmuxPaneTarget, '#{session_name}:#{window_index} #{pane_id}']
     : ['display-message', '-p', '#{session_name}:#{window_index} #{pane_id}'];
@@ -242,7 +246,7 @@ export function hasCurrentTmuxClientContext(): boolean {
   if (!context.ok) return false;
   const [sessionAndWindow = '', detectedLeaderPaneId = ''] = context.stdout.split(' ');
   const [sessionName, windowIndex] = sessionAndWindow.split(':');
-  return Boolean(sessionName && windowIndex && detectedLeaderPaneId.startsWith('%'));
+  return Boolean(sessionName && windowIndex && parseCanonicalTmuxPaneId(detectedLeaderPaneId));
 }
 
 export function isMsysOrGitBash(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): boolean {
@@ -303,24 +307,74 @@ export function listPaneIds(target: string): string[] {
   return listPanes(target).map((pane) => pane.paneId);
 }
 
-function paneExistsInTarget(target: string, paneId: string): boolean {
-  if (!paneId.startsWith('%')) return false;
-  return listPaneIds(target).includes(paneId);
+function readGlobalTmuxPaneIdSnapshot(): Set<string> | null {
+  const result = runTmux(['list-panes', '-a', '-F', '#{pane_id}']);
+  if (!result.ok) return null;
+
+  const paneIds = new Set<string>();
+  for (const line of result.stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const paneId = parseCanonicalTmuxPaneId(trimmed);
+    if (!paneId || paneIds.has(paneId)) return null;
+    paneIds.add(paneId);
+  }
+  return paneIds;
 }
 
-function waitForPaneToRemainPresent(
-  target: string,
+// psmux parses `%<digits>` targets into Rust `usize`. Its binary architecture
+// is not observable through tmux output, so accept only the canonical 32-bit
+// subset that round-trips on every supported `usize` width. This prevents a
+// failed parse from degrading a targeted pane kill to the active pane.
+const PSMUX_PANE_ID_MAX = 0xffff_ffffn;
+const PSMUX_PANE_ID_MAX_DIGITS = PSMUX_PANE_ID_MAX.toString().length;
+
+function parseCanonicalTmuxPaneId(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const paneId = value.trim();
+  const match = /^%(0|[1-9]\d*)$/.exec(paneId);
+  if (!match || match[1].length > PSMUX_PANE_ID_MAX_DIGITS) return null;
+
+  try {
+    return BigInt(match[1]) <= PSMUX_PANE_ID_MAX ? paneId : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPaneLiveInStrictGlobalProbe(paneId: string): boolean {
+  if (!parseCanonicalTmuxPaneId(paneId)) return false;
+  const result = runTmux(['list-panes', '-a', '-F', '#{pane_id} #{pane_dead}']);
+  if (!result.ok) return false;
+
+  let exactMatches = 0;
+  let isLive = false;
+  for (const line of result.stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = /^(%\d+) ([01])$/.exec(trimmed);
+    if (!match) return false;
+    const observedPaneId = parseCanonicalTmuxPaneId(match[1]);
+    if (!observedPaneId) return false;
+    if (observedPaneId !== paneId) continue;
+    exactMatches += 1;
+    isLive = match[2] === '0';
+  }
+  return exactMatches === 1 && isLive;
+}
+
+function waitForPaneToRemainStrictlyLive(
   paneId: string,
   timeoutMs: number = TMUX_PANE_STABILITY_TIMEOUT_MS,
 ): boolean {
-  if (!paneId.startsWith('%')) return false;
+  if (!parseCanonicalTmuxPaneId(paneId)) return false;
 
   const stablePollsRequired = Math.max(1, TMUX_PANE_STABILITY_POLLS_REQUIRED);
   const startedAt = Date.now();
   let stablePolls = 0;
 
   while (Date.now() - startedAt <= timeoutMs) {
-    if (paneExistsInTarget(target, paneId)) {
+    if (isPaneLiveInStrictGlobalProbe(paneId)) {
       stablePolls += 1;
       if (stablePolls >= stablePollsRequired) return true;
     } else {
@@ -333,6 +387,30 @@ function waitForPaneToRemainPresent(
   }
 
   return false;
+}
+
+function approveNewTmuxPaneId(
+  rawPaneOutput: string | null | undefined,
+  leaderPaneId: string,
+  preSplitPaneIds: ReadonlySet<string>,
+  operationCreatedPaneIds: ReadonlySet<string>,
+  rejectPreExisting: boolean,
+): string | null {
+  const outputLines = typeof rawPaneOutput === 'string'
+    ? rawPaneOutput.split('\n').map((line) => line.trim()).filter(Boolean)
+    : [];
+  const paneId = outputLines.length === 1 ? parseCanonicalTmuxPaneId(outputLines[0]) : null;
+  if (
+    !paneId
+    || paneId === leaderPaneId
+    || (rejectPreExisting && (
+      operationCreatedPaneIds.has(paneId)
+      || preSplitPaneIds.has(paneId)
+    ))
+  ) {
+    return null;
+  }
+  return paneId;
 }
 
 function isHudWatchPane(pane: TmuxPaneInfo): boolean {
@@ -553,21 +631,38 @@ function shellQuoteSingle(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function hudEnvValues(
+  env: NodeJS.ProcessEnv = process.env,
+  owner: { sessionId?: string | null; leaderPaneId?: string | null } = {},
+): Array<[string, string]> {
+  const sessionId = (owner.sessionId ?? '').trim();
+  const leaderPaneId = (owner.leaderPaneId ?? '').trim();
+  return [
+    ...(sessionId ? [['OMX_SESSION_ID', sessionId] as [string, string]] : []),
+    [OMX_TMUX_HUD_OWNER_ENV, '1'] as [string, string],
+    ...(leaderPaneId ? [[OMX_TMUX_HUD_LEADER_PANE_ENV, leaderPaneId] as [string, string]] : []),
+    ...(typeof env.OMX_ROOT === 'string' && env.OMX_ROOT.trim() !== ''
+      ? [['OMX_ROOT', env.OMX_ROOT] as [string, string]]
+      : []),
+  ];
+}
+
 function formatHudEnvAssignments(
   env: NodeJS.ProcessEnv = process.env,
   owner: { sessionId?: string | null; leaderPaneId?: string | null } = {},
 ): string {
-  const sessionId = (owner.sessionId ?? '').trim();
-  const leaderPaneId = (owner.leaderPaneId ?? '').trim();
-  const assignments = [
-    sessionId ? `OMX_SESSION_ID=${shellQuoteSingle(sessionId)}` : '',
-    `${OMX_TMUX_HUD_OWNER_ENV}=1`,
-    leaderPaneId ? `${OMX_TMUX_HUD_LEADER_PANE_ENV}=${shellQuoteSingle(leaderPaneId)}` : '',
-    ...(typeof env.OMX_ROOT === 'string' && env.OMX_ROOT.trim() !== ''
-      ? [`OMX_ROOT=${shellQuoteSingle(env.OMX_ROOT)}`]
-      : []),
-  ].filter(Boolean);
-  return assignments.join(' ');
+  return hudEnvValues(env, owner)
+    .map(([key, value]) => key === OMX_TMUX_HUD_OWNER_ENV ? `${key}=1` : `${key}=${shellQuoteSingle(value)}`)
+    .join(' ');
+}
+
+function formatPowerShellHudEnvAssignments(
+  env: NodeJS.ProcessEnv = process.env,
+  owner: { sessionId?: string | null; leaderPaneId?: string | null } = {},
+): string {
+  return hudEnvValues(env, owner)
+    .map(([key, value]) => `$env:${key} = ${quotePowerShellArg(value)}`)
+    .join('; ');
 }
 
 function quotePowerShellArg(value: string): string {
@@ -600,6 +695,38 @@ function resolveNativeWindowsPowerShellPath(env: NodeJS.ProcessEnv = process.env
     ?? existingCandidates[0]
     ?? resolvedFromPath
     ?? 'powershell.exe';
+}
+
+export interface HudStartupCommandOptions {
+  omxEntry: string;
+  sessionId?: string | null;
+  leaderPaneId?: string | null;
+  /** Omit for the Team mode's existing bare-node POSIX command shape. */
+  nodePath?: string | null;
+  env?: NodeJS.ProcessEnv;
+  /** Test seam; production callers rely on native-platform detection. */
+  nativeWindows?: boolean;
+}
+
+export function buildHudStartupCommand(options: HudStartupCommandOptions): string {
+  const env = options.env ?? process.env;
+  const owner = { sessionId: options.sessionId, leaderPaneId: options.leaderPaneId };
+  const omxEntry = translatePathForMsys(options.omxEntry);
+  const configuredNodePath = options.nodePath?.trim() ?? '';
+  const nativeWindows = options.nativeWindows ?? isNativeWindows();
+
+  if (nativeWindows) {
+    const nodePath = translatePathForMsys(configuredNodePath || resolveLeaderNodePath());
+    return [
+      formatPowerShellHudEnvAssignments(env, owner),
+      `& ${quotePowerShellArg(nodePath)} ${quotePowerShellArg(omxEntry)} hud --watch`,
+    ].filter(Boolean).join('; ');
+  }
+
+  const nodeCommand = configuredNodePath
+    ? shellQuoteSingle(translatePathForMsys(configuredNodePath))
+    : 'node';
+  return `exec env ${formatHudEnvAssignments(env, owner)} ${nodeCommand} ${shellQuoteSingle(omxEntry)} hud --watch`;
 }
 
 function normalizeTmuxHookToken(value: string): string {
@@ -1611,9 +1738,18 @@ export function createTeamSession(
   const safeTeamName = sanitizeTeamName(teamName);
   let registeredResizeHook: { name: string; target: string } | null = null;
   let registeredClientAttachedHook: { name: string; target: string } | null = null;
+  let rollbackLeaderPaneId: string | null = null;
+  const rollbackPreExistingPaneIds = new Set<string>();
+  const operationCreatedPaneIds = new Set<string>();
   const rollbackPaneIds: string[] = [];
   try {
-    const tmuxPaneTarget = process.env.TMUX_PANE;
+    const rawTmuxPaneTarget = process.env.TMUX_PANE?.trim();
+    const tmuxPaneTarget = rawTmuxPaneTarget
+      ? parseCanonicalTmuxPaneId(rawTmuxPaneTarget)
+      : null;
+    if (rawTmuxPaneTarget && !tmuxPaneTarget) {
+      throw new Error(`refusing non-canonical TMUX_PANE target: ${rawTmuxPaneTarget}`);
+    }
     const displayArgs = tmuxPaneTarget
       ? ['display-message', '-p', '-t', tmuxPaneTarget, '#{session_name}:#{window_index} #{pane_id}']
       : ['display-message', '-p', '#{session_name}:#{window_index} #{pane_id}'];
@@ -1624,7 +1760,7 @@ export function createTeamSession(
     }
     const [sessionAndWindow = '', detectedLeaderPaneId = ''] = context.stdout.split(' ');
     const [sessionName, windowIndex] = (sessionAndWindow || '').split(':');
-    if (!sessionName || !windowIndex || !detectedLeaderPaneId || !detectedLeaderPaneId.startsWith('%')) {
+    if (!sessionName || !windowIndex || !parseCanonicalTmuxPaneId(detectedLeaderPaneId)) {
       throw new Error(`failed to parse current tmux target: ${context.stdout}`);
     }
     const teamTarget = `${sessionName}:${windowIndex}`;
@@ -1637,16 +1773,45 @@ export function createTeamSession(
       }
     }
     const panes = listPanes(teamTarget);
-    const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
+    if (
+      isNativeWindows()
+      && !panes.some((pane) => parseCanonicalTmuxPaneId(pane.paneId) === parseCanonicalTmuxPaneId(detectedLeaderPaneId))
+    ) {
+      throw new Error('failed to snapshot the current native Windows tmux target before team creation');
+    }
+    const selectedLeaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
+    const leaderPaneId = parseCanonicalTmuxPaneId(selectedLeaderPaneId);
+    if (!leaderPaneId) throw new Error(`failed to select a canonical team leader pane: ${selectedLeaderPaneId}`);
+    rollbackLeaderPaneId = leaderPaneId;
+    for (const pane of panes) {
+      const initialPaneId = parseCanonicalTmuxPaneId(pane.paneId);
+      if (!initialPaneId) throw new Error(`failed to snapshot canonical tmux pane id: ${pane.paneId}`);
+      rollbackPreExistingPaneIds.add(initialPaneId);
+    }
+    if (isNativeWindows()) {
+      const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
+      if (!globalPaneIds || !globalPaneIds.has(leaderPaneId)) {
+        throw new Error('failed to snapshot global tmux pane ids before native Windows team creation');
+      }
+      for (const paneId of globalPaneIds) rollbackPreExistingPaneIds.add(paneId);
+    }
     tagPaneInstance(leaderPaneId, ownerSessionId);
     tagPaneTeamOwner(leaderPaneId, teamPaneOwnerId);
-    const initialHudPaneIds = findHudPaneIds(teamTarget, leaderPaneId);
+    const initialHudPaneCandidates = findHudPaneIds(teamTarget, leaderPaneId);
     const omxEntry = resolveOmxCliEntryPath();
     const canRecreateTeamHud = Boolean(omxEntry && omxEntry.trim() !== '');
     // Team mode prioritizes leader + worker visibility. Remove HUD panes only
     // when we can recreate the team HUD. Otherwise keep the existing HUD alive
     // instead of making it disappear on team startup failures or broken installs.
     if (canRecreateTeamHud) {
+      const initialHudPaneIds: string[] = [];
+      for (const candidate of initialHudPaneCandidates) {
+        const hudPaneId = parseCanonicalTmuxPaneId(candidate);
+        if (!hudPaneId) {
+          throw new Error(`failed to validate initial team HUD pane id: ${candidate}`);
+        }
+        initialHudPaneIds.push(hudPaneId);
+      }
       for (const hudPaneId of initialHudPaneIds) {
         runTmux(['kill-pane', '-t', hudPaneId]);
       }
@@ -1680,6 +1845,7 @@ export function createTeamSession(
         startup.initialPrompt,
         startup.workerRole,
       );
+
       // First split creates the right side from leader. Remaining splits stack on the right.
       const splitDirection = i === 1 ? '-h' : '-v';
       const splitTarget = i === 1 ? leaderPaneId : (rightStackRootPaneId ?? leaderPaneId);
@@ -1699,12 +1865,19 @@ export function createTeamSession(
       if (!split.ok) {
         throw new Error(`failed to create worker pane ${i}: ${split.stderr}`);
       }
-      const paneId = split.stdout.split('\n')[0]?.trim();
-      if (!paneId || !paneId.startsWith('%')) {
-        throw new Error(`failed to capture worker pane id for worker ${i}`);
+      const paneId = approveNewTmuxPaneId(
+        split.stdout,
+        leaderPaneId,
+        rollbackPreExistingPaneIds,
+        operationCreatedPaneIds,
+        isNativeWindows(),
+      );
+      if (!paneId) {
+        throw new Error(`failed to validate worker pane id for worker ${i}: ${split.stdout}`);
       }
+      operationCreatedPaneIds.add(paneId);
       rollbackPaneIds.push(paneId);
-      if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, paneId)) {
+      if (isNativeWindows() && !waitForPaneToRemainStrictlyLive(paneId)) {
         throw new Error(`worker pane ${i} did not remain present after tmux split-window returned ${paneId}`);
       }
       tagPaneInstance(paneId, ownerSessionId);
@@ -1735,21 +1908,34 @@ export function createTeamSession(
     let resizeHookName: string | null = null;
     let resizeHookTarget: string | null = null;
     if (canRecreateTeamHud && omxEntry) {
-      const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: ownerSessionId, leaderPaneId })} node ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
+      const hudCmd = buildHudStartupCommand({
+        omxEntry,
+        sessionId: ownerSessionId,
+        leaderPaneId,
+      });
       const hudCwd = translatePathForMsys(cwd);
       const hudResult = runTmux([
         'split-window', '-v', '-f', '-l', String(HUD_TMUX_TEAM_HEIGHT_LINES), '-t', teamTarget, '-d', '-P', '-F', '#{pane_id}', '-c', hudCwd, hudCmd,
       ]);
       if (hudResult.ok) {
-        const id = hudResult.stdout.split('\n')[0]?.trim() ?? '';
-        if (id.startsWith('%')) {
-          rollbackPaneIds.push(id);
-          if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
-            throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
-          }
-          tagPaneInstance(id, ownerSessionId);
-          tagPaneTeamOwner(id, teamPaneOwnerId);
-          hudPaneId = id;
+        const hudPaneCandidate = approveNewTmuxPaneId(
+          hudResult.stdout,
+          leaderPaneId,
+          rollbackPreExistingPaneIds,
+          operationCreatedPaneIds,
+          isNativeWindows(),
+        );
+        if (!hudPaneCandidate) {
+          throw new Error(`failed to validate team HUD pane id: ${hudResult.stdout}`);
+        }
+        operationCreatedPaneIds.add(hudPaneCandidate);
+        rollbackPaneIds.push(hudPaneCandidate);
+        if (isNativeWindows() && !waitForPaneToRemainStrictlyLive(hudPaneCandidate)) {
+          throw new Error(`HUD pane did not remain present after tmux split-window returned ${hudPaneCandidate}`);
+        }
+        tagPaneInstance(hudPaneCandidate, ownerSessionId);
+        tagPaneTeamOwner(hudPaneCandidate, teamPaneOwnerId);
+        hudPaneId = hudPaneCandidate;
 
           if (isNativeWindows()) {
             // Native Windows tmux support may flow through psmux; issuing a
@@ -1807,7 +1993,6 @@ export function createTeamSession(
           }
         }
       }
-    }
 
     runTmux(['select-pane', '-t', leaderPaneId]);
     redrawLeaderPaneAfterTeamLayout(leaderPaneId);
@@ -1845,7 +2030,16 @@ export function createTeamSession(
       runTmux(buildUnregisterResizeHookArgs(registeredResizeHook.target, registeredResizeHook.name));
     }
     for (const paneId of rollbackPaneIds) {
-      runTmux(['kill-pane', '-t', paneId]);
+      const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+      if (
+        !canonicalPaneId
+        || canonicalPaneId === rollbackLeaderPaneId
+        || rollbackPreExistingPaneIds.has(canonicalPaneId)
+        || !operationCreatedPaneIds.has(canonicalPaneId)
+      ) {
+        continue;
+      }
+      runTmux(['kill-pane', '-t', canonicalPaneId]);
     }
     throw error;
   }
@@ -1856,21 +2050,42 @@ export function restoreStandaloneHudPane(
   cwd: string,
   options: RestoreStandaloneHudPaneOptions = {},
 ): string | null {
-  const normalizedLeaderPaneId = normalizePaneTarget(leaderPaneId);
+  const normalizedLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
   if (!normalizedLeaderPaneId) return null;
 
   const omxEntry = resolveOmxCliEntryPath();
   if (!omxEntry || omxEntry.trim() === '') return null;
+  const nativeWindows = isNativeWindows();
+  let preSplitPaneIds = new Set<string>();
+  let ownedHudPaneIds: string[];
+  if (nativeWindows) {
+    const preSplitPanes = listPanes(normalizedLeaderPaneId);
+    for (const pane of preSplitPanes) {
+      const preSplitPaneId = parseCanonicalTmuxPaneId(pane.paneId);
+      if (!preSplitPaneId) return null;
+      preSplitPaneIds.add(preSplitPaneId);
+    }
+    if (!preSplitPanes.some((pane) => parseCanonicalTmuxPaneId(pane.paneId) === normalizedLeaderPaneId)) {
+      return null;
+    }
+    const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
+    if (!globalPaneIds || !globalPaneIds.has(normalizedLeaderPaneId)) return null;
+    for (const paneId of globalPaneIds) preSplitPaneIds.add(paneId);
+    ownedHudPaneIds = findHudWatchPaneIds(
+      preSplitPanes,
+      normalizedLeaderPaneId,
+      { leaderPaneId: normalizedLeaderPaneId },
+    );
+  } else {
+    ownedHudPaneIds = findOwnedHudPaneIds(normalizedLeaderPaneId, normalizedLeaderPaneId);
+  }
 
-  const [existingHudPaneId, ...duplicateHudPaneIds] = findOwnedHudPaneIds(
-    normalizedLeaderPaneId,
-    normalizedLeaderPaneId,
-  );
+  const [existingHudPaneId, ...duplicateHudPaneIds] = ownedHudPaneIds;
   for (const paneId of duplicateHudPaneIds) {
     runTmux(['kill-pane', '-t', paneId]);
   }
   if (existingHudPaneId) {
-    if (isNativeWindows()) {
+    if (nativeWindows) {
       runTmux(buildHudResizeArgs(existingHudPaneId));
     } else {
       runTmux(buildScheduleDelayedHudResizeArgs(existingHudPaneId));
@@ -1880,8 +2095,14 @@ export function restoreStandaloneHudPane(
     return existingHudPaneId;
   }
 
-  const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: options.sessionId, leaderPaneId: normalizedLeaderPaneId })} ${shellQuoteSingle(translatePathForMsys(resolveLeaderNodePath()))} ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
-  let hudResult: ReturnType<typeof runTmux> | null = null;
+  const hudCmd = buildHudStartupCommand({
+    omxEntry,
+    sessionId: options.sessionId,
+    leaderPaneId: normalizedLeaderPaneId,
+    nodePath: resolveLeaderNodePath(),
+  });
+  const operationCreatedPaneIds = new Set<string>();
+  let paneId: string | null = null;
   for (const restoreCwd of resolveStandaloneHudRestoreCwdCandidates(
     normalizedLeaderPaneId,
     cwd,
@@ -1902,17 +2123,36 @@ export function restoreStandaloneHudPane(
       translatePathForMsys(restoreCwd.rawPath),
       hudCmd,
     ]);
-    if (candidateResult.ok) {
-      hudResult = candidateResult;
-      break;
+    if (!candidateResult.ok) continue;
+
+    const approvedPaneId = approveNewTmuxPaneId(
+      candidateResult.stdout,
+      normalizedLeaderPaneId,
+      preSplitPaneIds,
+      operationCreatedPaneIds,
+      nativeWindows,
+    );
+    if (!approvedPaneId) return null;
+    operationCreatedPaneIds.add(approvedPaneId);
+
+    if (nativeWindows && !waitForPaneToRemainStrictlyLive(approvedPaneId)) {
+      const rollbackPaneId = parseCanonicalTmuxPaneId(approvedPaneId);
+      if (
+        rollbackPaneId
+        && rollbackPaneId !== normalizedLeaderPaneId
+        && operationCreatedPaneIds.has(rollbackPaneId)
+        && (!nativeWindows || !preSplitPaneIds.has(rollbackPaneId))
+      ) {
+        runTmux(['kill-pane', '-t', rollbackPaneId]);
+      }
+      return null;
     }
+    paneId = approvedPaneId;
+    break;
   }
-  if (!hudResult?.ok) return null;
+  if (!paneId) return null;
 
-  const paneId = hudResult.stdout.split('\n')[0]?.trim() ?? '';
-  if (!paneId.startsWith('%')) return null;
-
-  if (isNativeWindows()) {
+  if (nativeWindows) {
     runTmux(buildHudResizeArgs(paneId));
   } else {
     runTmux(buildScheduleDelayedHudResizeArgs(paneId));

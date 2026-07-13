@@ -161,11 +161,117 @@ function parseShellEnvAssignment(command: string, key: string): string | undefin
   return value === '' ? undefined : value;
 }
 
+interface PowerShellHudEnvPrefix {
+  present: boolean;
+  valid: boolean;
+  values: Map<string, string[]>;
+}
+
+function containsPowerShellEnvReferenceOutsideQuotes(command: string): boolean {
+  let quote: 'single' | 'double' | null = null;
+  let blockComment = false;
+  let lineComment = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    const next = command[index + 1];
+    if (blockComment) {
+      if (char === '#' && next === '>') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (lineComment) {
+      if (char === '\n' || char === '\r') lineComment = false;
+      continue;
+    }
+    if (quote === 'single') {
+      if (char === "'" && next === "'") index += 1;
+      else if (char === "'") quote = null;
+      continue;
+    }
+    if (quote === 'double') {
+      if (char === '`') index += 1;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (char === '<' && next === '#') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '#') {
+      lineComment = true;
+      continue;
+    }
+    if (char === "'") {
+      quote = 'single';
+      continue;
+    }
+    if (char === '"') {
+      quote = 'double';
+      continue;
+    }
+    if (char === '`') {
+      index += 1;
+      continue;
+    }
+    if (command.slice(index, index + 5).toLowerCase() === '$env:') return true;
+  }
+  return false;
+}
+
+function parsePowerShellHudEnvPrefix(command: string): PowerShellHudEnvPrefix {
+  const present = containsPowerShellEnvReferenceOutsideQuotes(command);
+  const values = new Map<string, string[]>();
+  if (!present) return { present: false, valid: false, values };
+
+  const prefixMatch = /^\s*((?:\$env:[A-Za-z_][A-Za-z0-9_]*\s*=\s*'(?:''|[^'])*'\s*;\s*)+)&(?:\s|$)/i.exec(command);
+  if (!prefixMatch) return { present: true, valid: false, values };
+
+  const assignmentPattern = /\$env:([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'((?:''|[^'])*)'\s*;/gi;
+  for (const match of prefixMatch[1]!.matchAll(assignmentPattern)) {
+    const key = match[1]!.toUpperCase();
+    const value = match[2]!.replace(/''/g, "'").trim();
+    const existing = values.get(key) ?? [];
+    existing.push(value);
+    values.set(key, existing);
+  }
+  return { present: true, valid: true, values };
+}
+
+function parseHudEnvAssignment(command: string, key: string): string | undefined {
+  const shellValue = parseShellEnvAssignment(command, key);
+  const powerShellPrefix = parsePowerShellHudEnvPrefix(command);
+  if (!powerShellPrefix.present) return shellValue;
+  if (!powerShellPrefix.valid || shellValue !== undefined) return undefined;
+
+  const values = powerShellPrefix.values.get(key.toUpperCase()) ?? [];
+  if (values.length !== 1) return undefined;
+  return values[0] === '' ? undefined : values[0];
+}
+
+function hasAmbiguousHudOwnerMetadata(command: string): boolean {
+  const powerShellPrefix = parsePowerShellHudEnvPrefix(command);
+  if (!powerShellPrefix.present) return false;
+  if (!powerShellPrefix.valid) return true;
+
+  return [OMX_TMUX_HUD_OWNER_ENV, 'OMX_SESSION_ID', OMX_TMUX_HUD_LEADER_PANE_ENV]
+    .some((key) => {
+      const values = powerShellPrefix.values.get(key.toUpperCase()) ?? [];
+      return values.length > 1 || parseShellEnvAssignment(command, key) !== undefined;
+    });
+}
+
 export function readHudPaneOwner(pane: TmuxPaneSnapshot): HudPaneOwner {
   const command = `${pane.startCommand} ${pane.currentCommand}`;
+  if (hasAmbiguousHudOwnerMetadata(command)) {
+    return { sessionId: undefined, leaderPaneId: undefined };
+  }
   return {
-    sessionId: parseShellEnvAssignment(command, 'OMX_SESSION_ID'),
-    leaderPaneId: parseShellEnvAssignment(command, OMX_TMUX_HUD_LEADER_PANE_ENV),
+    sessionId: parseHudEnvAssignment(command, 'OMX_SESSION_ID'),
+    leaderPaneId: parseHudEnvAssignment(command, OMX_TMUX_HUD_LEADER_PANE_ENV),
   };
 }
 
@@ -173,7 +279,8 @@ export function readHudPaneOwner(pane: TmuxPaneSnapshot): HudPaneOwner {
 function hasHudPaneOwnerMetadata(pane: TmuxPaneSnapshot): boolean {
   const command = `${pane.startCommand} ${pane.currentCommand}`;
   const owner = readHudPaneOwner(pane);
-  return parseShellEnvAssignment(command, OMX_TMUX_HUD_OWNER_ENV) === '1'
+  return parsePowerShellHudEnvPrefix(command).present
+    || parseHudEnvAssignment(command, OMX_TMUX_HUD_OWNER_ENV) === '1'
     || Boolean(owner.sessionId || owner.leaderPaneId);
 }
 
@@ -214,6 +321,7 @@ export function hudPaneMatchesOwner(pane: TmuxPaneSnapshot, owner: HudPaneOwner 
   const wantsSession = wantedSessionIds.length > 0;
   const wantsLeaderPane = wantedLeaderPaneId !== '';
   if (!wantsSession && !wantsLeaderPane) return true;
+  if (hasAmbiguousHudOwnerMetadata(`${pane.startCommand} ${pane.currentCommand}`)) return false;
 
   const paneOwner = readHudPaneOwner(pane);
   const sessionMatches = wantsSession && wantedSessionIds.includes(paneOwner.sessionId ?? '');

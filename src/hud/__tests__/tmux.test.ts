@@ -349,6 +349,78 @@ describe('HUD pane ownership helpers', () => {
     });
   });
 
+  it('reads and matches PowerShell HUD owner assignments with case-insensitive keys and literal quote decoding', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        `%2\tnode\t$env:omx_session_id = 'session ''quoted'''; $ENV:omx_tmux_hud_owner = '1'; $eNv:omx_tmux_hud_leader_pane = '%1'; & 'C:\\Program Files\\nodejs\\node.exe' 'C:\\Program Files\\OMX\\omx.js' hud --watch`,
+      ].join('\n'),
+    );
+
+    assert.deepEqual(readHudPaneOwner(panes[1]!), {
+      sessionId: "session 'quoted'",
+      leaderPaneId: '%1',
+    });
+    assert.equal(hudPaneMatchesOwner(panes[1]!, { sessionId: "session 'quoted'", leaderPaneId: '%1' }), true);
+    assert.deepEqual(
+      findHudWatchPaneIds(panes, '%1', { sessionId: "session 'quoted'", leaderPaneId: '%1' }),
+      ['%2'],
+    );
+  });
+
+  it('treats PowerShell owner-marker-only HUD commands as owned metadata instead of legacy fallback', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        `%2\tnode\t$env:OMX_TMUX_HUD_OWNER = '1'; & node omx.js hud --watch --preset=focused`,
+      ].join('\n'),
+    );
+
+    assert.deepEqual(readHudPaneOwner(panes[1]!), { sessionId: undefined, leaderPaneId: undefined });
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
+  });
+
+  it('rejects duplicate or mixed PowerShell ownership assignments instead of trusting the first value', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        `%2\tnode\t$env:OMX_SESSION_ID = 'session-a'; $env:OMX_SESSION_ID = 'session-b'; $env:OMX_TMUX_HUD_OWNER = '1'; $env:OMX_TMUX_HUD_LEADER_PANE = '%1'; & node omx.js hud --watch --preset=focused`,
+        `%3\tnode\tOMX_SESSION_ID='session-a'; $env:OMX_SESSION_ID = 'session-b'; $env:OMX_TMUX_HUD_OWNER = '1'; & node omx.js hud --watch --preset=focused`,
+        `%4\tnode\t$env:OMX_TMUX_HUD_OWNER = '1'; $env:OMX_TMUX_HUD_LEADER_PANE = '%1'; $env:OMX_TMUX_HUD_LEADER_PANE = '%9'; & node omx.js hud --watch --preset=focused`,
+      ].join('\n'),
+    );
+
+    for (const pane of panes.slice(1)) {
+      assert.deepEqual(readHudPaneOwner(pane), { sessionId: undefined, leaderPaneId: undefined });
+      assert.equal(hudPaneMatchesOwner(pane, { sessionId: 'session-a', leaderPaneId: '%1' }), false);
+      assert.equal(hudPaneMatchesOwner(pane, { leaderPaneId: '%1' }), false);
+    }
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
+  });
+
+  it('rejects empty, malformed, and near-miss PowerShell owner assignments', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        `%2\tnode\t$env:OMX_SESSION_ID = ''; & node omx.js hud --watch`,
+        `%3\tnode\tprefix$env:OMX_SESSION_ID = 'session-a'; & node omx.js hud --watch`,
+        `%4\tnode\t$env:OMX_SESSION_ID = "session-a"; & node omx.js hud --watch`,
+        `%5\tnode\t$env:OMX_SESSION_ID = 'session-a'near; & node omx.js hud --watch`,
+        `%6\tnode\t<# $env:OMX_SESSION_ID = 'comment-owner'; #>; node omx.js hud --watch --preset=focused`,
+        `%7\tnode\tWrite-Output "; $env:OMX_SESSION_ID = 'string-owner'; $env:OMX_TMUX_HUD_LEADER_PANE = '%1';"; node omx.js hud --watch --preset=focused`,
+      ].join('\n'),
+    );
+
+    for (const pane of panes.slice(1)) {
+      assert.deepEqual(readHudPaneOwner(pane), { sessionId: undefined, leaderPaneId: undefined });
+      assert.equal(hudPaneMatchesOwner(pane, { sessionId: 'session-a', leaderPaneId: '%1' }), false);
+    }
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), ['%6', '%7']);
+  });
+
   it('splits tmux octal-escaped control separators from live list-panes output', () => {
     const escapedSeparator = TMUX_PANE_FIELD_SEPARATOR_OCTAL_ESCAPE;
     const panes = parseTmuxPaneSnapshot(

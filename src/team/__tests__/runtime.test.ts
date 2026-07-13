@@ -2388,7 +2388,9 @@ esac
           dirPrefix: 'omx-runtime-win32-no-env-',
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
-printf '%s\\n' "$*" >> "${tmuxLogPath}"
+worker_state="$(dirname "${tmuxLogPath}")/worker"
+hud_state="$(dirname "${tmuxLogPath}")/hud"
+printf '%s\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   -V)
     echo "tmux 3.4"
@@ -2407,11 +2409,20 @@ case "\${1:-}" in
     ;;
   list-panes)
     case "$*" in
+      *"#{pane_id} #{pane_dead}"*)
+        printf "%%1 0\n"
+        if [ -f "$worker_state" ]; then printf "%%2 0\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3 0\n"; fi
+        ;;
       *"pane_current_command"*)
-        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'gemini'\\n%%3\\tnode\\t'node omx hud --watch'\\n"
+        printf "%%1\tnode\t'codex'\n"
+        if [ -f "$worker_state" ]; then printf "%%2\tgemini\t'gemini'\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\tnode\t'node omx hud --watch'\n"; fi
         ;;
       *)
-        printf "%%1\\n%%2\\n%%3\\n"
+        printf "%%1\n"
+        if [ -f "$worker_state" ]; then printf "%%2\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\n"; fi
         ;;
     esac
     exit 0
@@ -2419,9 +2430,11 @@ case "\${1:-}" in
   split-window)
     case "$*" in
       *" -h "*)
+        : > "$worker_state"
         echo "%2"
         ;;
       *)
+        : > "$hud_state"
         echo "%3"
         ;;
     esac
@@ -7248,6 +7261,7 @@ esac
             dirPrefix: 'omx-runtime-shutdown-win32-split-bin-',
             tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
+hud_state="$(dirname "${tmuxLogPath}")/hud-state"
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 case "$1" in
   -V)
@@ -7256,11 +7270,23 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
+      *"#{pane_id} #{pane_dead}"*)
+        printf "%%11 0\n"
+        if [ -f "$hud_state" ]; then printf "%%44 0\n"; fi
+        ;;
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;
+      *"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%11\tpwsh\tpwsh\n"
+        exit 0
+        ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tpwsh\\tpwsh\\n%%12\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-win32-split/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-win32-split/worker-2 codex\\n"
+        printf "%%11\tpwsh\tpwsh\n%%12\tnode\tnode /tmp/bin/omx.js hud --watch\n%%13\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-win32-split/worker-1 codex\n%%14\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-win32-split/worker-2 codex\n"
+        exit 0
+        ;;
+      *"-a -F #{pane_id}"*)
+        printf "%%11\n"
         exit 0
         ;;
       *)
@@ -7269,7 +7295,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "$hud_state"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
