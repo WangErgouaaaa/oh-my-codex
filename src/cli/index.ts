@@ -54,7 +54,10 @@ import { adaptCommand } from "./adapt.js";
 import { listCommand } from "./list.js";
 import { authCommand } from "./auth.js";
 import { missionCommand } from "./mission.js";
-import { runAuthHotswap } from "../auth/hotswap.js";
+import {
+  resolveCodexGlobalOptionValue,
+  runAuthHotswap,
+} from "../auth/hotswap.js";
 import {
   MADMAX_FLAG,
   CODEX_BYPASS_FLAG,
@@ -91,8 +94,9 @@ import {
 } from "./plugin-marketplace.js";
 import { escapeTomlString, readTopLevelTomlString, upsertTopLevelTomlString } from "../utils/toml.js";
 import {
-  CANONICAL_REASONING_EFFORTS,
-  isAmbiguousUnsupportedReasoningEffort,
+  ROOT_REASONING_EFFORTS,
+  isUnsupportedRootReasoningEffort,
+  normalizeUnsupportedRootReasoningEffort,
 } from "../config/models.js";
 
 
@@ -364,11 +368,17 @@ const OMX_RALPH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_RALPH_APPEND_INSTRUCTIONS_FILE";
 const OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE";
-const REASONING_MODES = CANONICAL_REASONING_EFFORTS;
+const REASONING_MODES = ROOT_REASONING_EFFORTS;
 type ReasoningMode = (typeof REASONING_MODES)[number];
 const REASONING_MODE_SET = new Set<string>(REASONING_MODES);
 const REASONING_USAGE = "Usage: omx reasoning <low|medium|high|xhigh>";
-const AMBIGUOUS_REASONING_MESSAGE = 'Codex/OMX canonical highest reasoning effort is "xhigh"; "max" and "ultra" are not accepted aliases.';
+
+function unsupportedLaunchShorthandError(flag: "--max" | "--ultra"): Error {
+  const guidance = flag === "--max"
+    ? 'No --max shorthand exists; use agentReasoning for per-agent "max" or pass -c model_reasoning_effort=... directly to Codex.'
+    : '"ultra" is not an OMX root or per-agent reasoning value and is not an alias for "max".';
+  return new Error(`Unsupported OMX launch shorthand "${flag}".\n${guidance}\nRun "omx help" for usage.`);
+}
 
 const ALLOWED_SHELLS = new Set([
   "/bin/sh",
@@ -659,6 +669,18 @@ export function resolveSetupTeamModeArg(args: string[]): SetupTeamMode | undefin
   }
 
   return value;
+}
+
+function splitOmxArgsAtEndOfOptions(args: string[]): {
+  omxArgs: string[];
+  suffix: string[];
+} {
+  const endOfOptionsIndex = args.indexOf("--");
+  if (endOfOptionsIndex === -1) return { omxArgs: args, suffix: [] };
+  return {
+    omxArgs: args.slice(0, endOfOptionsIndex),
+    suffix: args.slice(endOfOptionsIndex),
+  };
 }
 
 export function resolveCliInvocation(args: string[]): ResolvedCliInvocation {
@@ -1145,14 +1167,15 @@ export interface ResumeCodexHomeSelection {
 }
 
 export function parseResumeCodexHomeSelection(args: string[]): ResumeCodexHomeSelection {
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
   const nextArgs: string[] = [];
   let explicitCodexHome: string | undefined;
   let projectOnly = false;
 
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
+  for (let index = 0; index < omxArgs.length; index += 1) {
+    const arg = omxArgs[index];
     if (arg === "--codex-home") {
-      const value = args[index + 1];
+      const value = omxArgs[index + 1];
       if (!value || value.startsWith("-")) {
         throw new Error("Missing value after --codex-home.");
       }
@@ -1175,7 +1198,7 @@ export function parseResumeCodexHomeSelection(args: string[]): ResumeCodexHomeSe
   }
 
   return {
-    args: nextArgs,
+    args: [...nextArgs, ...suffix],
     explicitCodexHome,
     projectOnly,
   };
@@ -1251,8 +1274,30 @@ export async function preflightResumeOmxPluginState(
   };
 }
 
-function isResumeCodexLaunch(args: string[]): boolean {
-  return args.includes("resume");
+export { CODEX_GLOBAL_OPTIONS_WITH_SPLIT_VALUE } from "../auth/hotswap.js";
+
+export function isResumeCodexLaunch(args: string[]): boolean {
+  const { omxArgs } = splitOmxArgsAtEndOfOptions(args);
+  for (let index = 0; index < omxArgs.length; index += 1) {
+    const arg = omxArgs[index];
+    const optionValue = resolveCodexGlobalOptionValue(arg);
+    if (optionValue?.valueArity === "single") {
+      if (!optionValue.attached) index += 1;
+      continue;
+    }
+    if (optionValue?.valueArity === "variadic") {
+      if (optionValue.attached) continue;
+      let nextIndex = index + 1;
+      while (nextIndex < omxArgs.length && !omxArgs[nextIndex]!.startsWith("-")) {
+        nextIndex += 1;
+      }
+      index = nextIndex - 1;
+      continue;
+    }
+    if (arg.startsWith("-")) continue;
+    return arg === "resume";
+  }
+  return false;
 }
 
 async function prepareResumeCodexHomeForLaunch(
@@ -2195,13 +2240,27 @@ function launchArgRequestsDisposableWorktree(arg: string): boolean {
 }
 
 function launchArgsRequestMadmaxIsolation(launchArgs: readonly string[]): boolean {
-  return launchArgs.some(
-    (arg) => arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG,
-  );
+  for (const arg of launchArgs) {
+    if (arg === "--") break;
+    if (arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG) return true;
+  }
+  return false;
+}
+
+function launchArgsRequestAuthHotswap(launchArgs: readonly string[]): boolean {
+  for (const arg of launchArgs) {
+    if (arg === "--") break;
+    if (arg === "--hotswap") return true;
+  }
+  return false;
 }
 
 function launchArgsRequestDisposableWorktree(launchArgs: readonly string[]): boolean {
-  return launchArgs.some((arg) => launchArgRequestsDisposableWorktree(arg));
+  for (const arg of launchArgs) {
+    if (arg === "--") break;
+    if (launchArgRequestsDisposableWorktree(arg)) return true;
+  }
+  return false;
 }
 
 function clearInheritedMadmaxRootForDisposableWorktreeLaunch(
@@ -2681,7 +2740,8 @@ export async function main(args: string[]): Promise<void> {
   ]);
   const firstArg = args[0];
   const { command, launchArgs } = resolveCliInvocation(args);
-  const flags = new Set(args.filter((a) => a.startsWith("--")));
+  const { omxArgs } = splitOmxArgsAtEndOfOptions(args);
+  const flags = new Set(omxArgs.filter((arg) => arg.startsWith("--")));
   const options = {
     force: flags.has("--force"),
     mergeAgents: flags.has("--merge-agents"),
@@ -2700,7 +2760,7 @@ export async function main(args: string[]): Promise<void> {
   try {
     switch (command) {
       case "launch":
-        if (launchArgs.includes("--hotswap")) {
+        if (launchArgsRequestAuthHotswap(launchArgs)) {
           await launchWithAuthHotswap(launchArgs);
         } else {
           await launchWithHud(launchArgs);
@@ -3036,9 +3096,14 @@ async function reasoningCommand(args: string[]): Promise<void> {
   }
 
   if (!REASONING_MODE_SET.has(mode)) {
-    const guidance = isAmbiguousUnsupportedReasoningEffort(mode)
-      ? `${AMBIGUOUS_REASONING_MESSAGE}\n`
-      : "";
+    const unsupportedMode = isUnsupportedRootReasoningEffort(mode)
+      ? normalizeUnsupportedRootReasoningEffort(mode)
+      : undefined;
+    const guidance = unsupportedMode === "max"
+      ? `Reasoning mode "${mode}" is not supported by "omx reasoning".\nPer-agent "max" is configured with agentReasoning; direct -c model_reasoning_effort=... is passed to Codex and remains capability-dependent.\n`
+      : unsupportedMode === "ultra"
+        ? `Reasoning mode "${mode}" is not supported by OMX root or per-agent reasoning and is not an alias for "max".\nDirect -c model_reasoning_effort=... remains opaque Codex passthrough.\n`
+        : "";
     throw new Error(
       `${guidance}Invalid reasoning mode "${mode}". Expected one of: ${REASONING_MODES.join(", ")}.\n${REASONING_USAGE}`,
     );
@@ -3057,7 +3122,10 @@ async function reasoningCommand(args: string[]): Promise<void> {
 
 export async function launchWithAuthHotswap(args: string[]): Promise<void> {
   const launchCwd = process.cwd();
-  const parsedWorktree = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsedWorktree = parseWorktreeMode(omxArgs);
+  const hotswapArgs = [...parsedWorktree.remainingArgs, ...suffix];
+
   let cwd = launchCwd;
   let worktreeDirty = false;
   let ensuredLaunchWorktree: ReturnType<typeof ensureWorktree> | undefined;
@@ -3115,7 +3183,7 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
 
   const status = await runAuthHotswap({
     cwd,
-    argv: parsedWorktree.remainingArgs,
+    argv: hotswapArgs,
     lifecycle: {
       prepareCodexHomeForLaunch,
       preLaunch: (launchPath, sessionId, notifyTempContract, codexHomeOverride, enableAuthority) =>
@@ -3162,13 +3230,15 @@ export async function launchWithHud(args: string[]): Promise<void> {
   }
 
   const launchCwd = process.cwd();
-  const parsedWorktree = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsedWorktree = parseWorktreeMode(omxArgs);
   const notifyTempResult = resolveNotifyTempContract(
     parsedWorktree.remainingArgs,
     process.env,
   );
+  const passthroughArgs = [...notifyTempResult.passthroughArgs, ...suffix];
   const explicitLaunchPolicy = resolveEffectiveLeaderLaunchPolicyOverride(
-    notifyTempResult.passthroughArgs,
+    passthroughArgs,
     process.env,
   );
   const persistentCodexHomeForLaunch = resolveCodexHomeForLaunch(launchCwd, process.env);
@@ -3176,12 +3246,10 @@ export async function launchWithHud(args: string[]): Promise<void> {
     resolveTmuxAwareLaunchPolicy(explicitLaunchPolicy, isNativeWindows());
   const enableNotifyFallbackAuthority = launchPolicy === "direct";
   const workerSparkModel = resolveWorkerSparkModel(
-    notifyTempResult.passthroughArgs,
+    passthroughArgs,
     persistentCodexHomeForLaunch,
   );
-  let normalizedArgs = normalizeCodexLaunchArgs(
-    notifyTempResult.passthroughArgs,
-  );
+  let normalizedArgs = normalizeCodexLaunchArgs(passthroughArgs);
   let cwd = launchCwd;
   let worktreeDirty = false;
   let ensuredLaunchWorktree: ReturnType<typeof ensureWorktree> | undefined;
@@ -3211,7 +3279,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
     }
   }
   const madmaxWorktreeRuntimeContext = captureMadmaxWorktreeRuntimeContext({
-    originalLaunchArgs: args,
+    originalLaunchArgs: omxArgs,
     worktreeEnabled: Boolean(parsedWorktree.mode.enabled && ensuredLaunchWorktree?.enabled),
     sourceCwd: launchCwd,
     worktreeCwd: ensuredLaunchWorktree?.enabled ? ensuredLaunchWorktree.worktreePath : undefined,
@@ -3308,14 +3376,14 @@ export async function launchWithHud(args: string[]): Promise<void> {
 
 export async function execWithOverlay(args: string[]): Promise<void> {
   const launchCwd = process.cwd();
-  const parsedWorktree = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsedWorktree = parseWorktreeMode(omxArgs);
   const notifyTempResult = resolveNotifyTempContract(
     parsedWorktree.remainingArgs,
     process.env,
   );
-  const normalizedArgs = normalizeCodexLaunchArgs(
-    notifyTempResult.passthroughArgs,
-  );
+  const passthroughArgs = [...notifyTempResult.passthroughArgs, ...suffix];
+  const normalizedArgs = normalizeCodexLaunchArgs(passthroughArgs);
   let cwd = launchCwd;
   let worktreeDirty = false;
   let ensuredLaunchWorktree: ReturnType<typeof ensureWorktree> | undefined;
@@ -3422,7 +3490,8 @@ export async function execWithOverlay(args: string[]): Promise<void> {
 }
 
 export function normalizeCodexLaunchArgs(args: string[]): string[] {
-  const parsed = parseWorktreeMode(args);
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  const parsed = parseWorktreeMode(omxArgs);
   const launchPolicyParsed = splitLeaderLaunchPolicyArgs(parsed.remainingArgs);
   const normalized: string[] = [];
   let wantsBypass = false;
@@ -3455,7 +3524,7 @@ export function normalizeCodexLaunchArgs(args: string[]): string[] {
     }
 
     if (arg === "--max" || arg === "--ultra") {
-      throw new Error(AMBIGUOUS_REASONING_MESSAGE);
+      throw unsupportedLaunchShorthandError(arg);
     }
 
     if (arg === SPARK_FLAG) {
@@ -3480,7 +3549,7 @@ export function normalizeCodexLaunchArgs(args: string[]): string[] {
     normalized.push(CONFIG_FLAG, `${REASONING_KEY}="${reasoningMode}"`);
   }
 
-  return normalized;
+  return [...normalized, ...suffix];
 }
 
 /**
@@ -3493,6 +3562,7 @@ export function resolveWorkerSparkModel(
   codexHomeOverride?: string,
 ): string | undefined {
   for (const arg of args) {
+    if (arg === "--") break;
     if (arg === SPARK_FLAG || arg === MADMAX_SPARK_FLAG) {
       return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
     }
@@ -3657,11 +3727,13 @@ export function injectModelInstructionsBypassArgs(
   defaultFilePath?: string,
 ): string[] {
   if (!shouldBypassDefaultSystemPrompt(env)) return [...args];
-  if (hasModelInstructionsOverride(args)) return [...args];
+  const { omxArgs, suffix } = splitOmxArgsAtEndOfOptions(args);
+  if (hasModelInstructionsOverride(omxArgs)) return [...args];
   return [
-    ...args,
+    ...omxArgs,
     CONFIG_FLAG,
     buildModelInstructionsOverride(cwd, env, defaultFilePath),
+    ...suffix,
   ];
 }
 
@@ -5675,8 +5747,9 @@ function encodePowerShellCommand(commandText: string): string {
   return Buffer.from(commandText, "utf16le").toString("base64");
 }
 
-function isCodexVersionRequest(args: string[]): boolean {
-  return args.some((arg) => CODEX_VERSION_FLAGS.has(arg));
+export function isCodexVersionRequest(args: string[]): boolean {
+  const { omxArgs } = splitOmxArgsAtEndOfOptions(args);
+  return omxArgs.some((arg) => CODEX_VERSION_FLAGS.has(arg));
 }
 
 export function buildWindowsPromptCommand(
