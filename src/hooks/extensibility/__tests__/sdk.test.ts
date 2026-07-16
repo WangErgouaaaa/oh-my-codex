@@ -319,7 +319,7 @@ esac
         assert.equal(await readFile(payloadCapturePath, 'utf8'), `${text} [OMX_TMUX_INJECT]`);
         const commandLog = await readFile(commandLogPath, 'utf8');
         assert.match(commandLog, /load-buffer -b omx_payload_[a-f0-9]{32} \/.*\/payload/);
-        assert.match(commandLog, /if-shell .* paste-buffer -b omx_payload_[a-f0-9]{32} -t %42 -d ; display-message/);
+        assert.match(commandLog, /if-shell .* paste-buffer -b omx_payload_[a-f0-9]{32} -t %42 -d -r -p ; display-message/);
         assert.doesNotMatch(commandLog, /apostrophe|touch \/tmp\/pwned|split-window -h|send-keys -t %42 -l/);
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;

@@ -133,7 +133,7 @@ function pasteLiteralPanePayloadAtomically(target: TmuxTarget, payload: string):
     writeFileSync(payloadPath, payload, { encoding: 'utf8', flag: 'wx' });
     const loaded = runTmux(['load-buffer', '-b', bufferName, payloadPath]);
     if (!loaded.ok) return false;
-    return runPaneMutationAtomically(target, ['paste-buffer', '-b', bufferName, '-t', target.paneId, '-d']);
+    return runPaneMutationAtomically(target, ['paste-buffer', '-b', bufferName, '-t', target.paneId, '-d', '-r', '-p']);
   } catch {
     return false;
   } finally {
