@@ -266,7 +266,7 @@ if [[ "$cmd" == "if-shell" ]]; then
   if [[ "$thenCommand" == *"paste-buffer"* && -f "${tmuxLogPath}.buffer" ]]; then
     echo "send-keys -t $target -l $(cat "${tmuxLogPath}.buffer")" >> "${tmuxLogPath}"
   fi
-  receipt="\${thenCommand##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
+  receipt="\${thenCommand##*display-message -p }"; receipt="\${receipt%% *}"; printf '%s\n' "$receipt"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -465,21 +465,21 @@ echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "if-shell" ]]; then
-  success="\${5:-}"
   target=""
   condition=""
+  thenCommand=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
       -F) condition="$2"; shift 2 ;;
-      *) shift ;;
+      *) if [[ -z "$thenCommand" ]]; then thenCommand="$1"; fi; shift ;;
     esac
   done
   pid=""
   if [[ "$target" == "${anchorPane}" ]]; then pid="9901"; fi
   if [[ "$target" == "${livePane}" ]]; then pid="4201"; fi
   if [[ -n "$pid" && "$condition" == *"#{pane_id},$target"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},$pid"* ]]; then
-    receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
+    receipt="\${thenCommand##*display-message -p }"; receipt="\${receipt%% *}"; printf '%s\n' "$receipt"
   fi
   exit 0
 fi
@@ -1608,7 +1608,7 @@ describe('notify-fallback watcher', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      assert.doesNotMatch(tmuxLog, /set-buffer[^\n]*Team dispatch-team:/);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %42 -l Team dispatch-team:/);
 
       const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -1642,18 +1642,18 @@ echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "if-shell" ]]; then
-  success="\${5:-}"
   target=""
   condition=""
+  thenCommand=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
       -F) condition="$2"; shift 2 ;;
-      *) shift ;;
+      *) if [[ -z "$thenCommand" ]]; then thenCommand="$1"; fi; shift ;;
     esac
   done
   if [[ "$target" == "%42" && "$condition" == *"#{pane_id},%42"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},4201"* ]]; then
-    receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
+    receipt="\${thenCommand##*display-message -p }"; receipt="\${receipt%% *}"; printf '%s\n' "$receipt"
   fi
   exit 0
 fi
@@ -2309,7 +2309,7 @@ exit 0
       assert.equal(second.status, 0, second.stderr || second.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const typeMatches = tmuxLog.match(/set-buffer[^\n]*ping/g) || [];
+      const typeMatches = tmuxLog.match(/send-keys -t %43 -l ping/g) || [];
       assert.equal(typeMatches.length, 1, 'fresh attempt should type once; retries with draft should be submit-only');
       const cmMatches = tmuxLog.match(/'send-keys' '-t' '%43' 'C-m'/g) || [];
       assert.ok(cmMatches.length > 0, 'submit should use atomic C-m commands');
@@ -2386,7 +2386,7 @@ exit 0
       assert.equal(second.status, 0, second.stderr || second.stdout);
 
       const boundedLog = await readFile(tmuxLogPath, 'utf8');
-      let sends = boundedLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      let sends = boundedLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 1, 'cadence should suppress a second Ralph steer inside 60s');
 
       const watcherState = JSON.parse(await readFile(statePath, 'utf-8'));
@@ -2404,7 +2404,7 @@ exit 0
       assert.equal(third.status, 0, third.stderr || third.stdout);
 
       const finalLog = await readFile(tmuxLogPath, 'utf8');
-      sends = finalLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      sends = finalLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 2, 'Ralph steer should fire again once the 60s cadence elapses');
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -2451,7 +2451,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'fresh progress should suppress continue steer even after cooldown elapses');
 
       const watcherState = JSON.parse(await readFile(statePath, 'utf-8'));
@@ -2501,7 +2501,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 1, 'stale progress should still allow continue steer once cooldown elapses');
 
       const watcherState = JSON.parse(await readFile(statePath, 'utf-8'));
@@ -2555,7 +2555,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'stale starting phase should suppress continue steer');
 
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -2638,7 +2638,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'active native subagents should block fallback continue steer');
 
       const watcherState = JSON.parse(await readFile(statePath, 'utf-8'));
@@ -2704,7 +2704,7 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, '%42');
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'missing or invalid progress should fail closed without sending steer');
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -2754,7 +2754,7 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, '');
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      assert.equal(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/.test(tmuxLog), false);
+      assert.equal(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/.test(tmuxLog), false);
       assert.equal(/display-message -p -t %42 #{pane_id}/.test(tmuxLog), false, 'watcher should not guess a pane when tmux_pane_id is missing');
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -2826,8 +2826,8 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, livePane);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /if-shell -t %99[^\n]*paste-buffer/);
+      assert.match(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -2855,21 +2855,21 @@ echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "if-shell" ]]; then
-  success="\${5:-}"
   target=""
   condition=""
+  thenCommand=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
       -F) condition="$2"; shift 2 ;;
-      *) shift ;;
+      *) if [[ -z "$thenCommand" ]]; then thenCommand="$1"; fi; shift ;;
     esac
   done
   pid=""
   if [[ "$target" == "${anchorPane}" ]]; then pid="9901"; fi
   if [[ "$target" == "${livePane}" ]]; then pid="4201"; fi
   if [[ -n "$pid" && "$condition" == *"#{pane_id},$target"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},$pid"* ]]; then
-    receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
+    receipt="\${thenCommand##*display-message -p }"; receipt="\${receipt%% *}"; printf '%s\n' "$receipt"
   fi
   exit 0
 fi
@@ -3083,8 +3083,8 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, anchorPane);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /if-shell -t %42[^\n]*paste-buffer/);
+      assert.match(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3154,8 +3154,8 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, livePane);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /if-shell -t %99[^\n]*paste-buffer/);
+      assert.match(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3229,8 +3229,8 @@ exit 0
       assert.match(tmuxLog, /display-message -p -t %99 #{pane_id}\t#{pane_dead}\t#{pane_pid}/);
       assert.doesNotMatch(tmuxLog, /display-message -p -t %99 #S/);
       assert.match(tmuxLog, /list-panes -s -t .*sess-ralph-dead-anchor/);
-      assert.match(tmuxLog, /set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /if-shell -t %99[^\n]*paste-buffer/);
+      assert.match(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3276,7 +3276,7 @@ exit 0
       assert.equal(first.status, 0, first.stderr || first.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 1, 'empty startup state should send the first Ralph steer immediately once progress is stale');
 
       const watcherState = JSON.parse(await readFile(statePath, 'utf-8'));
@@ -3337,7 +3337,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 1, 'invalid last_sent_at should fall back to the persisted cooldown anchor once 60s have elapsed');
 
       const watcherState = JSON.parse(await readFile(statePath, 'utf-8'));
@@ -3397,7 +3397,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'blocked_on_user should suppress Ralph continue steer');
 
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -3477,7 +3477,7 @@ exit 0
       assert.equal(clearedRun.status, 0, clearedRun.stderr || clearedRun.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 1, 'terminal/cleared Ralph state must stop additional periodic steer sends');
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -3526,7 +3526,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'stale starting phase should block Ralph continue steer');
 
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -3578,7 +3578,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'blocked_on_user should suppress Ralph continue steer');
 
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -3637,7 +3637,7 @@ exit 0
       assert.equal(second.exitCode, 0);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 1, 'shared timestamp + lock should allow only one concurrent Ralph steer send');
 
       const sharedTimestamp = (await readFile(sharedTimestampPath, 'utf-8')).trim();
@@ -3781,7 +3781,7 @@ exit 0
       }
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const typeMatches = tmuxLog.match(/set-buffer[^\n]*ping/g) || [];
+      const typeMatches = tmuxLog.match(/send-keys -t %43 -l ping/g) || [];
       assert.equal(typeMatches.length, 3, 'should retype on every retry when trigger not in narrow capture (fresh + 2 retries)');
 
       const request = await readDispatchRequest('dispatch-team', queued.request.request_id, wd);
@@ -3968,7 +3968,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'stale current-session identity must block Ralph continue injection');
 
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -4018,7 +4018,7 @@ exit 0
       assert.equal(run.status, 0, run.stderr || run.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8').catch(() => '');
-      const sends = tmuxLog.match(/set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
+      const sends = tmuxLog.match(/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g) || [];
       assert.equal(sends.length, 0, 'fresh sessions must ignore stale root Ralph state');
 
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -4094,7 +4094,7 @@ exit 0
 
       await waitFor(async () => {
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
-        return /set-buffer[^\n]*Ralph loop active continue \[OMX_TMUX_INJECT\]/.test(tmuxLog);
+        return /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/.test(tmuxLog);
       }, 4000, 50);
 
       assert.ok(isPidAlive(child.pid), 'expected watcher to stay alive while Ralph remains active');
