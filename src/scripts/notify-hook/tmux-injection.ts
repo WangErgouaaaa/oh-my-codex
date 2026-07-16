@@ -701,9 +701,11 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
 
   // Shared pane-state guard: skip injection when the target pane is scrolling,
   // has returned to a shell, is still bootstrapping, or is visibly busy.
+  let readinessPanePid: number | undefined;
   try {
     const paneGuard = await evaluatePaneInjectionReadiness(paneTarget, {
       skipIfScrolling: config.skip_if_scrolling,
+      exactPaneId: paneTarget,
     });
     if (!paneGuard.ok) {
       const reason = mapPaneInjectionReadinessReason(paneGuard.reason);
@@ -720,8 +722,30 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
       });
       return;
     }
-  } catch {
-    // Non-fatal: if querying pane state fails, proceed with injection.
+    readinessPanePid = asNumber(paneGuard.exactPaneProof?.pid);
+    if (!Number.isInteger(readinessPanePid) || readinessPanePid <= 0) {
+      state.last_reason = 'pane_readiness_unverified';
+      state.last_event_at = nowIso;
+      await writeFile(hookStatePath, JSON.stringify(state, null, 2)).catch(() => {});
+      await logTmuxHookEvent(logsDir, {
+        ...baseLog,
+        event: 'injection_skipped',
+        reason: 'pane_readiness_unverified',
+        pane_target: paneTarget,
+      });
+      return;
+    }
+  } catch (error) {
+    const reason = `pane_proof_unavailable:${error instanceof Error ? error.message : String(error)}`;
+    updateStateForAttempt(false, reason);
+    await writeFile(hookStatePath, JSON.stringify(state, null, 2)).catch(() => {});
+    await logTmuxHookEvent(logsDir, {
+      ...baseLog,
+      event: 'injection_skipped',
+      reason,
+      pane_target: paneTarget,
+    });
+    return;
   }
 
   if (config.dry_run) {
@@ -741,6 +765,8 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
     const sendResult = await sendPaneInput({
       paneTarget,
       prompt,
+      exactPaneId: paneTarget,
+      expectedPanePid: readinessPanePid,
       submitKeyPresses: argv.submitArgv.length,
       submitDelayMs: 25,
     });

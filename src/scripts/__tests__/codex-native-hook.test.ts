@@ -261,6 +261,10 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" && "\${@: -1}" == "@omx_team_pane_owner_id" ]]; then
+  printf '%s\n' 'team:test'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   fmt=""
   while [[ "$#" -gt 0 ]]; do
@@ -21856,13 +21860,17 @@ PY`,
         name: "worker-stop-team-terminal",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await writeJson(join(cwd, ".omx", "state", "team", "worker-stop-team-terminal", "manifest.v2.json"), {
         name: "worker-stop-team-terminal",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await seedWorkerStopTeamFixture(cwd, "worker-stop-team-terminal", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
@@ -21954,13 +21962,17 @@ PY`,
         name: "worker-stop-team-busy-leader",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await writeJson(join(teamDir, "manifest.v2.json"), {
         name: "worker-stop-team-busy-leader",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await seedWorkerStopTeamFixture(cwd, "worker-stop-team-busy-leader", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
@@ -22034,9 +22046,11 @@ PY`,
         name: teamName,
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
         workers: [
-          { name: "worker-1", index: 1, pane_id: "%10" },
-          { name: "worker-2", index: 2, pane_id: "%11" },
+          { name: "worker-1", index: 1, pane_id: "%10", pid: 12310 },
+          { name: "worker-2", index: 2, pane_id: "%11", pid: 12311 },
         ],
       });
       await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1", "worker-2"]);
@@ -22085,9 +22099,11 @@ PY`,
         name: teamName,
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
         workers: [
-          { name: "worker-1", index: 1, pane_id: "%10" },
-          { name: "worker-2", index: 2, pane_id: "%11" },
+          { name: "worker-1", index: 1, pane_id: "%10", pid: 12310 },
+          { name: "worker-2", index: 2, pane_id: "%11", pid: 12311 },
         ],
       });
       await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1", "worker-2"]);
@@ -22237,7 +22253,9 @@ PY`,
         name: teamName,
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-2", index: 2, pane_id: "%11" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-2", index: 2, pane_id: "%11", pid: 12311 }],
       });
       await seedWorkerStopTeamFixture(cwd, teamName, ["worker-2"]);
       process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
@@ -22277,7 +22295,9 @@ PY`,
         name: teamName,
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
       await rm(join(teamDir, "workers"), { recursive: true, force: true });
@@ -22328,7 +22348,9 @@ PY`,
         name: teamName,
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
       await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { removePathOnSend: teamDir, teamOwnerId: `team:${teamName}` }));
@@ -22365,7 +22387,9 @@ PY`,
         name: teamName,
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
       await writeFile(
@@ -22437,13 +22461,17 @@ PY`,
         name: "worker-stop-helper-fail",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await writeJson(join(stateDir, "team", "worker-stop-helper-fail", "manifest.v2.json"), {
         name: "worker-stop-helper-fail",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await seedWorkerStopTeamFixture(cwd, "worker-stop-helper-fail", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
@@ -22512,7 +22540,9 @@ PY`,
         name: "worker-stop-failed-task",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await writeJson(join(workerDir, "identity.json"), {
         name: "worker-1",
@@ -22680,7 +22710,9 @@ PY`,
         name: "internal-stop-team",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await seedWorkerStopTeamFixture(cwd, "internal-stop-team", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
@@ -22750,7 +22782,9 @@ PY`,
         name: "worker-owned-task",
         tmux_session: "omx-team-worker-stop",
         leader_pane_id: "%42",
-        workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
+        leader_pane_pid: 12345,
+        tmux_pane_owner_id: "team:test",
+        workers: [{ name: "worker-1", index: 1, pane_id: "%10", pid: 12310 }],
       });
       await writeJson(join(workerDir, "identity.json"), {
         name: "worker-1",

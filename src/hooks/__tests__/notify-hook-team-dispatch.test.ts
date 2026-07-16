@@ -90,6 +90,11 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   exit 0
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_team_pane_owner_id" ]]; then
+  echo "team:alpha"
+  exit 0
+fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${tmuxLogPath}.buffer"
   exit 0
@@ -141,6 +146,32 @@ fi
 exit 0
 `;
 }
+
+function assertFreshExactProofBeforePaneEffects(tmuxLog: string, paneId: string): void {
+  const commands = tmuxLog.trim().split('\n').filter(Boolean);
+  const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
+  const ownerProof = new RegExp(`^show-option -qv -p -t ${paneId} @omx_team_pane_owner_id$`);
+  const effects = commands
+    .map((command, index) => ({ command, index }))
+    .filter(({ command }) => (
+      command.startsWith(`paste-buffer -t ${paneId} `)
+      || command.startsWith(`kill-pane -t ${paneId} `)
+      || (command.startsWith(`send-keys -t ${paneId} `) && !command.includes(' -l '))
+    ));
+
+  assert.ok(effects.length > 0, `expected explicit pane effects for ${paneId}:\n${commands.join('\n')}`);
+  for (const { command, index } of effects) {
+    assert.match(commands[index - 1] ?? '', exactGlobalPaneProof, `final PID proof must immediately precede ${command}`);
+    assert.match(commands[index - 2] ?? '', ownerProof, `owner proof must immediately precede the final PID proof for ${command}`);
+    assert.match(commands[index - 3] ?? '', exactGlobalPaneProof, `initial PID proof must precede owner proof for ${command}`);
+  }
+}
+
+function bindCanonicalTeamPaneAuthority(config: { tmux_pane_owner_id?: string; hud_pane_id?: string | null }, hudPaneId = '%88'): void {
+  config.tmux_pane_owner_id = 'team:alpha';
+  config.hud_pane_id = hudPaneId;
+}
+
 
 async function readTeamDeliveryLog(cwd: string): Promise<Array<Record<string, unknown>>> {
   const path = join(cwd, '.omx', 'logs', `team-delivery-${new Date().toISOString().slice(0, 10)}.jsonl`);
@@ -822,8 +853,204 @@ exit 0
       await rm(cwd, { recursive: true, force: true });
     }
   });
+  it('uses the persisted worker pane as an exact identity without generic resolution', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
 
-  it('leader-fixed dispatch prefers the canonical codex pane over a stale HUD leader pane id', async () => {
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const cfg = await readTeamConfig('alpha', cwd);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing team config');
+      cfg.workers[0].pane_id = '%99';
+      cfg.workers[0].pid = 9999;
+      bindCanonicalTeamPaneAuthority(cfg);
+      await saveTeamConfig(cfg, cwd);
+      await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        trigger_message: 'use the configured worker pane',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.processed, 1);
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+      assertFreshExactProofBeforePaneEffects(tmuxLog, '%99');
+      assert.match(tmuxLog, /send-keys -t %99/);
+      assert.doesNotMatch(tmuxLog, /display-message -p -t %99 #\{pane_id\}/);
+      assert.doesNotMatch(tmuxLog, /list-panes -t /);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed without a canonical PID for explicit worker and leader panes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-missing-pane-pid-'));
+    try {
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const config = await readTeamConfig('alpha', cwd);
+      assert.ok(config?.workers[0]);
+      if (!config?.workers[0]) throw new Error('missing worker');
+      config.workers[0].pane_id = '%42';
+      config.leader_pane_id = '%99';
+      await saveTeamConfig(config, cwd);
+      const worker = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox', to_worker: 'worker-1', worker_index: 1, trigger_message: 'do not send',
+      }, cwd);
+      const leader = await enqueueDispatchRequest('alpha', {
+        kind: 'nudge', to_worker: 'leader-fixed', trigger_message: 'leader do not send',
+      }, cwd);
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 2);
+      assert.equal((await readDispatchRequest('alpha', worker.request.request_id, cwd))?.last_reason, 'missing_exact_pane_pid');
+      assert.equal((await readDispatchRequest('alpha', leader.request.request_id, cwd))?.last_reason, 'missing_exact_pane_pid');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not send when a guarded worker pane is reused before input effects', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-pane-pid-reuse-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const proofSequencePath = join(cwd, 'exact-pane-sequence.txt');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      await writeFile(proofSequencePath, [
+        '%42\\t0\\t4242', '%42\\t0\\t4242', '%42\\t0\\t4242',
+        '%42\\t0\\t4242', '%42\\t0\\t4242', '%42\\t0\\t4242',
+        '%42\\t0\\t5252',
+      ].join('\n'));
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+      process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE = proofSequencePath;
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const config = await readTeamConfig('alpha', cwd);
+      assert.ok(config?.workers[0]);
+      if (!config?.workers[0]) throw new Error('missing worker');
+      config.workers[0].pane_id = '%42';
+      config.workers[0].pid = 4242;
+      bindCanonicalTeamPaneAuthority(config);
+      await saveTeamConfig(config, cwd);
+      const queued = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox', to_worker: 'worker-1', worker_index: 1, trigger_message: 'do not send',
+      }, cwd);
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 1);
+      assert.equal((await readDispatchRequest('alpha', queued.request.request_id, cwd))?.last_reason, 'exact_pane_unavailable');
+      const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+      assert.doesNotMatch(tmuxLog, /(?:paste-buffer|send-keys) -t %42/, 'replacement pane must receive no input effect');
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      delete process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE;
+      delete process.env.OMX_TEST_EXACT_PANE_COUNTER_FILE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before tmux effects when request and configured panes differ', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const cfg = await readTeamConfig('alpha', cwd);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing team config');
+      cfg.workers[0].pane_id = '%99';
+      await saveTeamConfig(cfg, cwd);
+      const queued = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        pane_id: '%42',
+        trigger_message: 'must not be redirected',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 1);
+
+      const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+      assert.equal(request?.status, 'failed');
+      assert.equal(request?.last_reason, 'exact_pane_mismatch');
+      assert.equal(await readFile(tmuxLogPath, 'utf8').catch(() => ''), '');
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it('fails an invalid request pane without session or index fallback', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+
+      await initTeamState('alpha', 'task', 'executor', 1, cwd);
+      const cfg = await readTeamConfig('alpha', cwd);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing team config');
+      cfg.tmux_session = 'must-not-resolve';
+      delete cfg.workers[0].pane_id;
+      await saveTeamConfig(cfg, cwd);
+      const queued = await enqueueDispatchRequest('alpha', {
+        kind: 'inbox',
+        to_worker: 'worker-1',
+        worker_index: 1,
+        pane_id: 'invalid-pane-id',
+        trigger_message: 'must not be sent',
+      }, cwd);
+
+      const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
+      const mod = await import(pathToFileURL(modulePath).href);
+      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      assert.equal(result.failed, 1);
+
+      const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
+      assert.equal(request?.last_reason, 'exact_pane_unavailable');
+      assert.equal(await readFile(tmuxLogPath, 'utf8').catch(() => ''), '');
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the persisted leader pane as an exact identity without resolver healing', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
     const fakeBinDir = join(cwd, 'fake-bin');
     const tmuxLogPath = join(cwd, 'tmux.log');
@@ -876,7 +1103,7 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$fmt" == "#{pane_start_command}" && "$target" == "%91" ]]; then
-    echo "node dist/cli/omx.js hud --watch"
+    echo "codex"
     exit 0
   fi
   if [[ "$fmt" == "#{pane_start_command}" && "$target" == "%42" ]]; then
@@ -891,6 +1118,10 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "codex"
     exit 0
   fi
+  exit 0
+fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_team_pane_owner_id" ]]; then
+  echo "team:alpha"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -1023,6 +1254,10 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   exit 0
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_team_pane_owner_id" ]]; then
+  echo "team:alpha"
+  exit 0
+fi
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${tmuxLogPath}.buffer"
   exit 0
@@ -1052,7 +1287,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf "%%77\\t1\\tcodex\\tcodex\\n"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf "%%77\\t0\\t7777\\n"
+  else
+    printf "%%77\\t1\\tcodex\\tcodex\\n"
+  fi
   exit 0
 fi
 exit 0
@@ -1066,6 +1305,8 @@ exit 0
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
       cfg.leader_pane_id = '%77';
+      cfg.leader_pane_pid = 7777;
+      bindCanonicalTeamPaneAuthority(cfg);
       await saveTeamConfig(cfg, cwd);
 
       const msg = await sendDirectMessage('alpha', 'worker-1', 'leader-fixed', 'hello leader', cwd);

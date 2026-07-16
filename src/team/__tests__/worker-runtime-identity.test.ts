@@ -268,7 +268,10 @@ process.on('SIGTERM', () => process.exit(0));
       if (!config) return;
       config.tmux_session = 'omx-team-low-role-scale';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42421;
+      config.tmux_pane_owner_id = 'team:low-role-scale';
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42422;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'manifest.v2.json');
@@ -300,6 +303,7 @@ process.on('SIGTERM', () => process.exit(0));
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /runtime\/worker-2-startup\.sh/);
+      assert.match(tmuxLog, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/m);
       const startupScript = await readFile(
         join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'runtime', 'worker-2-startup.sh'),
         'utf-8',
@@ -391,7 +395,10 @@ process.on('SIGTERM', () => process.exit(0));
       if (!config) return;
       config.tmux_session = 'omx-team-exact-role-cli';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42421;
+      config.tmux_pane_owner_id = 'team:exact-role-cli';
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42422;
       config.next_worker_index = 3;
       await saveTeamConfig(config, cwd);
 
@@ -434,6 +441,7 @@ process.on('SIGTERM', () => process.exit(0));
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /worker-3-startup\.sh/);
+      assert.match(tmuxLog, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/m);
       assert.doesNotMatch(tmuxLog, /\bclaude\b/);
       assert.doesNotMatch(tmuxLog, /\bgemini\b/);
     } finally {
