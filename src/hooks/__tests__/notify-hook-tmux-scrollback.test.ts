@@ -129,7 +129,10 @@ if [[ "$cmd" == "delete-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  printf '%s\n' "$receipt"
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then

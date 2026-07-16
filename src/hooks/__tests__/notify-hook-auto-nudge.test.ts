@@ -104,7 +104,7 @@ function escapeRegex(value: string): string {
 
 function atomicPaneMutationPattern(targetPane: string, prompt: string): RegExp {
   return new RegExp(
-    `set-buffer -b [^\\n]+ -- ${escapeRegex(prompt)}[\\s\\S]*?if-shell -t ${escapeRegex(targetPane)} -F .*'paste-buffer'.*'${escapeRegex(targetPane)}'.*__OMX_PANE_MUTATION_OK__`,
+    `set-buffer -b [^\\n]+ -- ${escapeRegex(prompt)}[\\s\\S]*?if-shell -t ${escapeRegex(targetPane)} -F .*'paste-buffer'.*'${escapeRegex(targetPane)}'.*display-message -p [a-f0-9]{32}`,
   );
 }
 
@@ -161,10 +161,10 @@ if [[ "\$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "\$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "\$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "\$cmd" == "delete-buffer" ]]; then
@@ -321,7 +321,7 @@ describe('notify-hook auto-nudge', () => {
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, defaultAutoNudgePattern('%99'), 'should send nudge response with injection marker');
       // Codex CLI needs C-m sent twice with a delay for reliable submission
-      const cmMatches = tmuxLog.match(/if-shell -t %99 -F .*'send-keys'.*'%99'.*'C-m'.*__OMX_PANE_MUTATION_OK__/g);
+      const cmMatches = tmuxLog.match(/if-shell -t %99 -F .*'send-keys'.*'%99'.*'C-m'.*display-message -p [a-f0-9]{32}/g);
       assert.ok(cmMatches && cmMatches.length >= 2, `should submit C-m twice through atomic receipts, got ${cmMatches?.length ?? 0}`);
     });
   });
@@ -761,10 +761,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -906,10 +906,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1052,10 +1052,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1198,10 +1198,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1340,10 +1340,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1530,10 +1530,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1676,10 +1676,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1803,10 +1803,10 @@ if [[ "$cmd" == "show-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  command="\${@: -2:1}"
-  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
-    printf '__OMX_PANE_MUTATION_OK__\n'
-  fi
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then

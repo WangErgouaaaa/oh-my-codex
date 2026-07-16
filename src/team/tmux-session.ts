@@ -2958,6 +2958,8 @@ export function shouldAttemptAdaptiveRetry(
 interface SendPaneAuthority {
   paneId: string;
   panePid: string;
+  /** Additional immutable split authority evaluated at the tmux sink. */
+  finalCondition?: string;
   revalidateAuthority?: SendPaneAuthorityRevalidator;
 }
 
@@ -2979,31 +2981,42 @@ function assertSendPaneAuthority(
 }
 
 function buildSendPaneIncarnationCondition(authority: SendPaneAuthority): string {
-  return `#{&&:#{==:#{pane_id},${authority.paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${authority.panePid}}}}`;
+  const incarnation = `#{&&:#{==:#{pane_id},${authority.paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${authority.panePid}}}}`;
+  return authority.finalCondition ? `#{&&:${incarnation},${authority.finalCondition}}` : incarnation;
 }
 
-function quoteTmuxCommandArgument(value: string): string {
-  return JSON.stringify(value);
+function quoteTmuxCommandLiteral(value: string): string {
+  // tmux's command parser treats double-quoted values as format-expandable.
+  // Single-quote and escape the only special single-quote sequence instead.
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function buildAtomicSendKeysCommand(authority: SendPaneAuthority, key: string, literal: boolean): string {
   return literal
-    ? `send-keys -t ${authority.paneId} -l -- ${quoteTmuxCommandArgument(key)}`
-    : `send-keys -t ${authority.paneId} ${quoteTmuxCommandArgument(key)}`;
+    ? `send-keys -t ${authority.paneId} -l -- ${quoteTmuxCommandLiteral(key)}`
+    : `send-keys -t ${authority.paneId} ${quoteTmuxCommandLiteral(key)}`;
+}
+
+function createSendReceipt(): string {
+  return `__OMX_SEND_AUTHORITY_${randomUUID().replaceAll('-', '')}__`;
 }
 
 async function runAtomicPaneCommandAsync(authority: SendPaneAuthority, command: string, stage: string): Promise<string> {
   if (authority.revalidateAuthority !== undefined && !authority.revalidateAuthority()) {
     throw new Error(`sendToWorker: pane authority changed before ${stage}`);
   }
-  const rejectedMarker = '__omx_send_authority_rejected__';
+  const receipt = createSendReceipt();
   const result = await runTmuxAsync([
-    'if-shell', '-F', '-t', authority.paneId, buildSendPaneIncarnationCondition(authority), command,
-    `display-message -p ${quoteTmuxCommandArgument(rejectedMarker)}`,
+    'if-shell', '-F', '-t', authority.paneId, buildSendPaneIncarnationCondition(authority),
+    `${command} \\; display-message -p ${receipt}`,
+    `display-message -p __omx_send_authority_rejected_${receipt}`,
   ]);
   if (!result.ok) throw new Error(`sendToWorker: failed ${stage}: ${result.stderr}`);
-  if (result.stdout === `${rejectedMarker}\n`) throw new Error(`sendToWorker: pane authority changed before ${stage}`);
-  return result.stdout;
+  const framedReceipt = `${receipt}\n`;
+  if (!result.stdout.endsWith(framedReceipt) || result.stdout.endsWith(`\r\n${framedReceipt}`)) {
+    throw new Error(`sendToWorker: pane authority changed before ${stage}`);
+  }
+  return result.stdout.slice(0, -framedReceipt.length);
 }
 
 async function requireAtomicCapturePaneEvidenceAsync(
@@ -3027,13 +3040,17 @@ function resolveSendPaneAuthority(
   workerPaneId: string | undefined,
   expectedPanePid: string | number | undefined,
   revalidateAuthority: SendPaneAuthorityRevalidator | undefined,
+  finalCondition?: string,
 ): SendPaneAuthority {
   const paneId = parseCanonicalTmuxPaneId(workerPaneId);
   const panePid = String(expectedPanePid ?? '').trim();
   if (!paneId || !/^[1-9][0-9]*$/.test(panePid)) {
     throw new Error('sendToWorker: immutable pane_id and pane_pid authority are required');
   }
-  return { paneId, panePid, revalidateAuthority };
+  if (finalCondition !== undefined && finalCondition.trim() === '') {
+    throw new Error('sendToWorker: final pane authority condition is required when supplied');
+  }
+  return { paneId, panePid, finalCondition, revalidateAuthority };
 }
 
 async function sendAtomicWorkerKeyAsync(authority: SendPaneAuthority, key: string, stage: string): Promise<void> {
@@ -3041,7 +3058,16 @@ async function sendAtomicWorkerKeyAsync(authority: SendPaneAuthority, key: strin
 }
 
 async function sendAtomicLiteralTextAsync(authority: SendPaneAuthority, text: string, stage: string): Promise<void> {
-  await runAtomicPaneCommandAsync(authority, buildAtomicSendKeysCommand(authority, text, true), stage);
+  const bufferName = `omx-send-${randomUUID().replaceAll('-', '')}`;
+  const staged = await runTmuxAsync(['set-buffer', '-b', bufferName, '--', text]);
+  if (!staged.ok) throw new Error(`sendToWorker: failed ${stage}: ${staged.stderr}`);
+  try {
+    // paste-buffer receives the exact argv payload staged above; unlike a nested
+    // send-keys command it cannot reinterpret $, quotes, backslashes, or Unicode.
+    await runAtomicPaneCommandAsync(authority, `paste-buffer -d -b ${bufferName} -t ${authority.paneId}`, stage);
+  } finally {
+    await runTmuxAsync(['delete-buffer', '-b', bufferName]);
+  }
 }
 
 function paneHasQueuedCodexSubmission(captured: string | null | undefined): boolean {
@@ -3319,9 +3345,10 @@ export async function sendToWorker(
   workerCli?: TeamWorkerCli,
   expectedPanePid?: string | number,
   revalidateAuthority?: SendPaneAuthorityRevalidator,
+  finalCondition?: string,
 ): Promise<void> {
   assertWorkerTriggerText(text);
-  const authority = resolveSendPaneAuthority(workerPaneId, expectedPanePid, revalidateAuthority);
+  const authority = resolveSendPaneAuthority(workerPaneId, expectedPanePid, revalidateAuthority, finalCondition);
   const strategy = resolveSendStrategyFromEnv();
   const resolvedWorkerCli = resolveWorkerCliForSend(workerIndex, workerCli);
   const capturedStr = await requireAtomicCapturePaneEvidenceAsync(authority, 80, 'pre_dispatch_scrollback');

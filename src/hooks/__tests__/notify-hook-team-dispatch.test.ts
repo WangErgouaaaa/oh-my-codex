@@ -45,7 +45,7 @@ if [[ "$cmd" == "capture-pane" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   if [[ "$*" == *"send-keys"* && "$*" == *"C-m"* && -n "\${OMX_TEST_TEAM_PID_AFTER_SEND:-}" ]]; then touch "${tmuxLogPath}.sent"; fi
-  if [[ "$*" == *"__OMX_PANE_MUTATION_OK__"* ]]; then printf '__OMX_PANE_MUTATION_OK__\n'; fi
+  success="\${5:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 
@@ -813,7 +813,7 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
       assert.doesNotMatch(tmuxLog, /if-shell -t %99/);
-      assert.match(tmuxLog, /list-panes -a/);
+      assert.match(tmuxLog, /display-message -p -t %99 #\{pane_id\}/);
 
 
     } finally {

@@ -481,7 +481,10 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  printf '%s\n' "$receipt"
   exit 0
 fi
 
@@ -644,7 +647,10 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  printf '%s\n' "$receipt"
   exit 0
 fi
 
@@ -1152,7 +1158,10 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  printf '%s\n' "$receipt"
   exit 0
 fi
 
@@ -1309,7 +1318,10 @@ if [[ "$cmd" == "list-panes" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  printf '%s\n' "$receipt"
   exit 0
 fi
 
@@ -1446,7 +1458,10 @@ if [[ "$cmd" == "list-panes" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  printf '%s\n' "$receipt"
   exit 0
 fi
 
@@ -2024,7 +2039,10 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  printf '%s\n' "$receipt"
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then

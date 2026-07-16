@@ -373,6 +373,15 @@ function isScalePaneStablyLive(paneId: string, expectedPid: string): boolean {
   return true;
 }
 
+function parseScaleSplitAuthorityOutput(output: string): { paneId: string; panePid: string; sessionId: string } | null {
+  const line = parseExactTmuxAuthorityScalar(output);
+  const match = line ? /^(%[1-9][0-9]*)\t([1-9][0-9]*)\t(\$[0-9]+)$/.exec(line) : null;
+  const paneId = parseCanonicalTmuxPaneId(match?.[1]);
+  return match && paneId && paneId === match[1]
+    ? { paneId, panePid: match[2]!, sessionId: match[3]! }
+    : null;
+}
+
 function hasScaleSplitRollbackAuthority(authority: VerifiedScaleSplitPane): boolean {
   const paneId = parseCanonicalTmuxPaneId(authority.paneId);
   const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
@@ -625,6 +634,7 @@ async function notifyWorkerPaneOutcome(
       workerCli,
       authority.panePid,
       () => revalidateScaleSplitAuthority(authority),
+      buildScaleSplitRollbackCondition(authority) ?? undefined,
     );
     return { ok: true, transport: 'tmux_send_keys', reason: 'tmux_send_keys_sent' };
   } catch (error) {
@@ -976,7 +986,7 @@ export async function scaleUp(
         });
       }
       const result = spawnSync('tmux', [
-        'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd,
+        'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}\t#{pane_pid}\t#{session_id}', '-c', workerCwd,
         writeScaleSplitOperationMarkedCommand(cmd, operationMarker),
       ], { encoding: 'utf-8' });
 
@@ -985,6 +995,55 @@ export async function scaleUp(
           `Failed to create tmux pane for ${workerName}: ${(result.stderr || '').trim()}`,
           { workerName, worktreePath: workerWorkspace?.worktreePath },
         );
+      }
+      const splitScalar = parseExactTmuxAuthorityScalar(result.stdout || '');
+      if (!splitScalar) {
+        return await rollbackScaleUp(`Failed to capture atomic tmux split authority for ${workerName}`, {
+          workerName, worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      const splitAuthority = parseScaleSplitAuthorityOutput(result.stdout || '');
+      let earlyAuthority: VerifiedScaleSplitPane | null = null;
+      if (splitAuthority && !preSplitGlobalPaneIds.has(splitAuthority.paneId)) {
+        earlyAuthority = {
+          paneId: splitAuthority.paneId,
+          panePid: splitAuthority.panePid,
+          sessionName,
+          sessionId: splitAuthority.sessionId,
+          ownerId: teamPaneOwnerId,
+          ownerOption,
+          ownerProof: provisionalProof,
+          ownerTagged: false,
+          operationMarker,
+        };
+        operationPaneIds.add(earlyAuthority.paneId);
+        operationPaneAuthorities.set(earlyAuthority.paneId, earlyAuthority);
+      }
+      if (!earlyAuthority) {
+        const markerPaneId = findScaleSplitOperationMarkerPaneId(operationMarker);
+        const markerIncarnation = markerPaneId && !preSplitGlobalPaneIds.has(markerPaneId)
+          ? readScalePaneIncarnation(markerPaneId)
+          : null;
+        if (markerPaneId && markerIncarnation) {
+          earlyAuthority = {
+            paneId: markerPaneId,
+            panePid: markerIncarnation.panePid,
+            sessionName,
+            sessionId: markerIncarnation.sessionId,
+            ownerId: teamPaneOwnerId,
+            ownerOption,
+            ownerProof: provisionalProof,
+            ownerTagged: false,
+            operationMarker,
+          };
+          operationPaneIds.add(markerPaneId);
+          operationPaneAuthorities.set(markerPaneId, earlyAuthority);
+        }
+      }
+      if (splitAuthority && preSplitGlobalPaneIds.has(splitAuthority.paneId)) {
+        return await rollbackScaleUp(`Failed to validate fresh tmux split authority for ${workerName}`, {
+          paneId: earlyAuthority?.paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
+        });
       }
 
       let postSplitGlobalPaneIds: Set<string> | null = null;
@@ -1032,20 +1091,18 @@ export async function scaleUp(
         }
         if (attempt < 2) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
       }
-      if (!paneId) {
+      if (!paneId || (splitAuthority && paneId !== splitAuthority.paneId)) {
         return await rollbackScaleUp(`Failed to derive exact tmux pane delta for ${workerName}`, {
-          workerName,
-          worktreePath: workerWorkspace?.worktreePath,
+          paneId: earlyAuthority?.paneId ?? splitAuthority?.paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
         });
       }
       const incarnation = readScalePaneIncarnation(paneId);
-      if (!incarnation) {
+      if (!incarnation || (splitAuthority && (incarnation.panePid !== splitAuthority.panePid || incarnation.sessionId !== splitAuthority.sessionId))) {
         return await rollbackScaleUp(`Failed to capture tmux pane incarnation for ${workerName}`, {
           paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
         });
       }
-      operationPaneIds.add(paneId);
-      const provisionalAuthority: VerifiedScaleSplitPane = {
+      const provisionalAuthority: VerifiedScaleSplitPane = earlyAuthority ?? {
         paneId,
         panePid: incarnation.panePid,
         sessionName,
@@ -1056,7 +1113,15 @@ export async function scaleUp(
         ownerTagged: false,
         operationMarker,
       };
-      operationPaneAuthorities.set(paneId, provisionalAuthority);
+      if (!earlyAuthority) {
+        operationPaneIds.add(paneId);
+        operationPaneAuthorities.set(paneId, provisionalAuthority);
+      }
+      if ((!splitAuthority && splitScalar !== paneId) || (splitAuthority && splitAuthority.paneId !== paneId)) {
+        return await rollbackScaleUp(`Failed to validate tmux split output for ${workerName}`, {
+          paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
       const boundProof = `${paneId}:${ownerNonce}`;
       if (
         spawnSync('tmux', ['set-option', '-g', ownerOption, boundProof], { encoding: 'utf-8' }).status !== 0
@@ -1069,13 +1134,6 @@ export async function scaleUp(
         });
       }
       provisionalAuthority.ownerProof = boundProof;
-      if (result.stdout !== `${paneId}\n`) {
-        return await rollbackScaleUp(`Failed to validate tmux split output for ${workerName}`, {
-          paneId,
-          workerName,
-          worktreePath: workerWorkspace?.worktreePath,
-        });
-      }
       if (
         !postSplitGlobalPaneIds
         || !postSplitSessionPaneOwners

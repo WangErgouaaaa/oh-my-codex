@@ -558,6 +558,11 @@ if [[ "$cmd" == "list-panes" ]]; then
       printf "%%42\t0\t4242\t1\tcodex --model gpt-5\n"
       [[ "\${OMX_TEST_MIXED_DEAD:-}" == "1" ]] && printf "%%77\t1\t0\t0\tremain-on-exit\\n"
     fi
+    case "\${OMX_TEST_DUPLICATE_DETAILED:-}" in
+      dead-dead) printf "%%77\t1\t0\t0\tremain-on-exit\n%%77\t1\t0\t0\tremain-on-exit\n" ;;
+      dead-live) printf "%%77\t1\t0\t0\tremain-on-exit\n%%77\t0\t7777\t0\tcodex\n" ;;
+      live-dead) printf "%%77\t0\t7777\t0\tcodex\n%%77\t1\t0\t0\tremain-on-exit\n" ;;
+    esac
   elif [[ "$*" == *"#{pane_dead}"* ]]; then
     count=0
     [[ -f "$OMX_TEST_TMUX_COUNT" ]] && count="$(<"$OMX_TEST_TMUX_COUNT")"
@@ -573,6 +578,11 @@ if [[ "$cmd" == "list-panes" ]]; then
       [[ "\${OMX_TEST_EXTRA_ID:-}" == "1" ]] && printf "%%99\t0\t9999\\n"
       if [[ "\${OMX_TEST_SESSION_DRIFT:-}" == "1" && "$(<"$OMX_TEST_DETAILED_COUNT")" -gt 1 ]]; then printf "%%99\t0\t9999\\n"; fi
     fi
+    case "\${OMX_TEST_DUPLICATE_SNAPSHOT:-}" in
+      dead-dead) printf "%%77\t1\t0\n%%77\t1\t0\n" ;;
+      dead-live) printf "%%77\t1\t0\n%%77\t0\t7777\n" ;;
+      live-dead) printf "%%77\t0\t7777\n%%77\t1\t0\n" ;;
+    esac
   elif [[ "$*" == *"#{pane_id}"* ]]; then
     if [[ "\${OMX_TEST_SESSION_DRIFT:-}" == "1" && "$(<"$OMX_TEST_DETAILED_COUNT")" -gt 1 ]]; then
       printf "%%42\n%%99\n"
@@ -590,6 +600,7 @@ if [[ "$cmd" == "if-shell" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "load-buffer" || "$cmd" == "delete-buffer" ]]; then
+  printf '%s\n' "$cmd $*" >> "$OMX_TEST_TMUX_LOG"
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
@@ -616,6 +627,24 @@ exit 1
         const mixedDead = await sdk.tmux.sendKeys({ text: 'mixed dead snapshot', sessionName: 'devsess', cooldownMs: 0, submit: false });
         assert.equal(mixedDead.ok, true);
         delete process.env.OMX_TEST_MIXED_DEAD;
+
+        for (const parser of ['DETAILED', 'SNAPSHOT'] as const) {
+          for (const duplicate of ['dead-dead', 'dead-live', 'live-dead'] as const) {
+            await rm(logPath, { force: true });
+            process.env[`OMX_TEST_DUPLICATE_${parser}`] = duplicate;
+            const result = await sdk.tmux.sendKeys({
+              text: `duplicate-${parser}-${duplicate}`,
+              sessionName: 'devsess',
+              cooldownMs: 0,
+              submit: false,
+            });
+            assert.equal(result.ok, false, `${parser} ${duplicate}`);
+            assert.equal(result.reason, 'target_missing', `${parser} ${duplicate}`);
+            assert.equal(existsSync(logPath), false, `${parser} ${duplicate}`);
+            delete process.env[`OMX_TEST_DUPLICATE_${parser}`];
+          }
+        }
+        await writeFile(logPath, '');
 
         process.env.OMX_TEST_EXTRA_ID = '1';
         const mismatched = await sdk.tmux.sendKeys({ text: 'hello mismatch', sessionName: 'devsess', cooldownMs: 0 });
@@ -671,6 +700,8 @@ exit 1
         delete process.env.OMX_TEST_DETAILED_COUNT;
         delete process.env.OMX_TEST_MIXED_DEAD;
         delete process.env.OMX_TEST_DEAD_TARGET;
+        delete process.env.OMX_TEST_DUPLICATE_DETAILED;
+        delete process.env.OMX_TEST_DUPLICATE_SNAPSHOT;
         await rm(cwd, { recursive: true, force: true });
         await rm(fakeBinDir, { recursive: true, force: true });
       }

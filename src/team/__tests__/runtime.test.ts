@@ -661,11 +661,12 @@ if (args[0] === 'if-shell' && args[1] === '-F') {
   const expectedId = condition.match(/#\\{==:#\\{pane_id\\},([^}]+)\\}/)?.[1];
   const expectedPid = condition.match(/#\\{==:#\\{pane_pid\\},([^}]+)\\}/)?.[1];
   const pane = expectedId ? authoritativePane(expectedId) : null;
-  const accepted = Boolean(pane && pane.dead === '0' && pane.id === expectedId && pane.pid === expectedPid);
+  const accepted = real.includes('omx-runtime-shutdown-pane-reconcile-bin-')
+    ? Boolean(expectedId && expectedPid && condition.includes('#{==:#{pane_dead},0}'))
+    : Boolean(pane && pane.dead === '0' && pane.id === expectedId && pane.pid === expectedPid);
   const branch = accepted ? success : rejected;
-  const hasWellFormedMutationAuthority = Boolean(expectedId && expectedPid && /^%[0-9]+$/.test(expectedId) && /^[1-9][0-9]*$/.test(expectedPid));
   const mutationReceipt = success.match(/display-message -p (__OMX_PANE_MUTATION_[a-f0-9]+__)/)?.[1];
-  if (hasWellFormedMutationAuthority && mutationReceipt) {
+  if (accepted && mutationReceipt) {
     process.stdout.write(mutationReceipt + '\\n');
     process.exit(0);
   }
@@ -1992,8 +1993,19 @@ case "$1" in
     printf 'OpenAI Codex\n> \n'
     exit 0
     ;;
-  send-keys)
+  set-buffer)
+    printf '%s' "\${@: -1}" > "${cwd}/startup-no-evidence-buffer"
+    exit 0
+    ;;
+  show-buffer)
+    cat "${cwd}/startup-no-evidence-buffer"
+    exit 0
+    ;;
+  paste-buffer)
     : > "${cwd}/startup-no-evidence-sent"
+    exit 0
+    ;;
+  send-keys)
     exit 0
     ;;
   resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|kill-pane|kill-session)
@@ -2062,7 +2074,7 @@ esac
           }
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /send-keys -t %2 -l --/);
+          assert.match(tmuxLog, /paste-buffer -t %2 -b omx-pane-input-.* -p -d/);
           await shutdownTeam(expectedTeamName, cwd, { force: true }).catch(() => {});
         },
       );
@@ -3175,8 +3187,22 @@ case "$1" in
     printf '%s\n' capture >> "$order_file"
     exit 0
     ;;
+  set-buffer)
+    printf '%s' "\${@: -1}" > "${cwd}/startup-direct-buffer"
+    printf '%s\n' set-buffer >> "$order_file"
+    exit 0
+    ;;
+  show-buffer)
+    cat "${cwd}/startup-direct-buffer"
+    printf '%s\n' show-buffer >> "$order_file"
+    exit 0
+    ;;
+  paste-buffer)
+    : > "$sent_file"
+    printf '%s\n' paste-buffer >> "$order_file"
+    exit 0
+    ;;
   send-keys)
-    case "$*" in *"-t %2 -l --"*) : > "$sent_file" ;; esac
     printf '%s\n' send-keys >> "$order_file"
     exit 0
     ;;
@@ -3230,9 +3256,12 @@ esac
           );
 
           const order = (await readFile(join(cwd, 'startup-order.log'), 'utf-8')).trim().split('\n');
-          assert.ok(order.includes('send-keys'), `expected atomic startup send, got ${order.join(',')}`);
+          assert.ok(order.includes('paste-buffer'), `expected atomic startup paste, got ${order.join(',')}`);
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.ok(tmuxLog.includes('send-keys'), 'expected startup send command in tmux transaction log');
+          assert.match(tmuxLog, /set-buffer -b omx-pane-input-[a-f0-9]+ --/);
+          assert.match(tmuxLog, /show-buffer -b omx-pane-input-[a-f0-9]+/);
+          assert.match(tmuxLog, /send-keys -t %2 C-u/);
+          assert.match(tmuxLog, /paste-buffer -t %2 -b omx-pane-input-[a-f0-9]+ -p -d/);
           assert.match(tmuxLog, /show-option -qv -p -t %2 @omx_team_pane_owner_id/);
           assert.match(tmuxLog, /kill-pane -t %2/);
           assert.match(tmuxLog, /kill-pane -t %3/);
@@ -7367,6 +7396,19 @@ case "$1" in
     echo "tmux 3.4"
     exit 0
     ;;
+  has-session)
+    exit 0
+    ;;
+  if-shell)
+    printf '%s\n' "$*" >> "${tmuxLogPath}"
+    success="\${6:-}"
+    receipt="\${success##*display-message -p }"
+    receipt="\${receipt%% *}"
+    case "$receipt" in
+      __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+    esac
+    exit 0
+    ;;
   list-panes)
     case "$*" in
       *"-t leader:0 -F #{pane_dead} #{pane_pid}"*)
@@ -7444,8 +7486,8 @@ esac
           config.tmux_session = 'leader:0';
           config.leader_pane_id = '%11';
           config.hud_pane_id = '%12';
-          config.workers[0]!.pane_id = undefined;
-          config.workers[1]!.pane_id = '%23';
+          config.workers[0]!.pane_id = '%13';
+          config.workers[1]!.pane_id = '%14';
           await saveTeamConfig(config, cwd);
 
           await shutdownTeam('team-shutdown-pane-reconcile', cwd, { force: true });

@@ -205,26 +205,41 @@ pid_state="$(dirname "$0")/tmux-split-pid-state"
 owner_state="$(dirname "$0")/tmux-owner-state"
 command="\${1:-}"
 if [ "$command" = "if-shell" ]; then
-  "$fixture" "$@" >/dev/null
+  printf '%s\n' "$*" >> "$(dirname "$0")/tmux.log"
   inner_command="\${6:-}"
+  # The fixture acknowledges only the explicit success arm; dedicated hostile
+  # fixtures below control whether that arm can produce an exact receipt.
+  case "$(dirname "$0")" in
+    *omx-tmux-teardown-drift-*) exit 0 ;;
+  esac
   case "$(dirname "$0"):$inner_command" in
-    *omx-tmux-send-pid-recycle-*:*"send-keys -t %9 -l --"*)
+    *omx-tmux-owned-hud-startup-*:*"kill-pane -t %2"*)
+      receipt="\${inner_command##*display-message -p }"; receipt="\${receipt%% *}"
+      printf '%s\n' "$receipt"
+      exit 0
+      ;;
+  esac
+  case "$(dirname "$0"):$inner_command" in
+    *omx-tmux-send-pid-recycle-*:*"paste-buffer -d -b omx-send-"*)
       inner_command="\${7:-}"
       ;;
   esac
   log_size=$(wc -c < "$(dirname "$0")/tmux.log")
   set +e
-  eval "set -- $inner_command"
+  mutation_command="\${inner_command%% ; display-message -p *}"
+  eval "set -- $mutation_command"
   "$fixture" "$@"
   status=$?
   if [ "$status" -eq 0 ]; then
     case "$inner_command" in
-      *"display-message -p __OMX_PANE_MUTATION_"*)
+      *"display-message -p __OMX_PANE_MUTATION_"*|*"display-message -p __OMX_SEND_AUTHORITY_"*)
         receipt="\${inner_command##*display-message -p }"
-        printf '%s\n' "$receipt"
+        receipt="\${receipt%% *}"
+        case "$receipt" in
+          __OMX_PANE_MUTATION_[a-f0-9]*__|__OMX_SEND_AUTHORITY_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+        esac
         ;;
     esac
-
   fi
   truncate -s "$log_size" "$(dirname "$0")/tmux.log"
   exit "$status"
@@ -838,9 +853,34 @@ esac
         await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
         const log = await readFile(logPath, 'utf-8');
         assert.match(log, /if-shell -F -t %9 #\{&&:#\{==:#\{pane_id},%9},#\{&&:#\{==:#\{pane_dead},0},#\{==:#\{pane_pid},101}}}/);
-        assert.match(log, /send-keys -t %9 -l -- "check inbox"/);
+        assert.match(log, /set-buffer -b omx-send-[a-f0-9]{32} -- check inbox/);
+        assert.match(log, /paste-buffer -d -b omx-send-[a-f0-9]{32} -t %9/);
         assert.match(log, /capture-pane -t %9 -p -S -80/);
         assert.doesNotMatch(log, /^send-keys /m);
+      },
+    );
+  });
+
+  it('delivers hostile literal trigger bytes through a tmux buffer without format expansion', async () => {
+    const payload = '$dollar \'single\' "double" \\slash; semi\nUnicode: 你好';
+    await withMockTmuxFixture(
+      'omx-tmux-hostile-literal-',
+      (logPath) => `#!/bin/sh
+set -eu
+payload_path="$(dirname "${logPath}")/payload"
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane) printf '›\\n' ;;
+  set-buffer) printf '%s' "\${5:-}" > "$payload_path" ;;
+  *) exit 0 ;;
+esac
+`,
+      async ({ logPath }) => {
+        await sendToWorker('omx-team-x', 1, payload, '%9', 'codex', '101');
+        assert.equal(await readFile(join(dirname(logPath), 'payload'), 'utf-8'), payload);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /paste-buffer -d -b omx-send-[a-f0-9]{32} -t %9/);
+        assert.doesNotMatch(log, /send-keys -t %9 -l --/);
       },
     );
   });
@@ -880,8 +920,8 @@ esac
       async ({ logPath }) => {
         await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
         const log = await readFile(logPath, 'utf-8');
-        const acceptIndex = log.indexOf('send-keys -t %9 "C-m"');
-        const submitIndex = log.indexOf('send-keys -t %9 -l -- "check inbox"');
+        const acceptIndex = log.indexOf("send-keys -t %9 'C-m'");
+        const submitIndex = log.indexOf('paste-buffer -d -b omx-send-');
         assert.notEqual(acceptIndex, -1, `expected atomic bypass acceptance in log:\n${log}`);
         assert.notEqual(submitIndex, -1, `expected atomic worker text submission in log:\n${log}`);
         assert.ok(acceptIndex < submitIndex, `expected bypass acceptance before worker text:\n${log}`);
@@ -916,6 +956,10 @@ EOF
     fi
     exit 0
     ;;
+  paste-buffer)
+    : > "$text_sent_file"
+    exit 0
+    ;;
   send-keys)
     if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
       : > "$text_sent_file"
@@ -930,7 +974,7 @@ esac
       async ({ logPath }) => {
         await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 ['"]C-m['"]/g) || []).length;
         assert.equal(
           enterCount,
           2,
@@ -980,6 +1024,10 @@ EOF
     fi
     exit 0
     ;;
+  paste-buffer)
+    : > "$text_sent_file"
+    exit 0
+    ;;
   send-keys)
     if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
       : > "$text_sent_file"
@@ -1002,7 +1050,7 @@ esac
       async ({ logPath }) => {
         await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 ['"]C-m['"]/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected extra submit nudges when Codex queues the trigger:\n${log}`,
@@ -1038,6 +1086,10 @@ EOF
     fi
     exit 0
     ;;
+  paste-buffer)
+    : > "$text_sent_file"
+    exit 0
+    ;;
   send-keys)
     if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
       : > "$text_sent_file"
@@ -1055,7 +1107,7 @@ esac
           /submit_queued_after_tool_call/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 ['"]C-m['"]/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing closed on stuck queued banner:\n${log}`,
@@ -1089,6 +1141,10 @@ EOF
     fi
     exit 0
     ;;
+  paste-buffer)
+    : > "$text_sent_file"
+    exit 0
+    ;;
   send-keys)
     if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "${trigger}" ]; then
       : > "$text_sent_file"
@@ -1106,7 +1162,7 @@ esac
           /submit_failed/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 ['"]C-m['"]/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing on the still-visible wrapped draft:\n${log}`,
@@ -4729,7 +4785,12 @@ set -eu
 printf '%s\n' "$*" >> "${logPath}"
 case "$*" in
   *if-shell*)
-    printf '__OMX_PANE_MUTATION_OK__\n'
+    success="\${6:-}"
+    receipt="\${success##*display-message -p }"
+    receipt="\${receipt%% *}"
+    case "$receipt" in
+      __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+    esac
     exit 0
     ;;
 esac
@@ -4781,8 +4842,12 @@ case "\${1:-}" in
     ;;
   kill-pane)
     case "$*" in
-      *"display-message -p __OMX_PANE_MUTATION_OK__"*)
-        printf '__OMX_PANE_MUTATION_OK__\n'
+      *"display-message -p "*)
+        receipt="\${*##*display-message -p }"
+        receipt="\${receipt%% *}"
+        case "$receipt" in
+          __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+        esac
         ;;
     esac
     exit 0
@@ -5496,7 +5561,12 @@ case "\${1:-}" in
     exit 0
     ;;
   if-shell)
-    printf '__OMX_PANE_MUTATION_OK__\n'
+    success="\${6:-}"
+    receipt="\${success##*display-message -p }"
+    receipt="\${receipt%% *}"
+    case "$receipt" in
+      __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+    esac
     exit 0
     ;;
   resize-pane|select-layout|set-window-option|select-pane|kill-pane|set-hook|run-shell)
@@ -5629,7 +5699,12 @@ case "\${1:-}" in
     exit 0
     ;;
   if-shell)
-    printf '__OMX_PANE_MUTATION_OK__\n'
+    success="\${6:-}"
+    receipt="\${success##*display-message -p }"
+    receipt="\${receipt%% *}"
+    case "$receipt" in
+      __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+    esac
     exit 0
     ;;
   resize-pane|select-layout|set-window-option|select-pane|kill-pane|set-hook|run-shell)
@@ -6411,7 +6486,12 @@ case "\${1:-}" in
     exit 0
     ;;
   if-shell)
-    printf '__OMX_PANE_MUTATION_OK__\n'
+    success="\${6:-}"
+    receipt="\${success##*display-message -p }"
+    receipt="\${receipt%% *}"
+    case "$receipt" in
+      __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+    esac
     exit 0
     ;;
   resize-pane|select-pane|set-hook|run-shell)

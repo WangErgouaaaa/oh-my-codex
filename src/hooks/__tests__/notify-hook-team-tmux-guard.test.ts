@@ -31,7 +31,7 @@ fi
 if [[ "$1" == "if-shell" ]]; then
   printf '[%s]' "$@" >> "${tmuxLogPath}"
   printf '\n' >> "${tmuxLogPath}"
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 
@@ -74,7 +74,7 @@ if [[ "$cmd" == "if-shell" ]]; then
   printf '[%s]' "$cmd" >> "${tmuxLogPath}"
   printf '[%s]' "$@" >> "${tmuxLogPath}"
   printf '\n' >> "${tmuxLogPath}"
-  if [[ "$count" -le ${stableAuthorityChecks} ]]; then printf '__OMX_PANE_MUTATION_OK__\n'; fi
+  success="\${5:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$count" -le ${stableAuthorityChecks} && "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 if [[ "$cmd" == "display-message" ]]; then
@@ -415,7 +415,7 @@ shift || true
 if [[ "$cmd" == "if-shell" ]]; then
   if [[ "$*" == *"paste-buffer"* ]]; then exit 1; fi
 
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  success="\${5:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 
@@ -688,7 +688,7 @@ exit 0
         await writeFile(join(fakeBinDir, 'tmux'), `#!/usr/bin/env bash
 set -eu
 if [[ "$1" == "display-message" ]]; then printf '%s' ${JSON.stringify(authorityOutput)}; exit 0; fi
-if [[ "$1" == "if-shell" ]]; then printf '__OMX_PANE_MUTATION_OK__\\n'; fi
+if [[ "$1" == "if-shell" ]]; then success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi; fi
 `);
         await chmod(join(fakeBinDir, 'tmux'), 0o755);
         const result = runSendPaneInputInChild({ fakeBinDir, moduleUrl, paneTarget: '%0', prompt: '', submitKeyPresses: 0, typePrompt: false });

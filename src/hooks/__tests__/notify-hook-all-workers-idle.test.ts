@@ -127,7 +127,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -411,7 +414,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -541,7 +547,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -554,7 +563,7 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /capture-pane/, 'busy-pane reminders should still inspect pane state');
-      assert.match(tmuxLog, /send-keys -t %182/, 'all-workers-idle reminder should still inject into a busy leader pane');
+      assert.match(tmuxLog, /if-shell -t %182[^\n]*paste-buffer/, 'all-workers-idle reminder should inject through a guarded paste-buffer');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
       if (existsSync(eventsPath)) {

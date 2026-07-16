@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { appendFileSync, existsSync, mkdirSync } from 'fs';
 import { execFileSync } from 'child_process';
@@ -20,7 +21,7 @@ import {
   paneHasActiveTask,
   paneLooksReady,
 } from '../tmux-hook-engine.js';
-import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
+import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityScalar } from '../../hud/tmux.js';
 
 
 /**
@@ -807,15 +808,16 @@ function isExactLfCaptureFrame(capture) {
 async function clearPaneInputAtomically(paneTarget, panePid) {
   const target = parseCanonicalTmuxPaneId(paneTarget);
   const pid = safeString(panePid);
-  if (!target || !/^[1-9][0-9]*$/.test(pid)) return false;
+  const receipt = randomUUID().replace(/-/g, '');
+  if (!target || !/^[1-9][0-9]*$/.test(pid) || !/^[a-f0-9]{32}$/.test(receipt)) return false;
   const authority = `#{&&:#{==:#{pane_id},${target}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${pid}}}}`;
   try {
     const result = await runProcess('tmux', [
       'if-shell', '-t', target, '-F', authority,
-      `send-keys -t ${target} C-u; display-message -p __OMX_PANE_MUTATION_OK__`,
+      `send-keys -t ${target} C-u; display-message -p ${receipt}`,
       '',
     ], 1000);
-    return result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+    return parseExactTmuxAuthorityScalar(result.stdout) === receipt;
   } catch {
     return false;
   }

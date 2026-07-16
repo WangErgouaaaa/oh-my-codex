@@ -1,6 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { safeString } from './utils.js';
 import { runProcess } from './process-runner.js';
-import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
+import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityScalar } from '../../hud/tmux.js';
 import {
   buildCapturePaneArgv,
   buildPaneInModeArgv,
@@ -169,19 +170,23 @@ function paneAuthorityFormat(paneId: string, panePid: string): string {
 }
 
 async function runPaneMutationAtomically(paneId: string, panePid: string, command: string[]): Promise<boolean> {
-  const quoted = `${command.map((arg) => `'${arg.replace(/'/g, "\\'")}'`).join(' ')} ; display-message -p __OMX_PANE_MUTATION_OK__`;
+  const receipt = randomUUID().replace(/-/g, '');
+  if (!/^[a-f0-9]{32}$/.test(receipt)) return false;
+  const quoted = `${command.map((arg) => `'${arg.replace(/'/g, "\\'")}'`).join(' ')} ; display-message -p ${receipt}`;
 
   const result = await runProcess('tmux', [
     'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid), quoted, '',
   ], 3000);
-  return result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+  return parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
 
 async function confirmPaneAuthorityAtomically(paneId: string, panePid: string): Promise<boolean> {
+  const receipt = randomUUID().replace(/-/g, '');
+  if (!/^[a-f0-9]{32}$/.test(receipt)) return false;
   const result = await runProcess('tmux', [
-    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid), 'display-message -p __OMX_PANE_MUTATION_OK__', '',
+    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid), `display-message -p ${receipt}`, '',
   ], 3000);
-  return result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+  return parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
 
 

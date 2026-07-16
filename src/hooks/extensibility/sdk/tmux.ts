@@ -165,9 +165,10 @@ function parseSessionPaneRows(stdout: string): SessionPaneRow[] | null {
       || (fields[1] !== '0' && fields[1] !== '1')
       || (fields[3] !== '0' && fields[3] !== '1')
     ) return null;
-    if (fields[1] === '1') continue;
-    if (!isStrictPanePid(fields[2]) || paneIds.has(fields[0])) return null;
+    if (paneIds.has(fields[0])) return null;
     paneIds.add(fields[0]);
+    if (fields[1] === '1') continue;
+    if (!isStrictPanePid(fields[2])) return null;
     parsedRows.push({
       paneId: fields[0],
       dead: false,
@@ -183,6 +184,7 @@ function parseStrictPaneSnapshot(stdout: string): Map<string, TmuxTarget> | null
   const rows = parseExactTmuxAuthorityLines(stdout);
   if (!rows) return null;
   const panes = new Map<string, TmuxTarget>();
+  const paneIds = new Set<string>();
   for (const row of rows) {
     const fields = row.split('\t');
     if (
@@ -190,8 +192,10 @@ function parseStrictPaneSnapshot(stdout: string): Map<string, TmuxTarget> | null
       || parseCanonicalTmuxPaneId(fields[0]) !== fields[0]
       || (fields[1] !== '0' && fields[1] !== '1')
     ) return null;
+    if (paneIds.has(fields[0])) return null;
+    paneIds.add(fields[0]);
     if (fields[1] === '1') continue;
-    if (!isStrictPanePid(fields[2]) || panes.has(fields[0])) return null;
+    if (!isStrictPanePid(fields[2])) return null;
     panes.set(fields[0], { paneId: fields[0], pid: Number(fields[2]), dead: false });
   }
   return panes;

@@ -316,7 +316,7 @@ if [[ "$cmd" == "paste-buffer" ]]; then
     esac
   done
   if [[ -f "${tmuxLogPath}.buffer" ]]; then
-    echo "send-keys -t \${target} -l $(cat "${tmuxLogPath}.buffer")" >> "${tmuxLogPath}"
+    printf '%s\t%s\n' "\${target}" "$(cat "${tmuxLogPath}.buffer")" >> "${tmuxLogPath}.pasted"
   fi
   exit 0
 fi
@@ -338,10 +338,14 @@ if [[ "$cmd" == "if-shell" ]]; then
   leaderPanePid="${leaderPanePid}"
   if [[ -f "${tmuxLogPath}.leader-pid" ]]; then leaderPanePid="$(cat "${tmuxLogPath}.leader-pid")"; fi
   if [[ "$target" == "%42" && "$condition" == *"#{pane_id},%42"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},""$leaderPanePid"* ]]; then
-    sink="\${success%% ; display-message -p __OMX_PANE_MUTATION_OK__*}"
+    sink="\${success%% ; display-message -p *}"
     eval "set -- $sink"
     "$0" "$@"
-    printf '%s\\n' "__OMX_PANE_MUTATION_OK__"
+    receipt="\${success##*display-message -p }"
+    receipt="\${receipt%% *}"
+    case "$receipt" in
+      __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+    esac
   fi
   exit 0
 fi
@@ -21908,7 +21912,7 @@ PY`,
       assert.equal(result.outputJson, null);
       assert.equal(replay.outputJson, null);
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      const stopNudges = tmuxLog.match(/send-keys -t %42 -l \[OMX\] worker-1 native Stop allowed/g) || [];
+      const stopNudges = tmuxLog.match(/paste-buffer -d -b omx-send-[a-f0-9]+ -t %42/g) || [];
       assert.equal(stopNudges.length, 1, "allowed worker Stop should nudge leader exactly once inside cooldown");
       const nudgeState = JSON.parse(await readFile(join(workerDir, "worker-stop-nudge.json"), "utf-8"));
       assert.equal(nudgeState.delivery, "sent");
@@ -21996,7 +22000,7 @@ PY`,
 
       assert.equal(result.outputJson, null);
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      assert.match(tmuxLog, /send-keys -t %42 -l \[OMX\] worker-1 native Stop allowed/);
+      assert.match(tmuxLog, /paste-buffer -d -b omx-send-[a-f0-9]+ -t %42/);
       assert.doesNotMatch(tmuxLog, /send-keys -t %42 Tab/);
       const submits = tmuxLog.match(/send-keys -t %42 C-m/g) || [];
       assert.equal(submits.length, 2, "busy worker-stop nudge should submit directly as steering, not queue via Tab");
@@ -22052,7 +22056,7 @@ PY`,
       assert.equal(first.result, "sent");
       assert.equal(second.result, "suppressed_team_cooldown");
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      const stopNudges = tmuxLog.match(/send-keys -t %42 -l \[OMX\] worker-\d+ native Stop allowed/g) || [];
+      const stopNudges = tmuxLog.match(/paste-buffer -d -b omx-send-[a-f0-9]+ -t %42/g) || [];
       assert.equal(stopNudges.length, 1, "same-team workers should share one leader nudge cooldown window");
       const teamNudgeState = JSON.parse(await readFile(join(teamDir, "worker-stop-nudge.json"), "utf-8"));
       assert.equal(teamNudgeState.worker, "worker-1");
@@ -22105,7 +22109,7 @@ PY`,
       assert.equal(results.filter((result) => result.result === "sent").length, 1);
       assert.equal(results.filter((result) => result.result === "suppressed_team_lock_held").length, 1);
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      const stopNudges = tmuxLog.match(/send-keys -t %42 -l \[OMX\] worker-\d+ native Stop allowed/g) || [];
+      const stopNudges = tmuxLog.match(/paste-buffer -d -b omx-send-[a-f0-9]+ -t %42/g) || [];
       assert.equal(stopNudges.length, 1, "concurrent same-team workers should emit only one leader nudge");
       assert.equal(existsSync(join(teamDir, "worker-stop-nudge.lock")), false);
     } finally {
@@ -22246,7 +22250,7 @@ PY`,
 
       assert.equal(result.result, "steered");
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      assert.match(tmuxLog, /send-keys -t %42 -l \[OMX\] worker-2 native Stop allowed/);
+      assert.match(tmuxLog, /paste-buffer -d -b omx-send-[a-f0-9]+ -t %42/);
       assert.doesNotMatch(tmuxLog, /send-keys -t %42 Tab/);
       const teamNudgeState = JSON.parse(await readFile(join(teamDir, "worker-stop-nudge.json"), "utf-8"));
       assert.equal(teamNudgeState.worker, "worker-2");
@@ -22292,7 +22296,7 @@ PY`,
       assert.equal(existsSync(join(teamDir, "worker-stop-nudge.json")), false);
       assert.equal(existsSync(join(teamDir, "workers", "worker-1", "worker-stop-nudge.json")), false);
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      assert.match(tmuxLog, /send-keys -t %42 -l \[OMX\] worker-1 native Stop allowed/);
+      assert.match(tmuxLog, /paste-buffer -d -b omx-send-[a-f0-9]+ -t %42/);
       const deliveryLogPath = join(logsDir, `team-delivery-${new Date().toISOString().split("T")[0]}.jsonl`);
       const deliveryEvents = (await readFile(deliveryLogPath, "utf-8"))
         .trim()
@@ -22713,7 +22717,7 @@ PY`,
 
       assert.equal(result.outputJson, null);
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      assert.match(tmuxLog, /send-keys -t %42 -l \[OMX\] worker-1 native Stop allowed/);
+      assert.match(tmuxLog, /paste-buffer -d -b omx-send-[a-f0-9]+ -t %42/);
       assert.equal(existsSync(join(workerDir, "worker-stop-nudge.json")), true);
     } finally {
       if (typeof prevTeamWorker === "string") process.env.OMX_TEAM_WORKER = prevTeamWorker;

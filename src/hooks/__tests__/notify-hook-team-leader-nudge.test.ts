@@ -281,7 +281,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -357,7 +360,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -456,7 +462,7 @@ describe('notify-hook leader-side authority handoff', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
-      assert.match(tmuxLog, /send-keys/, 'current implementation nudges the leader directly in this stale-leader path');
+      assert.match(tmuxLog, /if-shell[^\n]*paste-buffer/, 'stale-leader nudge should use guarded paste-buffer injection');
     });
   });
 
@@ -661,14 +667,14 @@ describe('notify-hook team leader nudge', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys/);
+      assert.match(tmuxLog, /set-buffer/);
       assert.match(tmuxLog, /-t %99/, 'should target leader pane when present');
       assert.match(tmuxLog, /\[OMX\] All 2 workers idle/, 'should emit all-workers-idle nudge');
       assert.doesNotMatch(tmuxLog, /\[OMX_INTENT:/, 'should keep orchestration intent out of injected display text');
       assert.match(tmuxLog, /\[OMX_TMUX_INJECT\]/, 'should include injection marker');
-      const submitMatches = tmuxLog.match(/send-keys -t %99 C-m/g) || [];
+      const submitMatches = tmuxLog.match(/if-shell -t %99 -F .*'send-keys'.*'%99'.*'C-m'.*display-message -p [a-f0-9]{32}/g) || [];
       assert.equal(submitMatches.length, 2, 'leader nudge should submit with isolated double C-m');
-      assert.ok(!/send-keys[^\n]*-l[^\n]*C-m/.test(tmuxLog), 'must not mix literal payload with submit keypresses');
+      assert.ok(!/set-buffer[^\n]*C-m/.test(tmuxLog), 'must keep buffered payload and C-m submits isolated');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
       assert.ok(existsSync(eventsPath), 'events.ndjson should exist');
@@ -936,7 +942,7 @@ describe('notify-hook team leader nudge', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys/);
+      assert.match(tmuxLog, /set-buffer/);
       assert.match(tmuxLog, /-t %97/, 'should still target the leader pane');
       assert.match(tmuxLog, /\[OMX\] All 2 workers idle/, 'global team-state fallback should still fire idle nudge');
     });
@@ -963,7 +969,7 @@ describe('notify-hook team leader nudge', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys/);
+      assert.match(tmuxLog, /set-buffer/);
       assert.match(tmuxLog, /-t %97/, 'should target canonical leader pane');
       assert.match(tmuxLog, /\[OMX\] All 2 workers idle/, 'canonical fallback should still fire idle nudge');
     });
@@ -997,7 +1003,7 @@ describe('notify-hook team leader nudge', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys/);
+      assert.match(tmuxLog, /set-buffer/);
       assert.match(tmuxLog, /\[OMX\] All 2 workers idle/, 'session-scoped nudge should ignore stale root deep-interview state');
     });
   });
@@ -1024,7 +1030,7 @@ describe('notify-hook team leader nudge', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys/);
+      assert.match(tmuxLog, /set-buffer/);
       assert.match(tmuxLog, /-t %97/, 'should still target canonical leader pane');
       assert.match(tmuxLog, /\[OMX\] All 2 workers idle/, 'inactive coarse state should still fall back canonically');
     });
@@ -1145,7 +1151,7 @@ describe('notify-hook team leader nudge', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys/);
+      assert.match(tmuxLog, /set-buffer/);
       assert.match(tmuxLog, /-t %91/);
       assert.doesNotMatch(tmuxLog, /-t devsess:0/);
       assert.match(tmuxLog, /Team alpha:/);
@@ -1608,7 +1614,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -1623,10 +1632,10 @@ exit 0
       assert.match(tmuxLog, /display-message -p -t %93 #\{pane_in_mode\}/);
       assert.match(tmuxLog, /capture-pane -t %93 -p -S -80/);
       assert.match(tmuxLog, /set-buffer .*Team busy-live-pane:/);
-      assert.match(tmuxLog, /send-keys -t %93 Tab/);
-      assert.match(tmuxLog, /send-keys -t %93 C-m/);
+      assert.match(tmuxLog, /if-shell -t %93[^\n]*'send-keys'.*'Tab'.*display-message -p [a-f0-9]{32}/);
+      assert.match(tmuxLog, /if-shell -t %93[^\n]*'send-keys'.*'C-m'.*display-message -p [a-f0-9]{32}/);
       assert.ok(
-        tmuxLog.indexOf('send-keys -t %93 Tab') < tmuxLog.indexOf('send-keys -t %93 C-m'),
+        tmuxLog.indexOf("'Tab'") < tmuxLog.indexOf("'C-m'"),
         'busy leader queue path should press Tab before C-m',
       );
       assert.match(tmuxLog, /\[OMX_TMUX_INJECT\]/, 'should keep the injection marker on busy-pane sends');
@@ -2068,7 +2077,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -2081,11 +2093,11 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /capture-pane/);
-      assert.match(tmuxLog, /send-keys -t %73/, 'should inject into a busy leader pane so Codex can queue the message');
-      assert.match(tmuxLog, /send-keys -t %73 Tab/);
-      assert.match(tmuxLog, /send-keys -t %73 C-m/);
+      assert.match(tmuxLog, /if-shell -t %73[^\n]*paste-buffer/, 'should inject into a busy leader pane through guarded paste-buffer');
+      assert.match(tmuxLog, /if-shell -t %73[^\n]*'send-keys'.*'Tab'.*display-message -p [a-f0-9]{32}/);
+      assert.match(tmuxLog, /if-shell -t %73[^\n]*'send-keys'.*'C-m'.*display-message -p [a-f0-9]{32}/);
       assert.ok(
-        tmuxLog.indexOf('send-keys -t %73 Tab') < tmuxLog.indexOf('send-keys -t %73 C-m'),
+        tmuxLog.indexOf("'Tab'") < tmuxLog.indexOf("'C-m'"),
         'busy leader queue path should press Tab before C-m',
       );
 
@@ -2203,7 +2215,10 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
-  echo "__OMX_PANE_MUTATION_OK__"
+  success="\${5:-}"
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
   exit 0
 fi
 exit 0
@@ -2216,7 +2231,7 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /capture-pane -t %74 -p -S -80/);
-      assert.match(tmuxLog, /send-keys -t %74/, 'capture failures should not suppress leader injection into a live codex pane');
+      assert.match(tmuxLog, /if-shell -t %74[^\n]*paste-buffer/, 'capture failures should not suppress guarded leader injection into a live codex pane');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
       if (existsSync(eventsPath)) {
@@ -2714,7 +2729,7 @@ exit 0
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys/);
+      assert.match(tmuxLog, /set-buffer/);
       assert.match(tmuxLog, /Team beta:/);
       assert.match(tmuxLog, /leader stale, \d+ worker pane\(s\) still active\./);
       assert.match(tmuxLog, /Next: check messages; keep orchestrating; if done, gracefully shut down: omx team shutdown beta\./);

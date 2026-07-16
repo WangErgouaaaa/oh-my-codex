@@ -253,7 +253,7 @@ async function writeSuccessfulScaleUpTmuxStub(
       `    count=$((count + 1)); printf '%s\\n' "$count" > "${splitCountPath}"`,
       '    split_command=""; for arg do split_command="$arg"; done',
 
-      '    echo "%$((30 + count))"',
+      "    printf '%%%s\\t%s\\t$1\\n' \"$((30 + count))\" \"$((1000000000 + 30 + count))\"",
       '    printf \'%%%s\\n\' "$((30 + count))" >> "$0.created-panes"',
       '    printf \'%%%s\\t%s\\n\' "$((30 + count))" "$((1000000000 + 30 + count))" >> "$0.created-pane-pids"',
       '    printf \'%%%s\\t%s\\n\' "$((30 + count))" "$split_command" >> "$0.created-pane-commands"',
@@ -330,7 +330,7 @@ function tmuxAuthorityListPanesCase(
   '    ;;',
   '  if-shell)',
     `    if [ "${options.recyclePidAtLivenessProbe === undefined ? '0' : '1'}" = 1 ] && [ -f "$0.liveness-probe-count" ]; then IFS= read -r liveness_probe_count < "$0.liveness-probe-count"; if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe ?? 0} ]; then case "\${5:-}" in *1000000031*) printf '%s\\n' '__omx_send_authority_rejected__'; exit 0 ;; esac; fi; fi`,
-    `    success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; case "$success" in ${options.atomicSendFailure === true ? '*send-keys*) exit 1 ;; ' : ''}*capture-pane*) printf '%s\\n' '›' ;; *display-message\\ -p\\ __OMX_PANE_MUTATION_[a-f0-9]*__*) printf '%s\\n' "$receipt" ;; esac`,
+    `    success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; case "$success" in ${options.atomicSendFailure === true ? '*paste-buffer*) exit 1 ;; ' : ''}*capture-pane*) printf '%s\\n' '›' ;; esac; case "$success" in *display-message\\ -p\\ __OMX_PANE_MUTATION_[a-f0-9]*__*|*display-message\\ -p\\ __OMX_SEND_AUTHORITY_[a-f0-9]*__*) printf '%s\\n' "$receipt" ;; esac`,
     '    ;;',
   ];
 }
@@ -1008,7 +1008,6 @@ esac
         assert.ok(commands.some((command) => command === 'list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'), testCase.name);
         assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-')), testCase.name);
         assert.ok(commands.some((command) => command.startsWith('split-window -v -t %21 ')), testCase.name);
-        assert.ok(commands.some((command) => command.startsWith('if-shell -F -t %31 ')), testCase.name);
         assert.equal(commands.some((command) => command === 'kill-pane -t %11' || command === 'kill-pane -t %12' || command === 'kill-pane -t %21' || command === 'kill-pane -t %30'), false, testCase.name);
         assert.equal(commands.some((command) => /^kill-pane\b/.test(command)), false, testCase.name);
         assert.equal(
@@ -1696,7 +1695,7 @@ printf '%s\\n' "$@" > '${capturePath}'
         assert.equal(config?.workers.length, 1, testCase.phase);
         const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
         assert.equal(commands.some((command) => command.startsWith('kill-pane -t %31')), false, commands.join('\n'));
-        assert.equal(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{==:#{pane_id},%31}') && command.includes('#{==:#{pane_dead},0}') && command.includes('#{==:#{pane_pid},1000000031}') && command.includes('send-keys -t %31') && command.includes('display-message -p "__omx_send_authority_rejected__"')), testCase.expectDispatch, commands.join('\n'));
+        assert.equal(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{==:#{pane_id},%31}') && command.includes('#{==:#{pane_dead},0}') && command.includes('#{==:#{pane_pid},1000000031}') && command.includes('#{==:#{session_id},$1}') && command.includes('@omx_scale_split_owner_nonce_') && command.includes('paste-buffer -d -b omx-send-') && command.includes('display-message -p __OMX_SEND_AUTHORITY_')), testCase.expectDispatch, commands.join('\n'));
         assert.ok(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{m:*') && command.includes('kill-pane -t %31 \\; display-message -p __OMX_PANE_MUTATION_')), commands.join('\n'));
         assert.equal(
           existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'workers', 'worker-2', 'identity.json')),
@@ -2971,6 +2970,7 @@ describe('scaleDown worktree AGENTS cleanup', () => {
           '    ;;',
           "  display-message) printf '$1\\n' ;;",
           '  kill-pane) exit 0 ;;',
+          "  show-options) printf 'team:scale-down-worktree\\n' ;;",
           "  show-option) printf 'team:scale-down-worktree\\n' ;;",
           "  if-shell) success=\"\${6:-}\"; receipt=\"\${success##*display-message -p }\"; receipt=\"\${receipt%% *}\"; case \"$receipt\" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\\n' \"$receipt\" ;; esac ;;",
           'esac',
@@ -3214,6 +3214,7 @@ case "\${1:-}" in
     esac
     ;;
   display-message) printf '$1\n' ;;
+  show-options) printf 'team:exclusions\n' ;;
   show-option) printf 'team:exclusions\n' ;;
   if-shell) success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; case "$receipt" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;; esac ;;
 esac
