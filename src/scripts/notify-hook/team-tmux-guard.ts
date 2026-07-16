@@ -11,158 +11,6 @@ import {
   paneHasActiveTask,
   paneLooksReady,
 } from '../tmux-hook-engine.js';
-import { readExactPaneProof } from '../../team/exact-pane.js';
-
-export const EXACT_PANE_UNAVAILABLE_REASON = 'exact_pane_unavailable';
-const EXACT_PANE_ID_RE = /^%\d+$/;
-
-function explicitPaneIdentity(value: any): { provided: boolean; paneId: string } {
-  const paneId = safeString(value).trim();
-  return { provided: paneId !== '', paneId: EXACT_PANE_ID_RE.test(paneId) ? paneId : '' };
-}
-
-export function normalizeExactPaneId(value: any): string {
-  return explicitPaneIdentity(value).paneId;
-}
-
-function exactPaneBindingFailure(target: string, exactPaneId: any): any | null {
-  const identity = explicitPaneIdentity(exactPaneId);
-  const targetIsExactPane = EXACT_PANE_ID_RE.test(target);
-  if (targetIsExactPane && !identity.provided) {
-    return {
-      ok: false,
-      reason: EXACT_PANE_UNAVAILABLE_REASON,
-      paneId: target,
-      proof: { status: 'unavailable', paneId: target, reason: 'missing_exact_pane_id' },
-    };
-  }
-  if (identity.provided && !identity.paneId) {
-    return {
-      ok: false,
-      reason: EXACT_PANE_UNAVAILABLE_REASON,
-      paneId: '',
-      proof: { status: 'unavailable', paneId: safeString(exactPaneId).trim(), reason: 'invalid_pane_id' },
-    };
-  }
-  if (identity.paneId && identity.paneId !== target) {
-    return {
-      ok: false,
-      reason: EXACT_PANE_UNAVAILABLE_REASON,
-      paneId: identity.paneId,
-      proof: { status: 'unavailable', paneId: identity.paneId, reason: 'pane_target_mismatch' },
-    };
-  }
-  return null;
-}
-
-export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: number): Promise<any> {
-  const identity = explicitPaneIdentity(exactPaneId);
-  if (!identity.provided) return { ok: true, paneId: '', proof: null };
-  if (!identity.paneId) {
-    return {
-      ok: false,
-      reason: EXACT_PANE_UNAVAILABLE_REASON,
-      paneId: '',
-      proof: {
-        status: 'unavailable',
-        paneId: safeString(exactPaneId).trim(),
-        reason: 'invalid_pane_id',
-      },
-    };
-  }
-
-  try {
-    const proof = await readExactPaneProof(identity.paneId);
-    if (proof.status === 'live' && proof.paneId === identity.paneId) {
-      if (typeof expectedPanePid === 'number' && proof.pid !== expectedPanePid) {
-        return {
-          ok: false,
-          reason: EXACT_PANE_UNAVAILABLE_REASON,
-          paneId: identity.paneId,
-          proof: { ...proof, status: 'unavailable', reason: 'pane_pid_changed', expectedPid: expectedPanePid },
-        };
-      }
-      return { ok: true, paneId: identity.paneId, proof };
-    }
-    return { ok: false, reason: EXACT_PANE_UNAVAILABLE_REASON, paneId: identity.paneId, proof };
-  } catch (error) {
-    return {
-      ok: false,
-      reason: EXACT_PANE_UNAVAILABLE_REASON,
-      paneId: identity.paneId,
-      proof: {
-        status: 'unavailable',
-        paneId: identity.paneId,
-        reason: 'query_failed',
-        detail: error instanceof Error ? error.message : safeString(error),
-      },
-    };
-  }
-}
-
-export async function verifyExactPaneOwnerLive(exactPaneId: any, expectedPanePid: number | undefined, expectedPaneOwnerId: any): Promise<any> {
-  const expectedOwner = safeString(expectedPaneOwnerId).trim();
-  if (!expectedOwner || !Number.isInteger(expectedPanePid) || Number(expectedPanePid) <= 0) {
-    return {
-      ok: false,
-      reason: EXACT_PANE_UNAVAILABLE_REASON,
-      paneId: normalizeExactPaneId(exactPaneId),
-      proof: {
-        status: 'unavailable',
-        paneId: normalizeExactPaneId(exactPaneId),
-        reason: !expectedOwner ? 'missing_expected_pane_owner' : 'missing_expected_pane_pid',
-      },
-    };
-  }
-  const beforeOwner = await verifyExactPaneLive(exactPaneId, expectedPanePid);
-  if (!beforeOwner.ok) return beforeOwner;
-  try {
-    const ownerResult = await runProcess(
-      'tmux',
-      ['show-option', '-qv', '-p', '-t', beforeOwner.paneId, '@omx_team_pane_owner_id'],
-      3000,
-    );
-    const actualOwner = safeString(ownerResult.stdout).trim();
-    if (actualOwner !== expectedOwner) {
-      return {
-        ok: false,
-        reason: EXACT_PANE_UNAVAILABLE_REASON,
-        paneId: beforeOwner.paneId,
-        proof: {
-          status: 'unavailable',
-          paneId: beforeOwner.paneId,
-          reason: actualOwner ? 'pane_owner_changed' : 'pane_owner_unavailable',
-          expectedOwner,
-          actualOwner: actualOwner || undefined,
-        },
-      };
-    }
-  } catch (error) {
-    return {
-      ok: false,
-      reason: EXACT_PANE_UNAVAILABLE_REASON,
-      paneId: beforeOwner.paneId,
-      proof: {
-        status: 'unavailable',
-        paneId: beforeOwner.paneId,
-        reason: 'pane_owner_unavailable',
-        detail: error instanceof Error ? error.message : safeString(error),
-      },
-    };
-  }
-  return verifyExactPaneLive(exactPaneId, expectedPanePid);
-}
-
-function exactPaneUnavailableResult(target: string, paneProof: any, extra: any = {}): any {
-  return {
-    ok: false,
-    sent: false,
-    reason: EXACT_PANE_UNAVAILABLE_REASON,
-    paneTarget: target,
-    exactPaneProof: paneProof.proof || null,
-    ...extra,
-  };
-}
 
 export const PANE_READINESS_UNVERIFIED_REASON = 'pane_readiness_unverified';
 let nextTmuxBufferId = 0;
@@ -200,10 +48,6 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   requireIdle = true,
   requireObservableState = false,
   requireCaptureEvidence = undefined,
-  exactPaneId = undefined,
-  expectedPanePid = undefined,
-  expectedPaneOwnerId = undefined,
-  expectedHudPaneId = undefined,
 } = {}): Promise<any> {
   const normalizedRequireObservableState = typeof requireCaptureEvidence === 'boolean' ? requireCaptureEvidence : requireObservableState;
   const requestedTarget = safeString(paneTarget);
@@ -218,26 +62,24 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
       paneCapture: '',
     };
   }
-  const bindingFailure = exactPaneBindingFailure(target, exactPaneId);
-  if (bindingFailure) return exactPaneUnavailableResult(target, bindingFailure);
+  if (skipIfScrolling) {
+    try {
+      const modeResult = await runProcess('tmux', buildPaneInModeArgv(target), 3000);
+      if (safeString(modeResult.stdout).trim() === '1') {
+        return {
+          ok: false,
+          sent: false,
+          reason: 'scroll_active',
+          paneTarget: target,
+          paneCurrentCommand: '',
+          paneCapture: '',
+        };
+      }
+    } catch {
+      // Non-fatal: continue with remaining preflight checks.
+    }
+  }
 
-  const exactPaneIdentity = safeString(exactPaneId).trim();
-  const exactPaneIdentityProvided = explicitPaneIdentity(exactPaneId).provided;
-  const expectedOwner = safeString(expectedPaneOwnerId).trim();
-  const expectedHudPane = normalizeExactPaneId(expectedHudPaneId);
-  const requiresTeamReadAuthority = exactPaneIdentityProvided && (
-    expectedPanePid !== undefined || expectedOwner || expectedHudPane
-  );
-  let exactPaneProof: any = null;
-  let pinnedPanePid = typeof expectedPanePid === 'number' ? expectedPanePid : undefined;
-  const verifyExplicitPane = async () => {
-    const paneProof = requiresTeamReadAuthority
-      ? await verifyExactPaneOwnerLive(exactPaneIdentity, pinnedPanePid, expectedOwner)
-      : await verifyExactPaneLive(exactPaneIdentity, pinnedPanePid);
-    exactPaneProof = paneProof.proof || null;
-    if (paneProof.ok && typeof paneProof.proof?.pid === 'number') pinnedPanePid ??= paneProof.proof.pid;
-    return paneProof;
-  };
   let paneCurrentCommand = '';
   let paneRunningShell = false;
   const buildReadinessResult = (ok: boolean, reason: string, paneCapture: string, readinessEvidence: string) => ({
@@ -248,15 +90,13 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
     paneCurrentCommand,
     paneCapture,
     readinessEvidence,
-    exactPaneProof,
   });
-  const exactPaneFailure = (paneProof: any, paneCapture = '') => exactPaneUnavailableResult(target, paneProof, {
-    paneCurrentCommand,
-    paneCapture,
-    readinessEvidence: 'exact_pane_unavailable',
-  });
-  if (expectedHudPane && expectedHudPane === exactPaneIdentity) {
-    return buildReadinessResult(false, 'hud_pane_target', '', 'hud_pane_rejected');
+  try {
+    const result = await runProcess('tmux', buildPaneCurrentCommandArgv(target), 3000);
+    paneCurrentCommand = safeString(result.stdout).trim();
+    paneRunningShell = requireRunningAgent && isPaneRunningShell(paneCurrentCommand);
+  } catch {
+    paneCurrentCommand = '';
   }
 
   try {
@@ -288,7 +128,6 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
           paneTarget: target,
           paneCurrentCommand,
           paneCapture,
-          exactPaneProof,
         };
       }
     }
@@ -300,13 +139,20 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
         paneTarget: target,
         paneCurrentCommand,
         paneCapture,
-        exactPaneProof,
       };
     }
     if (normalizedRequireObservableState && !hasCaptureEvidence && !paneCurrentCommand) {
       return buildReadinessResult(false, PANE_READINESS_UNVERIFIED_REASON, paneCapture, 'capture_empty');
     }
     return buildReadinessResult(true, 'ok', paneCapture, hasCaptureEvidence ? 'captured' : (paneCurrentCommand ? 'command_only' : 'none'));
+  } catch {
+    if (paneRunningShell) {
+      return buildReadinessResult(false, 'pane_running_shell', '', 'capture_failed');
+    }
+    if (normalizedRequireObservableState) {
+      return buildReadinessResult(false, PANE_READINESS_UNVERIFIED_REASON, '', 'capture_failed');
+    }
+    return buildReadinessResult(true, 'ok', '', paneCurrentCommand ? 'command_only' : 'none');
   }
 }
 
@@ -510,12 +356,6 @@ export async function queuePaneInput({
     ['send-keys', '-t', target, 'Tab'],
     ['send-keys', '-t', target, 'C-m'],
   ];
-  const firstSubmitProof = await verifyExplicitPane();
-  if (!firstSubmitProof.ok) {
-    return exactPaneUnavailableResult(target, firstSubmitProof, {
-      argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv },
-    });
-  }
   try {
     if (!(await paneAuthority()) || !(await capturedAuthority.assertPaneAuthority())) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
     if (!(await runPaneMutationAtomically(target, capturedAuthority.panePid, submitArgv[0]))) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
@@ -533,7 +373,6 @@ export async function queuePaneInput({
       reason: 'queued',
       paneTarget: target,
       argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv },
-      exactPaneProof,
     };
   } catch (error) {
     return {
@@ -542,12 +381,11 @@ export async function queuePaneInput({
       reason: 'queue_failed',
       paneTarget: target,
       argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv },
-      exactPaneProof,
       error: error instanceof Error ? error.message : safeString(error),
     };
   }
 }
 
-export async function checkPaneReadyForTeamSendKeys(paneTarget: any, exactPaneId: any): Promise<any> {
-  return evaluatePaneInjectionReadiness(paneTarget, { exactPaneId });
+export async function checkPaneReadyForTeamSendKeys(paneTarget: any): Promise<any> {
+  return evaluatePaneInjectionReadiness(paneTarget);
 }

@@ -40,20 +40,12 @@ import {
   teamReadWorkerStatus as readWorkerStatus,
   teamWriteWorkerStatus as writeWorkerStatus,
   teamWithScalingLock as withScalingLock,
-  teamWithTaskMembershipBarrier as withTaskMembershipBarrier,
-  recoverTeamMembershipTaskTransaction,
-  commitTeamMembershipTaskTransaction,
-  finalizeTeamMembershipTaskTransaction,
-  writeAtomic,
-  teamRemoveDurableFile as removeDurableFile,
   teamAppendEvent as appendTeamEvent,
   teamCreateTask as createStateTask,
   teamListTasks as listTasks,
-  teamReadTask as readTask,
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
   teamReadDispatchRequest as readDispatchRequest,
   teamTransitionDispatchRequest as transitionDispatchRequest,
-  teamRemoveDispatchRequestsForWorkers as removeDispatchRequestsForWorkers,
   type TeamConfig,
   type TeamTask,
   type WorkerInfo,
@@ -91,11 +83,8 @@ import {
   planWorktreeTarget,
   rollbackProvisionedWorktrees,
   type EnsureWorktreeResult,
-  type PlannedWorktreeTarget,
   type WorktreeMode,
 } from './worktree.js';
-import { withTaskClaimLock } from './state/locks.js';
-
 import {
   buildApprovedTeamHandoffSection,
   resolvePersistedApprovedTeamExecutionContinuityState,
@@ -110,42 +99,6 @@ import {
   parseExactTmuxAuthorityLines,
   parseExactTmuxAuthorityScalar,
 } from '../hud/tmux.js';
-
-const TASK_CLAIM_LOCK_STALE_MS = 5 * 60 * 1000;
-
-async function withTaskClaimLocks<T>(
-  teamName: string,
-  taskIds: readonly string[],
-  cwd: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const uniqueTaskIds = [...new Set(taskIds)].sort((left, right) => Number(left) - Number(right));
-  const teamDir = (name: string, lockCwd: string) => join(resolveCanonicalTeamStateRoot(lockCwd), 'team', name);
-  const locks = {
-    teamDir,
-    taskClaimLockDir: (name: string, taskId: string, lockCwd: string) => (
-      join(teamDir(name, lockCwd), 'claims', `task-${taskId}.lock`)
-    ),
-    mailboxLockDir: (name: string, workerName: string, lockCwd: string) => (
-      join(teamDir(name, lockCwd), 'mailbox', `.lock-${workerName}`)
-    ),
-  };
-  const acquire = async (index: number): Promise<T> => {
-    if (index >= uniqueTaskIds.length) return await fn();
-    const taskId = uniqueTaskIds[index]!;
-    const locked = await withTaskClaimLock(
-      teamName,
-      taskId,
-      cwd,
-      TASK_CLAIM_LOCK_STALE_MS,
-      locks,
-      async () => await acquire(index + 1),
-    );
-    if (!locked.ok) throw new Error(`Timed out acquiring task claim lock for ${teamName}/${taskId}`);
-    return locked.value;
-  };
-  return await acquire(0);
-}
 
 // ── Environment gate ──────────────────────────────────────────────────────────
 
@@ -579,75 +532,6 @@ function resolveInstructionStateRoot(worktreePath?: string | null): string | und
   return worktreePath ? WORKTREE_TRIGGER_STATE_ROOT : undefined;
 }
 
-function hasScaleUpFailureInjection(env: NodeJS.ProcessEnv, phase: string): boolean {
-  return env.OMX_TEAM_SCALE_UP_INJECT_FAILURE?.split(',').map((value) => value.trim()).includes(phase) ?? false;
-}
-
-function throwIfScaleUpFailureInjected(env: NodeJS.ProcessEnv, phase: string): void {
-  if (hasScaleUpFailureInjection(env, phase)) {
-    throw new Error(`injected_scale_up_failure:${phase}`);
-  }
-}
-
-function recoverCreatedWorktreeAfterEnsureFailure(
-  plan: PlannedWorktreeTarget,
-  worktreePathExistedBeforeEnsure: boolean,
-  branchExistedBeforeEnsure: boolean,
-): EnsureWorktreeResult | null {
-  if (worktreePathExistedBeforeEnsure || !existsSync(plan.worktreePath)) return null;
-
-  const commonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], {
-    cwd: plan.worktreePath,
-    encoding: 'utf-8',
-    windowsHide: true,
-  });
-  const repoCommonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], {
-    cwd: plan.repoRoot,
-    encoding: 'utf-8',
-    windowsHide: true,
-  });
-  if (
-    commonDir.status !== 0
-    || repoCommonDir.status !== 0
-    || resolve(plan.worktreePath, (commonDir.stdout || '').trim())
-      !== resolve(plan.repoRoot, (repoCommonDir.stdout || '').trim())
-  ) {
-    return null;
-  }
-
-  if (plan.branchName) {
-    const branch = spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], {
-      cwd: plan.worktreePath,
-      encoding: 'utf-8',
-      windowsHide: true,
-    });
-    if (branch.status !== 0 || (branch.stdout || '').trim() !== `refs/heads/${plan.branchName}`) return null;
-  } else {
-    const head = spawnSync('git', ['rev-parse', 'HEAD'], {
-      cwd: plan.worktreePath,
-      encoding: 'utf-8',
-      windowsHide: true,
-    });
-    const branch = spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], {
-      cwd: plan.worktreePath,
-      encoding: 'utf-8',
-      windowsHide: true,
-    });
-    if (head.status !== 0 || branch.status === 0 || (head.stdout || '').trim() !== plan.baseRef) return null;
-  }
-
-  return {
-    enabled: true,
-    repoRoot: plan.repoRoot,
-    worktreePath: plan.worktreePath,
-    detached: plan.detached,
-    branchName: plan.branchName,
-    created: true,
-    reused: false,
-    createdBranch: Boolean(plan.branchName && !branchExistedBeforeEnsure),
-  };
-}
-
 interface ScaleUpApprovedExecutionGate {
   ok: true;
   approvedContextSection?: string;
@@ -737,9 +621,6 @@ async function notifyWorkerPaneOutcome(
   message: string,
   authority: VerifiedScaleSplitPane,
   workerCli?: 'codex' | 'claude' | 'gemini',
-  expectedPanePid?: number,
-  expectedTeamOwnerId?: string,
-  hudPaneId?: string,
 ): Promise<DispatchOutcome> {
   if (!revalidateScaleSplitAuthority(authority)) {
     return { ok: false, transport: 'tmux_send_keys', reason: 'tmux_pane_authority_lost' };
@@ -795,7 +676,6 @@ export async function scaleUp(
   const leaderCwd = resolve(cwd);
 
   return await withScalingLock(sanitized, leaderCwd, async (): Promise<ScaleUpResult | ScaleError> => {
-    return await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
     const config = await readTeamConfig(sanitized, leaderCwd);
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
@@ -890,15 +770,10 @@ export async function scaleUp(
     const effectiveWorktreeMode = config.worktree_mode ?? resolveScaleUpWorktreeMode(config);
     if (!config.worktree_mode && effectiveWorktreeMode.enabled) {
       config.worktree_mode = effectiveWorktreeMode;
+      await saveTeamConfig(config, leaderCwd);
     }
 
     const addedWorkers: WorkerInfo[] = [];
-    // A scale-up pane becomes killable during rollback only after its exact
-    // process identity was pinned and, when Team ownership is configured, its
-    // owner tag command completed. A returned pane ID alone is cleanup debt,
-    // never authority to affect a potentially recycled pane.
-    const rollbackTaggedPaneOwnerIds = new Map<string, string>();
-
     const createdTaskIds: string[] = [];
     const initialPaneIds = new Set(preSplitPaneIds);
     const knownPaneIds = new Set(initialPaneIds);
@@ -906,14 +781,9 @@ export async function scaleUp(
     const operationPaneAuthorities = new Map<string, VerifiedScaleSplitPane>();
     const rollbackPaneIds = new Set<string>();
 
-    const provisionedWorktrees: EnsureWorktreeResult[] = [];
-    const preparedWorkerDirectoryOwner = new Map<string, string>();
-    const preparedStartupScriptOwner = new Map<string, string>();
-    const runtimeDirectoryPath = join(teamStateRoot, 'team', sanitized, 'runtime');
-    const runtimeDirectoryExisted = existsSync(runtimeDirectoryPath);
     const rollbackScaleUp = async (
       error: string,
-      context: { paneId?: string; worker?: WorkerInfo; workerName?: string; worktreePath?: string } = {},
+      context: { paneId?: string; workerName?: string; worktreePath?: string } = {},
     ): Promise<ScaleError> => {
       const killOperationPane = (paneId: string | undefined): void => {
         const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
@@ -938,150 +808,19 @@ export async function scaleUp(
         if (w.worktree_path) {
           await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, teamStateRoot, w.worktree_path).catch(() => {});
         }
-        if (requiredTeamOwnerId && rollbackTaggedPaneOwnerIds.get(paneId) !== requiredTeamOwnerId) {
-          unresolvedPaneIds.add(paneId);
-          cleanupDebt.push(`pane_owner_unverified:${paneId}`);
-          continue;
-        }
-        expectedPanePids[paneId] = expectedPanePid;
-        authorizedRollbackPaneIds.add(paneId);
-      }
-      try {
-        const paneTeardown = await teardownWorkerPanes([...authorizedRollbackPaneIds], {
-          leaderPaneId: config.leader_pane_id,
-          hudPaneId: config.hud_pane_id,
-          expectedPanePids,
-          authorizePaneKill: (paneId) => {
-            if (!requiredTeamOwnerId) return true;
-            const expectedOwnerId = rollbackTaggedPaneOwnerIds.get(paneId);
-            if (expectedOwnerId !== requiredTeamOwnerId) return false;
-            const currentOwner = readPaneTeamOwnerTagResult(paneId);
-            return currentOwner.status === 'value' && currentOwner.value === expectedOwnerId;
-          },
-        });
-        for (const paneId of [...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]) resolvedPaneIds.add(paneId);
-        for (const paneId of paneTeardown.kill.failedPaneIds) unresolvedPaneIds.add(paneId);
-        for (const proof of paneTeardown.proofUnavailable) unresolvedPaneIds.add(proof.paneId);
-        if (paneTeardown.kill.failedPaneIds.length > 0) cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
-        if (paneTeardown.proofUnavailable.length > 0) {
-          cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
-        }
-        if (paneTeardown.kill.failedPaneIds.length > 0 || paneTeardown.proofUnavailable.length > 0) {
-          for (const paneId of rollbackPaneIds) {
-            if (!resolvedPaneIds.has(paneId)) unresolvedPaneIds.add(paneId);
-          }
-          const unresolvedWithoutDirectFailure = [...unresolvedPaneIds].filter((paneId) =>
-            !paneTeardown.kill.failedPaneIds.includes(paneId)
-            && !paneTeardown.proofUnavailable.some((proof) => proof.paneId === paneId));
-          if (unresolvedWithoutDirectFailure.length > 0) {
-            cleanupDebt.push(`pane_teardown_unresolved:${unresolvedWithoutDirectFailure.join(',')}`);
-          }
-        }
-      } catch (cleanupError) {
-        for (const paneId of rollbackPaneIds) unresolvedPaneIds.add(paneId);
-        cleanupDebt.push(`pane_cleanup_exception:${String(cleanupError)}`);
       }
 
-      const unresolvedWorkerNames = new Set(rollbackWorkers
-        .filter((worker) => typeof worker.pane_id === 'string' && unresolvedPaneIds.has(worker.pane_id))
-        .map((worker) => worker.name));
-      if (context.workerName && context.paneId && unresolvedPaneIds.has(context.paneId)) {
-        unresolvedWorkerNames.add(context.workerName);
-      }
-      try {
-        await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
-          await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
-          const currentConfigBytes = await readFile(configPath, 'utf8');
-          const currentConfig = JSON.parse(currentConfigBytes) as TeamConfig;
-          const currentManifestBytes = existsSync(manifestPath) ? await readFile(manifestPath, 'utf8') : null;
-          const retainedWorkers = rollbackWorkers.filter((worker) => unresolvedWorkerNames.has(worker.name));
-          const desiredByName = new Map(originalConfig.workers.map((worker) => [worker.name, worker]));
-          for (const worker of retainedWorkers) desiredByName.set(worker.name, worker);
-          const desiredConfig: TeamConfig = {
-            ...originalConfig,
-            workers: [...desiredByName.values()],
-            worker_count: desiredByName.size,
-            next_worker_index: Math.max(
-              originalConfig.next_worker_index ?? (originalConfig.workers.length + 1),
-              ...retainedWorkers.map((worker) => worker.index + 1),
-            ),
-          };
-          const desiredManifestBytes = originalManifestBytes === null
-            ? null
-            : JSON.stringify({
-              ...(JSON.parse(originalManifestBytes) as Record<string, unknown>),
-              workers: desiredConfig.workers,
-              worker_count: desiredConfig.worker_count,
-              next_worker_index: desiredConfig.next_worker_index,
-            }, null, 2);
-          const taskChanges = [];
-          for (const taskId of createdTaskIds) {
-            const taskPath = join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`);
-            const task = await readTask(sanitized, taskId, leaderCwd);
-            taskChanges.push({
-              taskId,
-              oldBytes: existsSync(taskPath) ? await readFile(taskPath, 'utf8') : null,
-              newBytes: task && unresolvedWorkerNames.has(task.owner ?? '')
-                ? JSON.stringify(task, null, 2)
-                : null,
-            });
-          }
-          await commitTeamMembershipTaskTransaction(sanitized, leaderCwd, {
-            baseGeneration: currentConfig.config_generation ?? 0,
-            tasks: taskChanges,
-            config: { oldBytes: currentConfigBytes, newBytes: JSON.stringify(desiredConfig, null, 2) },
-            manifest: { oldBytes: currentManifestBytes, newBytes: desiredManifestBytes },
-            recoverToNewOnFailure: true,
-            retainJournalOnSuccess: true,
-            failRollbackPersistence: hasScaleUpFailureInjection(env, 'rollback-membership-persistence'),
-            failRollbackPersistenceAfter: hasScaleUpFailureInjection(env, 'rollback-membership-config-persistence')
-              ? 'config'
-              : hasScaleUpFailureInjection(env, 'rollback-membership-manifest-persistence')
-                ? 'manifest'
-                : undefined,
-          });
-          const verified = JSON.parse(await readFile(configPath, 'utf8')) as TeamConfig;
-          if (!verified || retainedWorkers.some((worker) => !verified.workers.some((entry) => entry.name === worker.name && entry.pane_id === worker.pane_id))) {
-            throw new Error('canonical_scale_up_rollback_membership_verification_failed');
-          }
-          if (verified.workers.some((worker) => rollbackWorkerNames.has(worker.name) && !unresolvedWorkerNames.has(worker.name))) {
-            throw new Error('canonical_scale_up_rollback_resolved_membership_verification_failed');
-          }
-          await finalizeTeamMembershipTaskTransaction(sanitized, leaderCwd);
-          Object.assign(config, verified);
-        });
-      } catch (rollbackError) {
-        const journalPath = join(teamStateRoot, 'team', sanitized, '.membership-task-transaction.json');
-        const suffix = existsSync(journalPath) ? String(rollbackError) : `no_recoverable_journal:${String(rollbackError)}`;
-        return { ok: false, error: `scale_up_rollback_membership_persistence_failed:${suffix}` };
-      }
-      const cleanupWorkerNames = new Set([
-        ...rollbackWorkers
-          .filter((worker) => typeof worker.pane_id !== 'string' || resolvedPaneIds.has(worker.pane_id))
-          .map((worker) => worker.name),
-        ...(context.workerName && !unresolvedWorkerNames.has(context.workerName) ? [context.workerName] : []),
-      ]);
-      try {
-        for (const taskId of createdTaskIds) {
-          const task = await readTask(sanitized, taskId, leaderCwd);
-          if (task && unresolvedWorkerNames.has(task.owner ?? '')) continue;
-          await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true });
-        }
-        await Promise.all([...cleanupWorkerNames].map(async (workerName) => {
-          await rm(join(teamStateRoot, 'team', sanitized, 'workers', workerName), { recursive: true, force: true });
-        }));
-        for (const taskId of createdTaskIds) {
-          const task = await readTask(sanitized, taskId, leaderCwd);
-          if (task && unresolvedWorkerNames.has(task.owner ?? '')) continue;
-          if (task) throw new Error(`canonical_scale_up_rollback_task_verification_failed:${taskId}`);
-        }
-        for (const workerName of cleanupWorkerNames) {
-          if (existsSync(join(teamStateRoot, 'team', sanitized, 'workers', workerName))) {
-            throw new Error(`canonical_scale_up_rollback_worker_verification_failed:${workerName}`);
-          }
-        }
-      } catch (rollbackError) {
-        cleanupDebt.push(`canonical_cleanup_failed:${String(rollbackError)}`);
+      if (
+        context.workerName &&
+        context.worktreePath &&
+        !addedWorkers.some((worker) => worker.name === context.workerName)
+      ) {
+        await removeWorkerWorktreeRootAgentsFile(
+          sanitized,
+          context.workerName,
+          teamStateRoot,
+          context.worktreePath,
+        ).catch(() => {});
       }
 
       killOperationPane(context.paneId);
@@ -1099,25 +838,18 @@ export async function scaleUp(
 
     // Persist incoming tasks only after launch policy is frozen; the resulting
     // task listing is used for inbox and task materialization, never launch policy.
-    let materializedTasks: TeamTask[];
-    try {
-      for (const task of tasks) {
-        const createdTask = await createStateTask(sanitized, {
-          subject: task.subject,
-          description: task.description,
-          status: 'pending',
-          owner: task.owner,
-          blocked_by: task.blocked_by,
-          role: task.role,
-        }, leaderCwd);
-        createdTaskIds.push(createdTask.id);
-      }
-      materializedTasks = await listTasks(sanitized, leaderCwd);
-    } catch (error) {
-      return await rollbackScaleUp(
-        `scale_up_task_materialization_failed:${error instanceof Error ? error.message : String(error)}`,
-      );
+    for (const task of tasks) {
+      const createdTask = await createStateTask(sanitized, {
+        subject: task.subject,
+        description: task.description,
+        status: 'pending',
+        owner: task.owner,
+        blocked_by: task.blocked_by,
+        role: task.role,
+      }, leaderCwd);
+      createdTaskIds.push(createdTask.id);
     }
+    const materializedTasks = await listTasks(sanitized, leaderCwd);
 
     for (const workerLaunchPlan of workerLaunchPlans) {
       const {
@@ -1127,93 +859,82 @@ export async function scaleUp(
         workerLaunchArgs,
         workerCli,
       } = workerLaunchPlan;
-      // Freeze the split target and its identity before preparing any artifacts.
-      // Later proof must establish that this exact pane process still owns the
-      // target; a recycled pane ID must never become split authority.
-      const splitTargetCandidate = config.workers[config.workers.length - 1];
-      const splitTargetWorker = splitTargetCandidate?.pane_id?.trim() ? splitTargetCandidate : undefined;
-      const splitTarget = splitTargetWorker?.pane_id ?? config.leader_pane_id ?? '';
-      const expectedSplitTargetPid = splitTargetWorker
-        ? splitTargetWorker.pid
-        : config.leader_pane_pid;
-      const expectedSplitTargetOwnerId = typeof config.tmux_pane_owner_id === 'string'
-        ? config.tmux_pane_owner_id.trim()
-        : '';
-      if (
-        typeof expectedSplitTargetPid !== 'number'
-        || !Number.isSafeInteger(expectedSplitTargetPid)
-        || expectedSplitTargetPid <= 0
-      ) {
-        return await rollbackScaleUp(`scale_up_split_target_pid_missing:${splitTarget}`);
-      }
-      if (!expectedSplitTargetOwnerId) {
-        return await rollbackScaleUp(`scale_up_split_target_owner_unavailable:${splitTarget}`);
-      }
-      const splitDirection = splitTarget === (config.leader_pane_id ?? '') ? '-h' : '-v';
-
       nextIndex = workerIndex + 1;
       if (workerLaunchPlan.mixedTaskRoles.length > 1) {
         console.log(`[omx:scaling] ${workerName}: mixed task roles [${workerLaunchPlan.mixedTaskRoles.join(', ')}], falling back to ${agentType}`);
       }
 
-      // Prepare every pre-pane artifact under the rollback boundary. A pane is
-      // not required for ownership: workerName and any created worktree are
-      // sufficient for rollback to clean a failed preparation.
+      // Create worker directory
       const workerDirPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'workers', workerName);
-      const startupScriptPath = join(
-        teamStateRoot,
-        'team',
-        sanitized,
-        'runtime',
-        `worker-${workerIndex}-startup.sh`,
-      );
-      let workerWorkspace: EnsureWorktreeResult | null = null;
-      let workerCwd = leaderCwd;
-      let cmd: string;
-      let rawRolePromptContent: string | null = null;
-      try {
-        preparedWorkerDirectoryOwner.set(workerDirPath, workerName);
-        await mkdir(workerDirPath, { recursive: true });
+      await mkdir(workerDirPath, { recursive: true });
 
-        if (effectiveWorktreeMode.enabled) {
-          const worktreePlan = planWorktreeTarget({
+      const worktreeMode = effectiveWorktreeMode;
+      const workerWorkspaceResult = worktreeMode.enabled
+        ? ensureWorktree(planWorktreeTarget({
             cwd: leaderCwd,
             scope: 'team',
-            mode: effectiveWorktreeMode,
+            mode: worktreeMode,
             teamName: sanitized,
             workerName,
-          });
-          if (!worktreePlan.enabled) throw new Error(`worktree_not_planned:${workerName}`);
-          const worktreePathExistedBeforeEnsure = existsSync(worktreePlan.worktreePath);
-          const branchExistedBeforeEnsure = worktreePlan.branchName
-            ? spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${worktreePlan.branchName}`], {
-                cwd: worktreePlan.repoRoot,
-                encoding: 'utf-8',
-                windowsHide: true,
-              }).status === 0
-            : false;
-          try {
-            const ensuredWorkspace = ensureWorktree(worktreePlan);
-            throwIfScaleUpFailureInjected(env, 'worktree-ensure-post-create');
-            if (!ensuredWorkspace.enabled) throw new Error(`worktree_not_provisioned:${workerName}`);
-            workerWorkspace = ensuredWorkspace;
-          } catch (error) {
-            const recoveredWorkspace = recoverCreatedWorktreeAfterEnsureFailure(
-              worktreePlan,
-              worktreePathExistedBeforeEnsure,
-              branchExistedBeforeEnsure,
-            );
-            if (recoveredWorkspace) {
-              workerWorkspace = recoveredWorkspace;
-              provisionedWorktrees.push(recoveredWorkspace);
-            }
-            throw error;
-          }
-          if (!workerWorkspace) throw new Error(`worktree_not_provisioned:${workerName}`);
-          provisionedWorktrees.push(workerWorkspace);
-          throwIfScaleUpFailureInjected(env, 'worktree-post-create');
-          workerCwd = workerWorkspace.worktreePath;
+          }))
+        : { enabled: false } as const;
+      const workerWorkspace = workerWorkspaceResult.enabled ? workerWorkspaceResult : null;
+      const workerCwd = workerWorkspace ? workerWorkspace.worktreePath : leaderCwd;
+
+      // Build startup command and create tmux pane
+      const rawRolePromptContent = await loadRolePrompt(runtimeRole, join(leaderCwd, '.codex', 'prompts'))
+        ?? await loadRolePrompt(runtimeRole, codexPromptsDir());
+      const resolvedWorkerModel = parseTeamWorkerLaunchArgs(workerLaunchArgs).modelOverride ?? undefined;
+      const rolePromptContent = rawRolePromptContent
+        ? composeRoleInstructionsForRole(runtimeRole, rawRolePromptContent, resolvedWorkerModel)
+        : null;
+      const teamInstructionsPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'worker-agents.md');
+      const instructionsFilePath = workerWorkspace
+        ? await writeWorkerWorktreeRootAgentsFile({
+            teamName: sanitized,
+            workerName,
+            workerRole: runtimeRole,
+            rolePromptContent: rolePromptContent ?? '',
+            teamStateRoot,
+            leaderCwd,
+            worktreePath: workerWorkspace.worktreePath,
+          })
+        : rolePromptContent
+          ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, teamInstructionsPath, runtimeRole, rolePromptContent)
+          : teamInstructionsPath;
+      const extraEnv: Record<string, string> = {
+        OMX_TEAM_STATE_ROOT: teamStateRoot,
+        OMX_TEAM_LEADER_CWD: leaderCwd,
+        OMX_MODEL_INSTRUCTIONS_FILE: instructionsFilePath,
+        ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
+      };
+      if (workerWorkspace) {
+        extraEnv.OMX_TEAM_WORKTREE_PATH = workerWorkspace.worktreePath;
+        if (workerWorkspace.branchName) {
+          extraEnv.OMX_TEAM_WORKTREE_BRANCH = workerWorkspace.branchName;
         }
+        extraEnv.OMX_TEAM_WORKTREE_DETACHED = workerWorkspace.detached ? '1' : '0';
+      }
+      trustWorkerMiseConfigIfAvailable(workerCwd);
+      const cmd = writeWorkerStartupScriptCommand(
+        sanitized,
+        workerIndex,
+        workerLaunchArgs,
+        workerCwd,
+        extraEnv,
+        workerCli,
+        undefined,
+        runtimeRole,
+      ) ?? buildWorkerStartupCommand(
+        sanitized,
+        workerIndex,
+        workerLaunchArgs,
+        workerCwd,
+        extraEnv,
+        workerCli,
+        undefined,
+        runtimeRole,
+      );
 
       // Find the right-most worker pane to split from, or fall back to leader pane.
       // Keep the initial split from leader horizontal to preserve the leader-left
@@ -1511,8 +1232,6 @@ export async function scaleUp(
         approvedContextSection,
         workerGoalInstruction: buildTeamWorkerGoalInstruction(sanitized, workerName, workerTasks, { teamStateRoot }),
       });
-      throwIfScaleUpFailureInjected(env, 'inbox');
-
 
       const triggerDirective = buildTriggerDirective(
         workerName,
@@ -1659,10 +1378,10 @@ export async function scaleUp(
       if (!outcome.ok) {
         return await rollbackScaleUp(`scale_up_dispatch_failed:${workerName}:${outcome.reason}`, {
           paneId,
-          worker: workerInfo,
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
         });
       }
-      throwIfScaleUpFailureInjected(env, 'post-dispatch-rollback');
 
       if (!revalidateScaleSplitAuthority(provisionalAuthority)) {
         return await rollbackScaleUp(`Failed to revalidate tmux pane authority before saving ${workerName}`, {
@@ -1680,29 +1399,14 @@ export async function scaleUp(
       persistedPaneIds.workerPaneIds.set(workerInfo, paneId);
       config.worker_count = config.workers.length;
       config.next_worker_index = nextIndex;
-      throwIfScaleUpFailureInjected(env, 'config');
-
       await saveTeamConfig(config, leaderCwd);
-      throwIfScaleUpFailureInjected(env, 'finalization');
-      } catch (error) {
-        return await rollbackScaleUp(
-          `scale_up_worker_materialization_failed:${workerName}:${error instanceof Error ? error.message : String(error)}`,
-          { paneId, worker: workerInfo },
-        );
-      }
     }
 
-    try {
-      await appendTeamEvent(sanitized, {
-        type: 'team_leader_nudge',
-        worker: 'leader-fixed',
-        reason: `scale_up: added ${count} worker(s), new count=${config.worker_count}`,
-      }, leaderCwd);
-    } catch (error) {
-      return await rollbackScaleUp(
-        `scale_up_finalization_failed:${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    await appendTeamEvent(sanitized, {
+      type: 'team_leader_nudge',
+      worker: 'leader-fixed',
+      reason: `scale_up: added ${count} worker(s), new count=${config.worker_count}`,
+    }, leaderCwd);
 
     return {
       ok: true,
@@ -1710,7 +1414,6 @@ export async function scaleUp(
       newWorkerCount: config.worker_count,
       nextWorkerIndex: nextIndex,
     };
-    });
   });
 }
 
@@ -1726,427 +1429,6 @@ export interface ScaleDownOptions {
   /** Drain timeout in milliseconds. Default: 30000. */
   drainTimeoutMs?: number;
 }
-
-interface ScaleDownCleanupDebtPane {
-  name?: string;
-  index?: number;
-  pane_id: string;
-  pid: number | null;
-}
-
-interface ScaleDownCleanupDebtResource {
-  name: string;
-  worktree_path?: string;
-  worktree_repo_root?: string;
-  worktree_branch?: string;
-  worktree_detached?: boolean;
-  worktree_created?: boolean;
-  team_state_root?: string;
-}
-
-interface ScaleDownCleanupDebt {
-  schema_version: 1;
-  operation: 'scale_down';
-  status: string;
-  created_at?: string;
-  updated_at?: string;
-  workers?: ScaleDownCleanupDebtPane[];
-  unresolved_panes?: ScaleDownCleanupDebtPane[];
-  resource_workers?: ScaleDownCleanupDebtResource[];
-  reasons?: string[];
-  removed_worker_names?: string[];
-}
-
-interface PathContainmentSemantics {
-  relative(from: string, to: string): string;
-  isAbsolute(path: string): boolean;
-  sep: string;
-}
-
-export function isSameOrInsidePath(
-  path: string,
-  root: string,
-  pathSemantics: PathContainmentSemantics = { relative, isAbsolute, sep },
-): boolean {
-  const relativePath = pathSemantics.relative(root, path);
-  return relativePath === ''
-    || (!pathSemantics.isAbsolute(relativePath)
-      && relativePath !== '..'
-      && !relativePath.startsWith(`..${pathSemantics.sep}`));
-}
-
-async function assertExistingPathParentContained(path: string, root: string): Promise<void> {
-  const canonicalRoot = await realpath(root);
-  let candidate = resolve(path);
-  while (!existsSync(candidate)) {
-    const parent = dirname(candidate);
-    if (parent === candidate) throw new Error(`scale_down_cleanup_debt_path_missing_parent:${path}`);
-    candidate = parent;
-  }
-  const canonicalExistingPath = await realpath(candidate);
-  if (!isSameOrInsidePath(canonicalExistingPath, canonicalRoot)) {
-    throw new Error(`scale_down_cleanup_debt_path_escape:${path}`);
-  }
-}
-
-async function validateScaleDownCleanupResources(
-  teamName: string,
-  leaderCwd: string,
-  teamStateRoot: string,
-  workers: readonly ScaleDownCleanupDebtResource[],
-): Promise<void> {
-  const canonicalLeaderCwd = await realpath(leaderCwd);
-  let repoRoot = canonicalLeaderCwd;
-  const repoRootResult = spawnSync('git', ['rev-parse', '--show-toplevel'], {
-    cwd: leaderCwd,
-    encoding: 'utf-8',
-    windowsHide: true,
-  });
-  const reportedRepoRoot = (repoRootResult.stdout || '').trim();
-  if (repoRootResult.status === 0 && reportedRepoRoot) {
-    repoRoot = await realpath(resolve(reportedRepoRoot));
-  }
-  const canonicalTeamStateRoot = await realpath(resolve(teamStateRoot));
-  const expectedWorkerRoot = join(canonicalTeamStateRoot, 'team', teamName, 'workers');
-
-  for (const worker of workers) {
-    const expectedWorkerDirectory = join(expectedWorkerRoot, worker.name);
-    await assertExistingPathParentContained(expectedWorkerDirectory, canonicalTeamStateRoot);
-    if (worker.team_state_root !== undefined
-      && (!isAbsolute(worker.team_state_root) || worker.team_state_root !== resolve(worker.team_state_root)
-        || resolve(worker.team_state_root) !== canonicalTeamStateRoot)) {
-      throw new Error(`scale_down_cleanup_debt_invalid_team_state_root:${worker.name}`);
-    }
-    if (worker.worktree_path === undefined) {
-      if (worker.worktree_repo_root !== undefined || worker.worktree_branch !== undefined
-        || worker.worktree_detached !== undefined || worker.worktree_created !== undefined) {
-        throw new Error(`scale_down_cleanup_debt_invalid_worktree_metadata:${worker.name}`);
-      }
-      continue;
-    }
-
-    const expectedWorktreePath = join(repoRoot, '.omx', 'team', teamName, 'worktrees', worker.name);
-    if (!isAbsolute(worker.worktree_path) || worker.worktree_path !== resolve(worker.worktree_path)
-      || resolve(worker.worktree_path) !== expectedWorktreePath
-      || (worker.worktree_repo_root !== undefined && (
-        !isAbsolute(worker.worktree_repo_root)
-        || worker.worktree_repo_root !== resolve(worker.worktree_repo_root)
-        || resolve(worker.worktree_repo_root) !== repoRoot
-      ))
-      || (worker.worktree_detached !== undefined && typeof worker.worktree_detached !== 'boolean')
-      || (worker.worktree_created !== undefined && typeof worker.worktree_created !== 'boolean')
-      || (worker.worktree_created === true && (
-        typeof worker.worktree_repo_root !== 'string' || typeof worker.worktree_detached !== 'boolean'
-      ))) {
-      throw new Error(`scale_down_cleanup_debt_invalid_worktree_target:${worker.name}`);
-    }
-    await assertExistingPathParentContained(expectedWorktreePath, repoRoot);
-    if (existsSync(expectedWorktreePath) && await realpath(expectedWorktreePath) !== expectedWorktreePath) {
-      throw new Error(`scale_down_cleanup_debt_worktree_symlink:${worker.name}`);
-    }
-  }
-}
-
-async function cleanupScaleDownResources(
-  teamName: string,
-  teamStateRoot: string,
-  workers: readonly ScaleDownCleanupDebtResource[],
-): Promise<void> {
-  for (const worker of workers) {
-    // An absent exact worktree means a prior cleanup completed before crashing.
-    // Do not replay a restoration or git removal against a replacement path.
-    if (worker.worktree_path && existsSync(worker.worktree_path)) {
-      await removeWorkerWorktreeRootAgentsFile(
-        teamName,
-        worker.name,
-        worker.team_state_root ?? teamStateRoot,
-        worker.worktree_path,
-      );
-    }
-  }
-  const worktrees: EnsureWorktreeResult[] = workers
-    .filter((worker): worker is ScaleDownCleanupDebtResource & {
-      worktree_path: string;
-      worktree_repo_root: string;
-      worktree_detached: boolean;
-      worktree_created: true;
-    } => worker.worktree_created === true
-      && typeof worker.worktree_path === 'string'
-      && existsSync(worker.worktree_path)
-      && typeof worker.worktree_repo_root === 'string'
-      && typeof worker.worktree_detached === 'boolean')
-    .map((worker) => ({
-      enabled: true,
-      repoRoot: worker.worktree_repo_root,
-      worktreePath: worker.worktree_path,
-      detached: worker.worktree_detached,
-      branchName: worker.worktree_branch ?? null,
-      created: true,
-      reused: false,
-      // Membership records do not establish branch ownership. Preserve a named
-      // branch rather than deleting one that may have predated this worker.
-      createdBranch: false,
-    }));
-  if (worktrees.length > 0) await rollbackProvisionedWorktrees(worktrees);
-  await Promise.all(workers.map(async (worker) => {
-    await rm(join(teamStateRoot, 'team', teamName, 'workers', worker.name), { recursive: true, force: true });
-  }));
-}
-
-function asScaleDownDebtResources(
-  debt: ScaleDownCleanupDebt,
-  removedWorkerNames: readonly string[],
-): ScaleDownCleanupDebtResource[] | null {
-  const resources = debt.resource_workers;
-  if (!Array.isArray(resources) || resources.length !== removedWorkerNames.length) return null;
-  const expected = new Set(removedWorkerNames);
-  const seen = new Set<string>();
-  for (const worker of resources) {
-    if (!worker || typeof worker.name !== 'string' || !expected.has(worker.name) || seen.has(worker.name)
-      || (worker.worktree_path !== undefined && typeof worker.worktree_path !== 'string')
-      || (worker.worktree_repo_root !== undefined && typeof worker.worktree_repo_root !== 'string')
-      || (worker.worktree_branch !== undefined && typeof worker.worktree_branch !== 'string')
-      || (worker.worktree_detached !== undefined && typeof worker.worktree_detached !== 'boolean')
-      || (worker.worktree_created !== undefined && typeof worker.worktree_created !== 'boolean')
-      || (worker.team_state_root !== undefined && typeof worker.team_state_root !== 'string')) return null;
-    seen.add(worker.name);
-  }
-  return resources;
-}
-
-function asScaleDownDebtPanes(
-  debt: ScaleDownCleanupDebt,
-  removedWorkerNames: readonly string[],
-  resources: readonly ScaleDownCleanupDebtResource[],
-  leaderPaneId: string | null | undefined,
-  hudPaneId: string | null | undefined,
-): ScaleDownCleanupDebtPane[] | null {
-  const workers = debt.workers;
-  const unresolved = debt.unresolved_panes;
-  if (!Array.isArray(workers) || (unresolved !== undefined && !Array.isArray(unresolved))) return null;
-
-  const expectedNames = new Set(removedWorkerNames);
-  const resourceNames = new Set(resources.map((resource) => resource.name));
-  const canonicalByName = new Map<string, ScaleDownCleanupDebtPane>();
-  const allPaneIds = new Set<string>();
-  const normalizedLeaderPaneId = typeof leaderPaneId === 'string' ? leaderPaneId.trim() : '';
-  const normalizedHudPaneId = typeof hudPaneId === 'string' ? hudPaneId.trim() : '';
-  const validate = (pane: ScaleDownCleanupDebtPane, requireCanonicalMatch: boolean): boolean => {
-    if (!pane || typeof pane.name !== 'string' || !expectedNames.has(pane.name) || !resourceNames.has(pane.name)
-      || typeof pane.index !== 'number' || !Number.isInteger(pane.index) || pane.index <= 0
-      || pane.index !== Number(pane.name.slice('worker-'.length))
-      || typeof pane.pane_id !== 'string' || !/^%\d+$/.test(pane.pane_id)
-      || pane.pane_id === normalizedLeaderPaneId || pane.pane_id === normalizedHudPaneId
-      || (pane.pid !== null && (!Number.isSafeInteger(pane.pid) || pane.pid <= 0))) return false;
-    const canonical = canonicalByName.get(pane.name);
-    if (requireCanonicalMatch) {
-      return canonical !== undefined
-        && canonical.index === pane.index
-        && canonical.pane_id === pane.pane_id
-        && canonical.pid === pane.pid;
-    }
-    if (canonical !== undefined || allPaneIds.has(pane.pane_id)) return false;
-    canonicalByName.set(pane.name, pane);
-    allPaneIds.add(pane.pane_id);
-    return true;
-  };
-
-  for (const worker of workers) {
-    if (!validate(worker, false)) return null;
-  }
-  const unresolvedNames = new Set<string>();
-  const unresolvedPaneIds = new Set<string>();
-  for (const pane of unresolved ?? []) {
-    if (unresolvedNames.has(pane.name ?? '') || unresolvedPaneIds.has(pane.pane_id)
-      || !validate(pane, true)) return null;
-    unresolvedNames.add(pane.name!);
-    unresolvedPaneIds.add(pane.pane_id);
-  }
-  return unresolved && unresolved.length > 0 ? unresolved : workers;
-}
-
-async function hasMatchingScaleDownDebtWorkerIdentity(
-  teamStateRoot: string,
-  teamName: string,
-  pane: ScaleDownCleanupDebtPane,
-): Promise<boolean> {
-  try {
-    const identity = JSON.parse(await readFile(
-      join(teamStateRoot, 'team', teamName, 'workers', pane.name ?? '', 'identity.json'),
-      'utf8',
-    )) as Partial<WorkerInfo>;
-    return identity.name === pane.name
-      && identity.index === pane.index
-      && identity.pane_id === pane.pane_id
-      && identity.pid === pane.pid;
-  } catch {
-    return false;
-  }
-}
-
-export async function reconcileScaleDownCleanupDebt(
-  teamName: string,
-  cwd: string,
-  _callerConfig: TeamConfig,
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  const sanitized = sanitizeTeamName(teamName);
-  const leaderCwd = resolve(cwd);
-  return await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
-    await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
-    // Authorization is derived only from the canonical state observed under the
-    // membership barrier; callers may hold a stale pre-transaction config.
-    const config = await readTeamConfig(sanitized, leaderCwd);
-    if (!config) return { ok: false, error: `Team ${sanitized} not found` };
-    const teamStateRoot = config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd);
-    const cleanupDebtPath = join(teamStateRoot, 'team', sanitized, '.scale-down-cleanup-debt.json');
-    if (!existsSync(cleanupDebtPath)) return { ok: true };
-
-    let debt: ScaleDownCleanupDebt;
-    try {
-      debt = JSON.parse(await readFile(cleanupDebtPath, 'utf8')) as ScaleDownCleanupDebt;
-    } catch (error) {
-      return { ok: false, error: `scale_down_cleanup_debt_unreadable:${String(error)}` };
-    }
-    if (debt.schema_version !== 1 || debt.operation !== 'scale_down') {
-      return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
-    }
-    const removedWorkerNames = Array.isArray(debt.removed_worker_names)
-      ? debt.removed_worker_names
-      : (Array.isArray(debt.workers) ? debt.workers.map((worker) => worker?.name).filter((name): name is string => typeof name === 'string') : []);
-    if (removedWorkerNames.length === 0
-      || removedWorkerNames.some((name) => !/^worker-\d+$/.test(name))
-      || new Set(removedWorkerNames).size !== removedWorkerNames.length) {
-      return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
-    }
-    const resources = asScaleDownDebtResources(debt, removedWorkerNames);
-    if (!resources) return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
-    try {
-      await validateScaleDownCleanupResources(sanitized, leaderCwd, teamStateRoot, resources);
-    } catch {
-      return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
-    }
-    const panes = asScaleDownDebtPanes(
-      debt,
-      removedWorkerNames,
-      resources,
-      config.leader_pane_id,
-      config.hud_pane_id,
-    );
-    // Validate all journal bindings before classifying or mutating recovery state.
-    // A journal is evidence, never authority to target an arbitrary global pane.
-    if (!panes) return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
-    const stillCanonical = removedWorkerNames.filter((name) => config.workers.some((worker) => worker.name === name));
-    // A pre-commit journal is not authorization to kill or remove anything.
-    if (stillCanonical.length === removedWorkerNames.length) {
-      await removeDurableFile(cleanupDebtPath);
-      return { ok: true };
-    }
-    if (stillCanonical.length > 0) return { ok: false, error: 'scale_down_cleanup_debt_membership_inconsistent' };
-    // A cleanup journal may never reuse a pane identity held by a worker that
-    // survived the committed membership update. This is checked before any
-    // liveness or owner probes so malformed debt cannot cause a tmux effect.
-    const survivingWorkers = config.workers.filter((worker) => !removedWorkerNames.includes(worker.name));
-    if (panes.some((pane) => survivingWorkers.some((worker) => (
-      worker.pane_id === pane.pane_id
-      || (pane.pid !== null && worker.pid === pane.pid)
-    )))) {
-      return { ok: false, error: 'scale_down_cleanup_debt_malformed' };
-    }
-    const resolvedPaneIds = new Set<string>();
-    const reasons: string[] = [];
-    const expectedOwnerId = typeof config.tmux_pane_owner_id === 'string'
-      ? config.tmux_pane_owner_id.trim()
-      : '';
-    for (const pane of panes) {
-      // Legacy PID-less records can establish convergence from an authoritative
-      // global absence/dead proof, but can never authorize a live-pane effect.
-      const freshProof = readExactPaneProofSync(pane.pane_id);
-      if (freshProof.status === 'gone') {
-        resolvedPaneIds.add(pane.pane_id);
-        continue;
-      }
-      if (freshProof.status === 'unavailable') {
-        reasons.push(`${pane.pane_id}:${freshProof.reason}`);
-        continue;
-      }
-      if (pane.pid === null) {
-        reasons.push(`${pane.pane_id}:legacy_pid_missing_live`);
-        continue;
-      }
-      if (freshProof.pid !== pane.pid) {
-        reasons.push(`${pane.pane_id}:pane_pid_changed`);
-        continue;
-      }
-      // A live debt pane must remain bound to the removed worker's recorded
-      // identity; the team-wide owner token alone only proves team membership.
-      if (!await hasMatchingScaleDownDebtWorkerIdentity(teamStateRoot, sanitized, pane)) {
-        reasons.push(`${pane.pane_id}:worker_identity_unavailable`);
-        continue;
-      }
-      // Owner reads are authoritative only for this canonical Team token. Missing,
-      // mismatched, and unavailable tags all fail closed for a live pane effect.
-      if (!expectedOwnerId) {
-        reasons.push(`${pane.pane_id}:team_owner_unavailable`);
-        continue;
-      }
-      const owner = readPaneTeamOwnerTagResult(pane.pane_id);
-      if (owner.status === 'error') {
-        reasons.push(`${pane.pane_id}:team_owner_unavailable`);
-        continue;
-      }
-      if (owner.status !== 'value' || owner.value !== expectedOwnerId) {
-        reasons.push(`${pane.pane_id}:team_owner_mismatch`);
-        continue;
-      }
-      // teardownWorkerPanes re-proves this exact pane immediately before the kill
-      // and pins the same durable PID through the kill confirmation.
-      const teardown = await teardownWorkerPanes([pane.pane_id], {
-        leaderPaneId: config.leader_pane_id,
-        hudPaneId: config.hud_pane_id,
-        expectedPanePids: { [pane.pane_id]: pane.pid },
-        authorizePaneKill: (paneId) => {
-          const currentOwner = readPaneTeamOwnerTagResult(paneId);
-          return currentOwner.status === 'value' && currentOwner.value === expectedOwnerId;
-        },
-      });
-      if (teardown.provenGonePaneIds.includes(pane.pane_id) || teardown.killedPaneIds.includes(pane.pane_id)) {
-        resolvedPaneIds.add(pane.pane_id);
-        continue;
-      }
-      reasons.push(...teardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`));
-      reasons.push(...teardown.kill.failedPaneIds.map((paneId) => `${paneId}:kill_failed`));
-      if (teardown.proofUnavailable.length === 0 && teardown.kill.failedPaneIds.length === 0) {
-        reasons.push(`${pane.pane_id}:teardown_unresolved`);
-      }
-    }
-    const unresolvedPanes = panes.filter((pane) => !resolvedPaneIds.has(pane.pane_id));
-    if (unresolvedPanes.length > 0) {
-      await writeAtomic(cleanupDebtPath, JSON.stringify({
-        ...debt,
-        status: 'unresolved',
-        updated_at: new Date().toISOString(),
-        unresolved_panes: unresolvedPanes,
-        reasons,
-      }, null, 2));
-      return { ok: false, error: `scale_down_cleanup_debt_unresolved:${unresolvedPanes.map((pane) => pane.pane_id).join(',')}` };
-    }
-    try {
-      await cleanupScaleDownResources(sanitized, teamStateRoot, resources);
-    } catch (error) {
-      await writeAtomic(cleanupDebtPath, JSON.stringify({
-        ...debt,
-        status: 'resource_cleanup_pending',
-        updated_at: new Date().toISOString(),
-        unresolved_panes: [],
-        reasons: [`resource_cleanup_failed:${String(error)}`],
-      }, null, 2));
-      return { ok: false, error: `scale_down_cleanup_debt_resource_cleanup_failed:${String(error)}` };
-    }
-    await removeDurableFile(cleanupDebtPath);
-    return { ok: true };
-  });
-}
-
 
 /**
  * Remove workers from a running team.
@@ -2168,10 +1450,7 @@ export async function scaleDown(
   const drainTimeoutMs = options.drainTimeoutMs ?? 30_000;
 
   return await withScalingLock(sanitized, leaderCwd, async (): Promise<ScaleDownResult | ScaleError> => {
-    const config = await withTaskMembershipBarrier(sanitized, leaderCwd, async () => {
-      await recoverTeamMembershipTaskTransaction(sanitized, leaderCwd);
-      return await readTeamConfig(sanitized, leaderCwd);
-    });
+    const config = await readTeamConfig(sanitized, leaderCwd);
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
     }
@@ -2242,32 +1521,6 @@ export async function scaleDown(
 
     const sessionName = config.tmux_session;
     const removedNames: string[] = [];
-    const priorWorkerStatusArtifacts = new Map<string, { exists: true; raw: Buffer } | { exists: false }>();
-    for (const worker of targetWorkers) {
-      const statusPath = join(teamStateRoot, 'team', sanitized, 'workers', worker.name, 'status.json');
-      try {
-        priorWorkerStatusArtifacts.set(worker.name, { exists: true, raw: await readFile(statusPath) });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-          priorWorkerStatusArtifacts.set(worker.name, { exists: false });
-        } else {
-          throw error;
-        }
-      }
-    }
-    const restorePriorWorkerStatuses = async (workers: readonly WorkerInfo[]): Promise<void> => {
-      await Promise.all(workers.map(async (worker) => {
-        const statusPath = join(teamStateRoot, 'team', sanitized, 'workers', worker.name, 'status.json');
-        const priorArtifact = priorWorkerStatusArtifacts.get(worker.name);
-        if (priorArtifact?.exists) {
-          await writeFile(statusPath, priorArtifact.raw);
-        } else {
-          await rm(statusPath, { force: true });
-        }
-      }));
-    };
-
-
 
     // Phase 1: Set workers to 'draining' status
     for (const w of targetWorkers) {
@@ -2374,22 +1627,31 @@ export async function scaleDown(
         return { ok: false, error: `scale_down_worktree_cleanup_failed:${String(error)}` };
       }
     }
-    if (teardownFailure) return teardownFailure;
-    targetWorkers = removableWorkers;
 
-    // Resource cleanup remains represented by the committed debt until every
-    // worker directory, status, generated AGENTS file, and provisioned worktree
-    // has converged. Reconciliation reacquires authority before consuming it.
-    removedNames.push(...targetWorkers.map((worker) => worker.name));
-    const resourceCleanup = await reconcileScaleDownCleanupDebt(sanitized, leaderCwd, config);
-    if (!resourceCleanup.ok) return resourceCleanup;
-    const reason = `scale_down: removed ${removedNames.length} worker(s) [${removedNames.join(', ')}], new count=${config.worker_count}`;
-    try {
-      await appendTeamEvent(sanitized, { type: 'team_leader_nudge', worker: 'leader-fixed', reason }, leaderCwd);
-    } catch {
-      // The cleanup transaction has already converged; event delivery is advisory.
+    for (const w of targetWorkers) {
+      if (w.worktree_path) {
+        await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, w.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd), w.worktree_path).catch(() => {});
+      }
+      removedNames.push(w.name);
     }
-    return { ok: true, removedWorkers: removedNames, newWorkerCount: config.worker_count };
+
+    // Phase 4: Update config
+    const removedSet = new Set(removedNames);
+    config.workers = config.workers.filter(w => !removedSet.has(w.name));
+    config.worker_count = config.workers.length;
+    await saveTeamConfig(config, leaderCwd);
+
+    await appendTeamEvent(sanitized, {
+      type: 'team_leader_nudge',
+      worker: 'leader-fixed',
+      reason: `scale_down: removed ${removedNames.length} worker(s) [${removedNames.join(', ')}], new count=${config.worker_count}`,
+    }, leaderCwd);
+
+    return {
+      ok: true,
+      removedWorkers: removedNames,
+      newWorkerCount: config.worker_count,
+    };
   });
 }
 

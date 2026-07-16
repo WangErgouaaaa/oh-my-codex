@@ -1412,11 +1412,6 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
-      const config = await readTeamConfig('team-shutdown-mode-state', wd);
-      assert.ok(config);
-      if (!config) return;
-      config.tmux_session = '';
-      await saveTeamConfig(config, wd);
 
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
       console.warn = (...args: unknown[]) => warns.push(args.map(String).join(' '));
@@ -1472,11 +1467,6 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
-      const config = await readTeamConfig(teamName, wd);
-      assert.ok(config);
-      if (!config) return;
-      config.tmux_session = '';
-      await saveTeamConfig(config, wd);
 
       await teamCommand(['shutdown', teamName, '--force']);
 
@@ -1524,11 +1514,6 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
-      const config = await readTeamConfig(teamName, wd);
-      assert.ok(config);
-      if (!config) return;
-      config.tmux_session = '';
-      await saveTeamConfig(config, wd);
 
       await teamCommand(['shutdown', teamName, '--force']);
 
@@ -1581,11 +1566,6 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
-      const config = await readTeamConfig(teamName, wd);
-      assert.ok(config);
-      if (!config) return;
-      config.tmux_session = '';
-      await saveTeamConfig(config, wd);
 
       await teamCommand(['shutdown', teamName, '--force']);
 
@@ -1612,8 +1592,6 @@ describe('teamCommand shutdown --force parsing', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-shutdown-shared-cli-'));
     const binDir = join(wd, 'bin');
     const tmuxLogPath = join(wd, 'tmux.log');
-    const killedHudPanePath = join(wd, 'killed-hud-pane');
-    const restoredHudPanePath = join(wd, 'restored-hud-pane');
     const tmuxPath = join(binDir, 'tmux');
     const previousPath = process.env.PATH;
 
@@ -1661,8 +1639,8 @@ case "$1" in
         printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER='1' OMX_SESSION_ID='shared-shutdown-cli' OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=shared-shutdown-cli/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=shared-shutdown-cli/worker-2 codex\\n"
         exit 0
         ;;
-      *"-F #{pane_id}"*)
-        printf "%%11\n%%12\n%%13\n%%14\n"
+      *"-t leader:0 -F #{pane_id}"*)
+        printf "%%11\\n%%12\\n%%13\\n%%14\\n"
         exit 0
         ;;
       *)
@@ -1671,8 +1649,7 @@ case "$1" in
     esac
     ;;
   split-window)
-    : > "${restoredHudPanePath}"
-    printf '%%44\n'
+    printf '%%44\\n'
     exit 0
     ;;
   show-option)
@@ -1705,10 +1682,6 @@ case "$1" in
     exit 0
     ;;
   kill-pane)
-    case "$3" in
-      %12) : > "${killedHudPanePath}" ;;
-      %13|%14) : > "${wd}/killed-pane-$3" ;;
-    esac
     # Shared-session runtime coverage should validate pane-targeted teardown
     # only. Detached leader-wrapper signal behavior is covered separately in
     # cli/index detached-session tests.
@@ -1732,12 +1705,8 @@ esac
       if (!config) return;
       config.tmux_session = 'leader:0';
       config.leader_pane_id = '%11';
-      config.leader_pane_pid = 1111;
       config.hud_pane_id = '%12';
-      config.hud_pane_pid = 1212;
-      config.tmux_pane_owner_id = 'team:shared-shutdown-cli';
       config.workers[0]!.pane_id = '%13';
-      config.workers[0]!.pid = 1313;
       config.workers[1]!.pane_id = '%14';
       config.workers[0]!.pid = 1103;
       config.workers[1]!.pid = 1104;
@@ -1763,28 +1732,6 @@ esac
       assert.match(tmuxLog, /kill-pane -t %13/);
       assert.match(tmuxLog, /kill-pane -t %14/);
       assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
-      const tmuxCommands = tmuxLog.trim().split('\n').filter(Boolean);
-      const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
-      for (const paneId of ['%12', '%13', '%14']) {
-        const killIndex = tmuxCommands.indexOf(`kill-pane -t ${paneId}`);
-        assert.ok(killIndex > 2, `expected teardown for ${paneId}`);
-        assert.match(
-          tmuxCommands[killIndex - 3] ?? '',
-          exactGlobalPaneProof,
-          `${paneId} teardown must begin with a fresh exact global proof`,
-        );
-        assert.equal(
-          tmuxCommands[killIndex - 2],
-          `show-option -qv -p -t ${paneId} @omx_team_pane_owner_id`,
-          `${paneId} teardown must include adjacent owner authorization`,
-        );
-        assert.match(
-          tmuxCommands[killIndex - 1] ?? '',
-          exactGlobalPaneProof,
-          `${paneId} teardown must end with a final exact global PID proof`,
-        );
-      }
-      assert.doesNotMatch(tmuxLog, /list-panes -t %(12|13|14)\b/, 'explicit teardown panes must not use target-scoped fallback proof');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -1800,29 +1747,9 @@ esac
       await withTempTmuxSession(async (fixture) => {
         const teamName = 'shared-shutdown-in-pane';
         const teamStateRoot = join(wd, '.omx', 'state');
-        const runtimeDir = join(teamStateRoot, 'team', teamName, 'runtime');
-        const workerPaneOneScript = join(runtimeDir, 'worker-1-startup.sh');
-        const workerPaneTwoScript = join(runtimeDir, 'worker-2-startup.sh');
-        await mkdir(runtimeDir, { recursive: true });
-        await writeFile(workerPaneOneScript, '#!/bin/sh\nexec sleep 300\n');
-        await writeFile(workerPaneTwoScript, '#!/bin/sh\nexec sleep 300\n');
-        await chmod(workerPaneOneScript, 0o755);
-        await chmod(workerPaneTwoScript, 0o755);
         const hudPaneId = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, 'sleep 300']);
-        const workerPaneOne = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, workerPaneOneScript]);
-        const workerPaneTwo = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, workerPaneTwoScript]);
-        const leaderPanePid = Number(runFixtureTmux(fixture, ['display-message', '-p', '-t', fixture.leaderPaneId, '#{pane_pid}']));
-        const hudPanePid = Number(runFixtureTmux(fixture, ['display-message', '-p', '-t', hudPaneId, '#{pane_pid}']));
-        const workerPaneOnePid = Number(runFixtureTmux(fixture, ['display-message', '-p', '-t', workerPaneOne, '#{pane_pid}']));
-        const workerPaneTwoPid = Number(runFixtureTmux(fixture, ['display-message', '-p', '-t', workerPaneTwo, '#{pane_pid}']));
-        assert.ok(leaderPanePid > 0);
-        assert.ok(hudPanePid > 0);
-        assert.ok(workerPaneOnePid > 0);
-        assert.ok(workerPaneTwoPid > 0);
-        const paneOwnerId = 'team:shared-shutdown-in-pane';
-        for (const paneId of [fixture.leaderPaneId, hudPaneId, workerPaneOne, workerPaneTwo]) {
-          runFixtureTmux(fixture, ['set-option', '-p', '-t', paneId, '@omx_team_pane_owner_id', paneOwnerId]);
-        }
+        const workerPaneOne = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, 'sleep 300']);
+        const workerPaneTwo = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, 'sleep 300']);
 
         await initTeamState(teamName, 'shared shutdown in-pane test', 'executor', 2, wd);
         const config = await readTeamConfig(teamName, wd);
@@ -1830,14 +1757,9 @@ esac
         if (!config) return;
         config.tmux_session = fixture.windowTarget;
         config.leader_pane_id = fixture.leaderPaneId;
-        config.leader_pane_pid = leaderPanePid;
         config.hud_pane_id = hudPaneId;
-        config.hud_pane_pid = hudPanePid;
-        config.tmux_pane_owner_id = paneOwnerId;
         config.workers[0]!.pane_id = workerPaneOne;
-        config.workers[0]!.pid = workerPaneOnePid;
         config.workers[1]!.pane_id = workerPaneTwo;
-        config.workers[1]!.pid = workerPaneTwoPid;
         await saveTeamConfig(config, wd);
 
         const result = await runNodeCli(['team', 'shutdown', teamName, '--force'], {
@@ -2578,12 +2500,10 @@ describe('teamCommand status', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-status-json-'));
     const previousCwd = process.cwd();
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-    const previousPath = process.env.PATH;
     const logs: string[] = [];
     const originalLog = console.log;
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
-      process.env.PATH = wd;
       process.chdir(wd);
       const config = await withoutTeamTestWorkerEnv(() => initTeamState('pane-json-team', 'inspect worker panes', 'executor', 1, wd));
       await withoutTeamTestWorkerEnv(() => createTask('pane-json-team', {
@@ -2835,8 +2755,6 @@ describe('teamCommand status', () => {
     } finally {
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
-      if (typeof previousPath === 'string') process.env.PATH = previousPath;
-      else delete process.env.PATH;
       console.log = originalLog;
       process.chdir(previousCwd);
       await rm(wd, { recursive: true, force: true });

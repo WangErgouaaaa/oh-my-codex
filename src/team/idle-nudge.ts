@@ -65,7 +65,7 @@ export async function isPaneIdle(paneId: string): Promise<boolean> {
 /** Resolves fresh, owner-bound pane authority before issuing a nudge. */
 async function sendToWorkerByPaneId(
   sessionName: string,
-  target: TeamNudgePaneTarget | null,
+  paneId: string,
   message: string,
 ): Promise<boolean> {
   const baseSessionName = sessionName.split(':', 1)[0] ?? '';
@@ -91,35 +91,6 @@ async function sendToWorkerByPaneId(
     return false;
   }
 }
-
-
-function isAuthorizedTeamNudgeTarget(value: string | TeamNudgePaneTarget): value is TeamNudgePaneTarget {
-  return typeof value !== 'string'
-    && /^%[0-9]+$/.test(value.paneId)
-    && Number.isSafeInteger(value.workerIndex)
-    && value.workerIndex >= 0
-    && Number.isSafeInteger(value.panePid)
-    && value.panePid > 0
-    && value.teamOwnerId.trim() !== ''
-    && value.paneId !== value.hudPaneId?.trim();
-}
-
-async function isAuthorizedTeamPaneIdle(sessionName: string, target: TeamNudgePaneTarget): Promise<boolean> {
-  try {
-    const capture = await captureWorkerPane(
-      sessionName,
-      target.workerIndex,
-      target.paneId,
-      target.panePid,
-      target.teamOwnerId,
-      target.hudPaneId,
-    );
-    return capture !== '' && paneLooksReady(capture) && !paneHasActiveTask(capture);
-  } catch {
-    return false;
-  }
-}
-
 
 // ---------------------------------------------------------------------------
 // NudgeTracker
@@ -151,7 +122,7 @@ export class NudgeTracker {
    * @param sessionName  - Tmux session name (passed to sendToWorker)
    */
   async checkAndNudge(
-    paneTargets: Array<string | TeamNudgePaneTarget>,
+    paneIds: string[],
     leaderPaneId: string | undefined,
     sessionName: string,
   ): Promise<string[]> {
@@ -163,10 +134,7 @@ export class NudgeTracker {
 
     const nudged: string[] = [];
 
-    for (const paneTarget of paneTargets) {
-      const paneId = typeof paneTarget === 'string' ? paneTarget : paneTarget.paneId;
-      // Explicit Team panes require their persisted PID, canonical owner, and HUD exclusion.
-      if (paneId.startsWith('%') && !isAuthorizedTeamNudgeTarget(paneTarget)) continue;
+    for (const paneId of paneIds) {
       // Never nudge the leader pane
       if (paneId === leaderPaneId) continue;
 
@@ -179,9 +147,7 @@ export class NudgeTracker {
       // Max nudges reached for this pane — skip
       if (state.nudgeCount >= this.config.maxCount) continue;
 
-      const idle = isAuthorizedTeamNudgeTarget(paneTarget)
-        ? await isAuthorizedTeamPaneIdle(sessionName, paneTarget)
-        : await isPaneIdle(paneId);
+      const idle = await isPaneIdle(paneId);
 
       if (!idle) {
         // Pane is active — reset idle tracking
@@ -198,9 +164,7 @@ export class NudgeTracker {
       if (now - state.firstIdleAt < this.config.delayMs) continue;
 
       // Send the nudge
-      const ok = isAuthorizedTeamNudgeTarget(paneTarget)
-        ? await sendToWorkerByPaneId(sessionName, paneTarget, this.config.message)
-        : await sendToWorkerByPaneId(sessionName, null, this.config.message);
+      const ok = await sendToWorkerByPaneId(sessionName, paneId, this.config.message);
       if (ok) {
         state.nudgeCount++;
         state.lastNudgeAt = now;

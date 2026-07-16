@@ -96,12 +96,6 @@ async function writeWorkerIdentityFixture(stateRoot: string, cwd: string, teamNa
     worktree_path: cwd,
     team_state_root: stateRoot,
   });
-  await writeJson(join(stateRoot, 'team', teamName, 'config.json'), {
-    name: teamName,
-    tmux_pane_owner_id: `team:${teamName}`,
-    hud_pane_id: null,
-    workers: [{ name: workerName, pane_id: '%99', pid: 9999 }],
-  });
 }
 
 function escapeRegex(value: string): string {
@@ -751,7 +745,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     fi
     exit 0
   fi
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -896,7 +890,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     fi
     exit 0
   fi
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1042,7 +1036,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     fi
     exit 0
   fi
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1188,7 +1182,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     fi
     exit 0
   fi
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1330,7 +1324,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     fi
     exit 0
   fi
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1426,76 +1420,6 @@ exit 0
       const nudgeStatePath = join(workerStateRoot, 'auto-nudge-state.json');
       assert.ok(existsSync(nudgeStatePath), 'worker state root should receive auto-nudge state');
     });
-  });
-
-  it('does not capture or send in team-worker context without a persisted string owner token', async () => {
-    for (const owner of [undefined, 17] as const) {
-      await withTempWorkingDir(async (cwd) => {
-        const workerStateRoot = join(cwd, 'leader-state-root');
-        const codexHome = join(cwd, 'codex-home');
-        const fakeBinDir = join(cwd, 'fake-bin');
-        const tmuxLogPath = join(cwd, 'tmux.log');
-        await mkdir(workerStateRoot, { recursive: true });
-        await mkdir(codexHome, { recursive: true });
-        await mkdir(fakeBinDir, { recursive: true });
-        await writeWorkerIdentityFixture(workerStateRoot, cwd, 'auto-nudge', 'worker-1');
-        const configPath = join(workerStateRoot, 'team', 'auto-nudge', 'config.json');
-        const config = JSON.parse(await readFile(configPath, 'utf-8'));
-        if (owner === undefined) delete config.tmux_pane_owner_id;
-        else config.tmux_pane_owner_id = owner;
-        await writeJson(configPath, config);
-        await writeJson(join(codexHome, '.omx-config.json'), { autoNudge: { enabled: true, delaySec: 0, stallMs: 0 } });
-        await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
-        await chmod(join(fakeBinDir, 'tmux'), 0o755);
-
-        const result = runNotifyHook(cwd, fakeBinDir, codexHome, {
-          'last-assistant-message': 'I can continue with the worker follow-up from here.',
-        }, {
-          OMX_TEAM_WORKER: 'auto-nudge/worker-1',
-          OMX_TEAM_STATE_ROOT: workerStateRoot,
-        });
-        assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
-        const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
-        assert.doesNotMatch(tmuxLog, /capture-pane|send-keys/, 'missing or malformed persisted owner must not capture or send tmux input');
-      });
-    }
-  });
-
-  it('fails closed for Team-worker owner takeover, recycled panes, and HUD targets', async () => {
-    for (const scenario of ([
-      { name: 'owner takeover', env: { OMX_TEST_TMUX_OWNER: 'team:foreign' }, hudPaneId: null },
-      { name: 'recycled pane', env: { OMX_TEST_TMUX_PANE_PID: '10001' }, hudPaneId: null },
-      { name: 'HUD target', env: {}, hudPaneId: '%99' },
-    ] satisfies Array<{ name: string; env: Record<string, string>; hudPaneId: string | null }>)) {
-      await withTempWorkingDir(async (cwd) => {
-        const workerStateRoot = join(cwd, 'leader-state-root');
-        const codexHome = join(cwd, 'codex-home');
-        const fakeBinDir = join(cwd, 'fake-bin');
-        const tmuxLogPath = join(cwd, 'tmux.log');
-        await mkdir(workerStateRoot, { recursive: true });
-        await mkdir(codexHome, { recursive: true });
-        await mkdir(fakeBinDir, { recursive: true });
-        await writeWorkerIdentityFixture(workerStateRoot, cwd, 'auto-nudge', 'worker-1');
-        const configPath = join(workerStateRoot, 'team', 'auto-nudge', 'config.json');
-        const config = JSON.parse(await readFile(configPath, 'utf-8'));
-        config.hud_pane_id = scenario.hudPaneId;
-        await writeJson(configPath, config);
-        await writeJson(join(codexHome, '.omx-config.json'), { autoNudge: { enabled: true, delaySec: 0, stallMs: 0 } });
-        await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
-        await chmod(join(fakeBinDir, 'tmux'), 0o755);
-
-        const result = runNotifyHook(cwd, fakeBinDir, codexHome, {
-          'last-assistant-message': 'I can continue with the worker follow-up from here.',
-        }, {
-          OMX_TEAM_WORKER: 'auto-nudge/worker-1',
-          OMX_TEAM_STATE_ROOT: workerStateRoot,
-          ...(scenario.env as Record<string, string>),
-        });
-        assert.equal(result.status, 0, `${scenario.name}: hook failed: ${result.stderr || result.stdout}`);
-        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'), `${scenario.name} must not inject Team input`);
-      });
-    }
   });
 
   it('fails closed in team-worker context when the worker state root lacks a valid identity', async () => {
@@ -1632,12 +1556,8 @@ fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
-if [[ "$cmd" == "show-option" ]]; then
-  echo "team:auto-nudge"
-  exit 0
-fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 exit 0
@@ -1783,7 +1703,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 exit 0
@@ -1927,7 +1847,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     fi
     exit 0
   fi
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
+  echo "%1 12345"
   exit 0
 fi
 exit 0

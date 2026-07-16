@@ -329,7 +329,7 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
   const assertLeaderAuthority = async () => Boolean(await readLeaderPaneAuthority(teamName, authorityCwd, leaderAuthority));
   const tmuxTarget = leaderAuthority.paneId;
 
-  if (!tmuxTarget || !leaderPanePid || !leaderPaneOwnerId) {
+  if (!tmuxTarget) {
     if (!(await teamStateAllowsWorkerStopNudge(stateDir, teamName))) {
       await recordShutdownSuppressionOnce();
       return { ok: true, result: TEAM_SHUTDOWN_NO_INJECTION_REASON };
