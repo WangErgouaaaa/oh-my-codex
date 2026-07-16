@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { createHookPluginSdk, clearHookPluginState } from '../sdk.js';
 import type { HookEventEnvelope } from '../types.js';
+import { buildPlatformCommandSpec } from '../../../utils/platform-command.js';
 
 function makeEvent(event = 'session-start'): HookEventEnvelope {
   return {
@@ -25,6 +26,29 @@ async function writeOmxStateFile(cwd: string, fileName: string, value: unknown):
 }
 
 describe('createHookPluginSdk', () => {
+  it('preserves tmux arguments through native Windows executable, cmd, and PowerShell platform adapters', () => {
+    const args = ['if-shell', '-t', '%42', '-F', '#{pane_id}', "display-message -p 'literal payload'", ''];
+    const psmuxExe = 'C:\\Program Files\\psmux.exe';
+    const psmuxCmd = 'C:\\Program Files\\psmux.cmd';
+    const psmuxPs1 = 'C:\\Program Files\\psmux.ps1';
+    const exists = (path: string): boolean => [psmuxExe, psmuxCmd, psmuxPs1].includes(path);
+
+    assert.deepEqual(buildPlatformCommandSpec(psmuxExe, args, 'win32', {}, exists), {
+      command: psmuxExe,
+      args,
+      resolvedPath: psmuxExe,
+    });
+    const cmd = buildPlatformCommandSpec(psmuxCmd, args, 'win32', { ComSpec: 'C:\\Windows\\System32\\cmd.exe' }, exists);
+    assert.equal(cmd.command, 'C:\\Windows\\System32\\cmd.exe');
+    assert.deepEqual(cmd.args.slice(0, 3), ['/d', '/s', '/c']);
+    assert.match(cmd.args[3]!, /"C:\\Program Files\\psmux\.cmd" "if-shell" "-t" "%42"/);
+    const powershell = buildPlatformCommandSpec(psmuxPs1, args, 'win32', {}, exists);
+    assert.deepEqual(powershell, {
+      command: 'powershell.exe',
+      args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psmuxPs1, ...args],
+      resolvedPath: psmuxPs1,
+    });
+  });
   describe('state', () => {
     it('reads undefined for missing key', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
@@ -319,13 +343,103 @@ esac
         assert.equal(await readFile(payloadCapturePath, 'utf8'), `${text} [OMX_TMUX_INJECT]`);
         const commandLog = await readFile(commandLogPath, 'utf8');
         assert.match(commandLog, /load-buffer -b omx_payload_[a-f0-9]{32} \/.*\/payload/);
-        assert.match(commandLog, /if-shell .* paste-buffer -b omx_payload_[a-f0-9]{32} -t %42 -d -r -p ; display-message/);
+        assert.match(commandLog, /if-shell .*#{==:#{bracket_paste_flag},1}.* paste-buffer -b omx_payload_[a-f0-9]{32} -t %42 -d -r -p ; display-message/);
         assert.doesNotMatch(commandLog, /apostrophe|touch \/tmp\/pwned|split-window -h|send-keys -t %42 -l/);
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;
         delete process.env.OMX_TEST_PAYLOAD_CAPTURE;
         delete process.env.OMX_TEST_TMUX_COMMAND_LOG;
+        await rm(cwd, { recursive: true, force: true });
+        await rm(fakeBinDir, { recursive: true, force: true });
+      }
+    });
+    it('requires bracketed paste at the atomic literal payload sink', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
+      const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-sdk-bin-'));
+      const fakeTmuxPath = join(fakeBinDir, 'tmux');
+      const payloadCapturePath = join(fakeBinDir, 'payload.capture');
+      const commandLogPath = join(fakeBinDir, 'commands.log');
+      const pasteExecutionPath = join(fakeBinDir, 'paste.executions');
+      const previousPath = process.env.PATH;
+      const multiline = "run-shell 'looks executable'; split-window -h\\nUnicode 雪 🚀";
+      try {
+        await writeFile(fakeTmuxPath, `#!/usr/bin/env bash
+set -eu
+cmd="$1"
+shift || true
+case "$cmd" in
+  display-message) printf 'devsess\\n' ;;
+  list-panes)
+    if [[ "$*" == *"#{pane_active}"* ]]; then
+      printf "%%42\\t0\\t4242\\t1\\tcodex --model gpt-5\\n"
+    elif [[ "$*" == *"#{pane_dead}"* ]]; then
+      printf "%%42\\t0\\t4242\\n"
+    else
+      printf "%%42\\n"
+    fi
+    ;;
+  load-buffer) cp "$3" "$OMX_TEST_PAYLOAD_CAPTURE" ;;
+  if-shell)
+    printf '%s\\n' "$*" >> "$OMX_TEST_TMUX_COMMAND_LOG"
+    if [[ "$*" == *"paste-buffer"* ]]; then
+      [[ "$*" == *"#{==:#{bracket_paste_flag},1}"* ]] || exit 1
+      if [[ "\${OMX_TEST_BRACKET_MODE:-1}" == "1" && "\${OMX_TEST_PID_REUSE:-0}" != "1" ]]; then
+        printf '__OMX_PANE_MUTATION_OK__\\n'
+        printf 'paste\\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+      fi
+    else
+      printf '__OMX_PANE_MUTATION_OK__\\n'
+    fi
+    ;;
+  delete-buffer) ;;
+  *) exit 1 ;;
+esac
+`);
+        await import('node:fs/promises').then((fs) => fs.chmod(fakeTmuxPath, 0o755));
+        process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+        process.env.OMX_TEST_PAYLOAD_CAPTURE = payloadCapturePath;
+        process.env.OMX_TEST_TMUX_COMMAND_LOG = commandLogPath;
+        process.env.OMX_TEST_PASTE_EXECUTIONS = pasteExecutionPath;
+
+        const sdk = createHookPluginSdk({ cwd, pluginName: 'bracketed-paste', event: makeEvent(), sideEffectsEnabled: true });
+        const enabled = await sdk.tmux.sendKeys({ text: multiline, paneId: '%42', cooldownMs: 0, submit: false });
+        assert.equal(enabled.ok, true);
+        assert.equal(await readFile(payloadCapturePath, 'utf8'), `${multiline} [OMX_TMUX_INJECT]`);
+        assert.equal((await readFile(pasteExecutionPath, 'utf8')).trim(), 'paste');
+        const enabledCommands = await readFile(commandLogPath, 'utf8');
+        assert.match(enabledCommands, /#{==:#{bracket_paste_flag},1}/);
+        assert.doesNotMatch(enabledCommands, /send-keys -t %42 C-m/);
+
+        process.env.OMX_TEST_BRACKET_MODE = '0';
+        const disabled = await sdk.tmux.sendKeys({ text: 'bracket disabled', paneId: '%42', cooldownMs: 0, submit: false });
+        assert.equal(disabled.ok, false);
+        assert.equal((await readFile(pasteExecutionPath, 'utf8')).trim(), 'paste');
+
+        process.env.OMX_TEST_BRACKET_MODE = 'malformed';
+        const unavailable = await sdk.tmux.sendKeys({ text: 'bracket unavailable', paneId: '%42', cooldownMs: 0, submit: false });
+        assert.equal(unavailable.ok, false);
+        assert.equal((await readFile(pasteExecutionPath, 'utf8')).trim(), 'paste');
+
+        process.env.OMX_TEST_BRACKET_MODE = '1';
+        process.env.OMX_TEST_PID_REUSE = '1';
+        const recycled = await sdk.tmux.sendKeys({ text: 'reused pane', paneId: '%42', cooldownMs: 0, submit: false });
+        assert.equal(recycled.ok, false);
+        assert.equal((await readFile(pasteExecutionPath, 'utf8')).trim(), 'paste');
+        assert.match(await readFile(commandLogPath, 'utf8'), /#{==:#{pane_pid},4242}/);
+
+        delete process.env.OMX_TEST_PID_REUSE;
+        const singleLine = await sdk.tmux.sendKeys({ text: 'single line remains compatible', paneId: '%42', cooldownMs: 0 });
+        assert.equal(singleLine.ok, true);
+        assert.equal(await readFile(payloadCapturePath, 'utf8'), 'single line remains compatible [OMX_TMUX_INJECT]');
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        delete process.env.OMX_TEST_PAYLOAD_CAPTURE;
+        delete process.env.OMX_TEST_TMUX_COMMAND_LOG;
+        delete process.env.OMX_TEST_PASTE_EXECUTIONS;
+        delete process.env.OMX_TEST_BRACKET_MODE;
+        delete process.env.OMX_TEST_PID_REUSE;
         await rm(cwd, { recursive: true, force: true });
         await rm(fakeBinDir, { recursive: true, force: true });
       }

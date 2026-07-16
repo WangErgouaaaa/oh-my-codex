@@ -42,6 +42,7 @@ import { resolveOmxCliEntryPath } from '../utils/paths.js';
 
 const execFileAsync = promisify(execFile);
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../hud/constants.js';
+
 import { OMX_TMUX_HUD_OWNER_ENV } from '../hud/reconcile.js';
 import {
   findHudWatchPaneIds,
@@ -398,12 +399,20 @@ function readPaneIncarnation(paneId: string): { paneDead: boolean; panePid: stri
   const seen = new Set<string>();
   let incarnation: { paneDead: boolean; panePid: string } | null = null;
   for (const line of lines) {
-    const match = /^(%0|%[1-9][0-9]*) ([01]) ([1-9][0-9]*)$/.exec(line);
+    const match = /^(%0|%[1-9][0-9]*) ([01]) ([0-9]+)$/.exec(line);
     if (!match) return null;
     const observedPaneId = parseCanonicalTmuxPaneId(match[1]);
-    if (!observedPaneId || observedPaneId !== match[1] || seen.has(observedPaneId)) return null;
+    if (!observedPaneId || observedPaneId !== match[1]) return null;
+    // A remain-on-exit pane may legitimately report PID 0. Dead rows carry no
+    // live-incarnation authority, so they cannot poison an otherwise valid
+    // global snapshot or create a duplicate-live ambiguity.
+    if (match[2] === '1') {
+      if (observedPaneId === canonicalPaneId) incarnation = { paneDead: true, panePid: match[3]! };
+      continue;
+    }
+    if (!/^[1-9][0-9]*$/.test(match[3]!) || seen.has(observedPaneId)) return null;
     seen.add(observedPaneId);
-    if (observedPaneId === canonicalPaneId) incarnation = { paneDead: match[2] === '1', panePid: match[3]! };
+    if (observedPaneId === canonicalPaneId) incarnation = { paneDead: false, panePid: match[3]! };
   }
   return incarnation;
 }
@@ -437,29 +446,42 @@ function buildTeamPaneIncarnationCondition(paneId: string, panePid: string): str
   return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
 }
 
+function createMutationReceipt(): string {
+  return `__OMX_PANE_MUTATION_${randomUUID().replaceAll('-', '')}__`;
+}
+
+function isSafeTmuxFormatOperand(value: string): boolean {
+  return /^[A-Za-z0-9_:@$-]+$/.test(value);
+}
+
 /** Removes only the exact pane incarnation and requires a tmux-server receipt. */
+
 function removeTeamPaneIncarnation(pane: TeamPaneIncarnation): boolean {
   const paneId = parseCanonicalTmuxPaneId(pane.paneId);
   if (!paneId || paneId !== pane.paneId || !/^[1-9][0-9]*$/.test(pane.panePid)) return false;
+  const receipt = createMutationReceipt();
   const result = runTmux([
     'if-shell', '-t', paneId, '-F', buildTeamPaneIncarnationCondition(paneId, pane.panePid),
-    `kill-pane -t ${paneId} \\; display-message -p __OMX_PANE_MUTATION_OK__`,
+    `kill-pane -t ${paneId} \\; display-message -p ${receipt}`,
     '',
   ]);
-  return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+  return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
+
 /** Resizes only the exact live pane incarnation and requires a tmux-server receipt. */
 function resizeTeamPaneIncarnation(pane: TeamPaneIncarnation, heightLines: number): boolean {
   const paneId = parseCanonicalTmuxPaneId(pane.paneId);
   if (!paneId || paneId !== pane.paneId || !/^[1-9][0-9]*$/.test(pane.panePid)) return false;
   const height = Number.isFinite(heightLines) && heightLines > 0 ? Math.floor(heightLines) : HUD_TMUX_TEAM_HEIGHT_LINES;
+  const receipt = createMutationReceipt();
   const result = runTmux([
     'if-shell', '-t', paneId, '-F', buildTeamPaneIncarnationCondition(paneId, pane.panePid),
-    `resize-pane -t ${paneId} -y ${height} \\; display-message -p __OMX_PANE_MUTATION_OK__`,
+    `resize-pane -t ${paneId} -y ${height} \\; display-message -p ${receipt}`,
     '',
   ]);
-  return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+  return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
+
 
 function isPaneStablyLiveInStrictGlobalProbe(
   paneId: string,
@@ -551,12 +573,13 @@ function splitOutputMatchesPaneId(rawPaneOutput: string | null | undefined, pane
 type VerifiedSplitPane = {
   paneId: string;
   panePid: string;
-  ownerNonce: string;
-  ownerOption: string;
-  ownerProof: string;
+  sessionId: string;
+  adoptionOption: string;
+  adoptionReceipt: string;
   operationMarker: string;
   windowTarget: string;
 };
+
 
 function paneIdSetForTarget(target: string): Set<string> | null {
   const panes = listPanes(target);
@@ -564,18 +587,17 @@ function paneIdSetForTarget(target: string): Set<string> | null {
   return new Set(panes.map((pane) => pane.paneId));
 }
 
-function readTmuxOptionExactly(option: string): string | null {
-  const result = runTmux(['show-options', '-g', '-v', option]);
+function readTmuxPaneOptionExactly(paneId: string, option: string): string | null {
+  const result = runTmux(['show-options', '-qv', '-p', '-t', paneId, option]);
   return result.ok ? parseExactTmuxAuthorityScalar(result.stdout) : null;
 }
 
-
-
 /**
+
  * Creates a pane only after proving its split output, global membership, window
- * membership, liveness, and an operation-scoped nonce all agree. The nonce is
- * installed before the split so a post-split validation failure retains a
- * proof-bound rollback capability for the exact split operation.
+ * membership, liveness, and an operation-scoped marker agree. The adoption
+ * receipt is installed on the exact candidate pane before any destructive
+ * rollback authority is retained.
  */
 function splitAndAdoptPane(
   splitArgs: string[],
@@ -588,16 +610,12 @@ function splitAndAdoptPane(
   const preWindow = paneIdSetForTarget(windowTarget);
   if (!preGlobal || !preWindow || !preGlobal.has(sourcePane) || !preWindow.has(sourcePane)) return null;
 
-  const ownerNonce = `split:${randomUUID()}`;
-  const ownerOption = `@omx_split_owner_nonce_${randomUUID().replaceAll('-', '')}`;
+  const adoptionOption = `@omx_split_adoption_${randomUUID().replaceAll('-', '')}`;
+  const adoptionReceipt = createMutationReceipt();
   const operationMarker = randomUUID();
-  const provisionalProof = `pending:${ownerNonce}`;
-  if (
-    !runTmux(['set-option', '-g', ownerOption, provisionalProof]).ok
-    || readTmuxOptionExactly(ownerOption) !== provisionalProof
-  ) return null;
 
   const markedSplitArgs = [...splitArgs];
+
   const commandIndex = markedSplitArgs.length - 1;
   const command = markedSplitArgs[commandIndex];
   if (!command) return null;
@@ -611,32 +629,31 @@ function splitAndAdoptPane(
   // marker provides a bounded recovery path without granting authority to
   // split stdout.
   const candidate = readPostSplitCandidate(preGlobal, preWindow, windowTarget, operationMarker);
+  const sessionProbe = candidate
+    ? runTmux(['display-message', '-p', '-t', candidate, '#{session_id}'])
+    : null;
+  const sessionId = sessionProbe?.ok
+    ? parseExactTmuxAuthorityScalar(sessionProbe.stdout)
+    : null;
   const incarnation = candidate ? readPaneIncarnation(candidate) : null;
-  if (!candidate || !incarnation) return null;
+  if (!candidate || !sessionId || !incarnation) return null;
 
   const provisionalAuthority: VerifiedSplitPane = {
     paneId: candidate,
     panePid: incarnation.panePid,
-    ownerNonce,
-    ownerOption,
-    ownerProof: provisionalProof,
+    sessionId,
+    adoptionOption,
+    adoptionReceipt,
     operationMarker,
     windowTarget,
   };
-  if (!revalidateSplitPaneAuthority(provisionalAuthority)) {
-    rollbackSplitPaneAuthority(provisionalAuthority);
-    return null;
-  }
-  const boundProof = `${candidate}:${ownerNonce}`;
   if (
-    !runTmux(['set-option', '-g', ownerOption, boundProof]).ok
-    || readTmuxOptionExactly(ownerOption) !== boundProof
-  ) {
-    rollbackSplitPaneAuthority(provisionalAuthority);
-    return null;
-  }
-  const authority = { ...provisionalAuthority, ownerProof: boundProof };
+    !runTmux(['set-option', '-p', '-t', candidate, adoptionOption, adoptionReceipt]).ok
+    || readTmuxPaneOptionExactly(candidate, adoptionOption) !== adoptionReceipt
+  ) return null;
+  const authority = provisionalAuthority;
   if (!splitOutputMatchesPaneId(split.stdout, candidate)) {
+
     rollbackSplitPaneAuthority(authority);
     return null;
   }
@@ -660,7 +677,7 @@ function revalidateSplitPaneAuthority(authority: VerifiedSplitPane): boolean {
       && window.has(paneId)
       && findSplitOperationMarkerPaneId(authority.operationMarker) === paneId
       && isPaneLiveInStrictGlobalProbe(paneId, authority.panePid)
-      && readTmuxOptionExactly(authority.ownerOption) === authority.ownerProof,
+      && readTmuxPaneOptionExactly(paneId, authority.adoptionOption) === authority.adoptionReceipt,
   );
 }
 
@@ -681,13 +698,31 @@ function hasSplitPaneRollbackAuthority(authority: VerifiedSplitPane): boolean {
       && window.has(paneId)
       && findSplitOperationMarkerPaneId(authority.operationMarker) === paneId
       && readPaneIncarnation(paneId)?.panePid === authority.panePid
-      && readTmuxOptionExactly(authority.ownerOption) === authority.ownerProof,
+      && readTmuxPaneOptionExactly(paneId, authority.adoptionOption) === authority.adoptionReceipt,
   );
+}
+
+function buildSplitPaneRollbackCondition(authority: VerifiedSplitPane): string | null {
+  if (
+    !isSafeTmuxFormatOperand(authority.sessionId)
+    || !isSafeTmuxFormatOperand(authority.adoptionOption)
+    || !isSafeTmuxFormatOperand(authority.adoptionReceipt)
+  ) return null;
+  return `#{&&:${buildTeamPaneIncarnationCondition(authority.paneId, authority.panePid)},#{&&:#{==:#{session_id},${authority.sessionId}},#{==:#{${authority.adoptionOption}},${authority.adoptionReceipt}}}}`;
 }
 
 function rollbackSplitPaneAuthority(authority: VerifiedSplitPane): boolean {
   if (!hasSplitPaneRollbackAuthority(authority)) return false;
-  return runTmux(['kill-pane', '-t', authority.paneId]).ok;
+  const condition = buildSplitPaneRollbackCondition(authority);
+  if (!condition) return false;
+  const receipt = createMutationReceipt();
+  const result = runTmux([
+    'if-shell', '-F', '-t', authority.paneId,
+    condition,
+    `kill-pane -t ${authority.paneId} ; display-message -p ${receipt}`,
+    '',
+  ]);
+  return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
 
 function isHudWatchPane(pane: TmuxPaneInfo): boolean {
@@ -795,13 +830,18 @@ export function sleepFractionalSeconds(
 
 async function runTmuxAsync(args: string[]): Promise<{ok: true; stdout: string} | {ok: false; stderr: string}> {
   try {
-    const { stdout } = await execFileAsync('tmux', args, { encoding: 'utf-8' });
+    const spec = buildPlatformCommandSpec('tmux', args);
+    const { stdout } = await execFileAsync(spec.command, spec.args, {
+      encoding: 'utf-8',
+      ...(process.platform === 'win32' ? { windowsHide: true } : {}),
+    });
     return { ok: true, stdout: stdout || '' };
   } catch (error: unknown) {
     const err = error as { stderr?: string; message?: string };
     return { ok: false, stderr: (err.stderr || err.message || '').trim() || 'tmux command failed' };
   }
 }
+
 
 
 
@@ -851,15 +891,22 @@ async function isWorkerAliveAsync(sessionName: string, workerIndex: number, work
 
 function parsePaneLivenessBatch(output: string): Map<string, { dead: '0' | '1'; pid: number }> | null {
   const rows = new Map<string, { dead: '0' | '1'; pid: number }>();
+  const livePaneIds = new Set<string>();
   const lines = parseExactTmuxAuthorityLines(output);
   if (!lines) return null;
   for (const line of lines) {
     if (line === '') return null;
-    const match = /^(%0|%[1-9][0-9]*) ([01]) ([1-9][0-9]*)$/.exec(line);
+    const match = /^(%0|%[1-9][0-9]*) ([01]) ([0-9]+)$/.exec(line);
     if (!match) return null;
     const paneId = parseCanonicalTmuxPaneId(match[1]);
     const pid = Number(match[3]);
-    if (!paneId || paneId !== match[1] || rows.has(paneId) || !Number.isSafeInteger(pid)) return null;
+    if (!paneId || paneId !== match[1] || !Number.isSafeInteger(pid)) return null;
+    if (match[2] === '0') {
+      if (pid < 1 || livePaneIds.has(paneId)) return null;
+      livePaneIds.add(paneId);
+    }
+    // Dead remain-on-exit rows are structurally valid even with PID 0. They
+    // never provide live authority, but retain target liveness semantics.
     rows.set(paneId, { dead: match[2] as '0' | '1', pid });
   }
   return rows;
@@ -2305,7 +2352,7 @@ export function createTeamSession(
       if (i === 1) rightStackRootPaneId = paneId;
 
     }
-    if (!workerPaneIds.every((paneId) => revalidateSplitPaneAuthority(rollbackPaneAuthorities.get(paneId) ?? { paneId: '', panePid: '', ownerNonce: '', ownerOption: '', ownerProof: '', operationMarker: '', windowTarget: '' }))) {
+    if (!workerPaneIds.every((paneId) => revalidateSplitPaneAuthority(rollbackPaneAuthorities.get(paneId) ?? { paneId: '', panePid: '', sessionId: '', adoptionOption: '', adoptionReceipt: '', operationMarker: '', windowTarget: '' }))) {
       throw new Error('worker pane authority changed before team layout mutation');
     }
 
@@ -2498,7 +2545,7 @@ export function createTeamSession(
         || canonicalPaneId === rollbackLeaderPaneId
         || rollbackPreExistingPaneIds.has(canonicalPaneId)
         || !operationCreatedPaneIds.has(canonicalPaneId)
-        || !hasSplitPaneRollbackAuthority(rollbackPaneAuthorities.get(canonicalPaneId) ?? { paneId: '', panePid: '', ownerNonce: '', ownerOption: '', ownerProof: '', operationMarker: '', windowTarget: '' })
+        || !hasSplitPaneRollbackAuthority(rollbackPaneAuthorities.get(canonicalPaneId) ?? { paneId: '', panePid: '', sessionId: '', adoptionOption: '', adoptionReceipt: '', operationMarker: '', windowTarget: '' })
 
       ) {
         continue;
@@ -3416,20 +3463,14 @@ export async function killWorker(sessionName: string, workerIndex: number, worke
     await sleep(1000);
   }
 
-  if (await isWorkerAliveAsync(sessionName, workerIndex, canonicalWorkerPaneId ?? undefined)) {
-    await runTmuxAsync(['kill-pane', '-t', target]);
-  }
+  // This legacy API cannot carry exact pane authority, so it must never escalate
+  // its advisory interrupt sequence into a destructive pane kill.
 }
 
-// leaderPaneId: when provided, the kill is skipped if workerPaneId matches it.
-export function killWorkerByPaneId(workerPaneId: string, leaderPaneId?: string): void {
-  const canonicalWorkerPaneId = parseCanonicalTmuxPaneId(workerPaneId);
-  if (!canonicalWorkerPaneId) return;
-  const canonicalLeaderPaneId = leaderPaneId ? parseCanonicalTmuxPaneId(leaderPaneId) : null;
-  if (leaderPaneId && !canonicalLeaderPaneId) return;
-  if (canonicalLeaderPaneId && canonicalWorkerPaneId === canonicalLeaderPaneId) return;
-  runTmux(['kill-pane', '-t', canonicalWorkerPaneId]);
+/** Legacy direct kill wrapper deliberately fails closed without structured authority. */
+export function killWorkerByPaneId(_workerPaneId: string, _leaderPaneId?: string): void {
 }
+
 
 export function paneHasOmxInstanceTag(paneId: string | null | undefined, instanceId: string | null | undefined): boolean {
   const normalizedPaneId = normalizePaneTarget(paneId);
@@ -3486,14 +3527,10 @@ export function readPaneTeamOwnerTagResult(paneId: string | null | undefined): P
   return { status: 'error', error: stderr || `tmux show-option exited ${result.status ?? 'unknown'}` };
 }
 
-export async function killWorkerByPaneIdAsync(workerPaneId: string, leaderPaneId?: string): Promise<void> {
-  const canonicalWorkerPaneId = parseCanonicalTmuxPaneId(workerPaneId);
-  if (!canonicalWorkerPaneId) return;
-  const canonicalLeaderPaneId = leaderPaneId ? parseCanonicalTmuxPaneId(leaderPaneId) : null;
-  if (leaderPaneId && !canonicalLeaderPaneId) return;
-  if (canonicalLeaderPaneId && canonicalWorkerPaneId === canonicalLeaderPaneId) return;
-  await runTmuxAsync(['kill-pane', '-t', canonicalWorkerPaneId]);
+/** Legacy direct kill wrapper deliberately fails closed without structured authority. */
+export async function killWorkerByPaneIdAsync(_workerPaneId: string, _leaderPaneId?: string): Promise<void> {
 }
+
 
 export interface PaneTeardownSummary {
   attemptedPaneIds: string[];
@@ -3957,15 +3994,35 @@ export async function teardownWorkerPanes(
   };
 
   for (const paneId of killablePaneIds) {
-    if (options.authority) {
-      const sourceAuthorityValid = await options.authority.revalidate?.(paneId) ?? true;
-      if (!sourceAuthorityValid || !hasFreshPaneTeardownAuthority(paneId, options.authority)) {
-        summary.kill.failed += 1;
-        break;
-      }
+    if (!options.authority) {
+      summary.kill.failed += 1;
+      break;
     }
-    const result = await runTmuxAsync(['kill-pane', '-t', paneId]);
-    if (result.ok) summary.kill.succeeded += 1;
+    const sourceAuthorityValid = await options.authority.revalidate?.(paneId) ?? true;
+    if (!sourceAuthorityValid || !hasFreshPaneTeardownAuthority(paneId, options.authority)) {
+      summary.kill.failed += 1;
+      break;
+    }
+    const expectedPanePid = String(options.authority.expectedPanePids?.get(paneId) ?? '');
+    const expectedOwnerId = options.authority.expectedOwnerId;
+    const sessionName = options.authority.sessionName;
+    if (
+      !/^[1-9][0-9]*$/.test(expectedPanePid)
+      || !isSafeTmuxFormatOperand(expectedOwnerId)
+      || !isSafeTmuxFormatOperand(sessionName)
+    ) {
+      summary.kill.failed += 1;
+      break;
+    }
+    const receipt = createMutationReceipt();
+    const condition = `#{&&:${buildTeamPaneIncarnationCondition(paneId, expectedPanePid)},#{&&:#{==:#{session_name},${sessionName}},#{==:#{${OMX_TEAM_PANE_OWNER_OPTION}},${expectedOwnerId}}}}`;
+    const result = await runTmuxAsync([
+      'if-shell', '-F', '-t', paneId,
+      condition,
+      `kill-pane -t ${paneId} ; display-message -p ${receipt}`,
+      '',
+    ]);
+    if (result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt) summary.kill.succeeded += 1;
     else {
       summary.kill.failed += 1;
       break;

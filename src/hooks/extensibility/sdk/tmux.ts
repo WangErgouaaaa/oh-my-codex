@@ -3,11 +3,10 @@ import { createHash, randomUUID } from 'crypto';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { spawnSync } from 'child_process';
 import { sleepSync } from '../../../utils/sleep.js';
 import { resolveCodexPane } from '../../../scripts/tmux-hook-engine.js';
 import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityLines } from '../../../hud/tmux.js';
-import { resolveTmuxBinaryForPlatform } from '../../../utils/platform-command.js';
+import { spawnPlatformCommandSync } from '../../../utils/platform-command.js';
 import type {
   HookEventEnvelope,
   HookPluginSdk,
@@ -58,9 +57,7 @@ function sleepFractionalSeconds(seconds: number): void {
 }
 
 function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; stderr: string } {
-  const result = spawnSync(resolveTmuxBinaryForPlatform() || 'tmux', args, { encoding: 'utf-8',
-      windowsHide: true,
-    });
+  const { result } = spawnPlatformCommandSync('tmux', args, { encoding: 'utf-8' });
   if (result.error) return { ok: false, stderr: result.error.message };
   if (result.status !== 0) {
     return { ok: false, stderr: (result.stderr || '').trim() || `tmux exited ${result.status}` };
@@ -102,16 +99,17 @@ function tmuxCommandToken(value: string): string | null {
   return /^[A-Za-z0-9_.:%-]+$/.test(value) ? value : null;
 }
 
-function paneAuthorityFormat(target: TmuxTarget): string | null {
+function paneAuthorityFormat(target: TmuxTarget, requireBracketPaste = false): string | null {
   if (parseCanonicalTmuxPaneId(target.paneId) !== target.paneId) return null;
   const sessionName = target.sessionSnapshot?.sessionName;
   if (sessionName && /[,#{}\r\n]/.test(sessionName)) return null;
   const sessionCondition = sessionName ? `#{==:#{session_name},${sessionName}}` : '1';
-  return `#{&&:#{==:#{pane_id},${target.paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${target.pid}},#{&&:${sessionCondition},#{m:*codex*,#{pane_start_command}}}}}}`;
+  const bracketPasteCondition = requireBracketPaste ? '#{==:#{bracket_paste_flag},1}' : '1';
+  return `#{&&:#{==:#{pane_id},${target.paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${target.pid}},#{&&:${sessionCondition},#{&&:#{m:*codex*,#{pane_start_command}},${bracketPasteCondition}}}}}}`;
 }
 
-function runPaneMutationAtomically(target: TmuxTarget, command: string[]): boolean {
-  const condition = paneAuthorityFormat(target);
+function runPaneMutationAtomically(target: TmuxTarget, command: string[], requireBracketPaste = false): boolean {
+  const condition = paneAuthorityFormat(target, requireBracketPaste);
   const commandTokens = command.map(tmuxCommandToken);
   if (!condition || commandTokens.some((token) => token === null)) return false;
   const thenCommand = `${commandTokens.join(' ')} ; display-message -p __OMX_PANE_MUTATION_OK__`;
@@ -133,7 +131,7 @@ function pasteLiteralPanePayloadAtomically(target: TmuxTarget, payload: string):
     writeFileSync(payloadPath, payload, { encoding: 'utf8', flag: 'wx' });
     const loaded = runTmux(['load-buffer', '-b', bufferName, payloadPath]);
     if (!loaded.ok) return false;
-    return runPaneMutationAtomically(target, ['paste-buffer', '-b', bufferName, '-t', target.paneId, '-d', '-r', '-p']);
+    return runPaneMutationAtomically(target, ['paste-buffer', '-b', bufferName, '-t', target.paneId, '-d', '-r', '-p'], true);
   } catch {
     return false;
   } finally {

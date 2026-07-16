@@ -1672,6 +1672,15 @@ case "$1" in
     esac
     exit 0
     ;;
+  if-shell)
+    success="\${6:-}"
+    receipt="\${success##*display-message -p }"
+    receipt="\${receipt%% *}"
+    case "$receipt" in
+      __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+    esac
+    exit 0
+    ;;
   kill-pane)
     # Shared-session runtime coverage should validate pane-targeted teardown
     # only. Detached leader-wrapper signal behavior is covered separately in

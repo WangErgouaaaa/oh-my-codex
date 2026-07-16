@@ -326,7 +326,7 @@ function tmuxAuthorityListPanesCase(
     '    ;;',
   '  if-shell)',
     `    if [ "${options.recyclePidAtLivenessProbe === undefined ? '0' : '1'}" = 1 ] && [ -f "$0.liveness-probe-count" ]; then IFS= read -r liveness_probe_count < "$0.liveness-probe-count"; if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe ?? 0} ]; then case "\${5:-}" in *1000000031*) printf '%s\\n' '__omx_send_authority_rejected__'; exit 0 ;; esac; fi; fi`,
-    `    case "\${6:-}" in ${options.atomicSendFailure === true ? '*send-keys*) exit 1 ;; ' : ''}*capture-pane*) printf '%s\\n' '›' ;; esac`,
+    `    success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; case "$success" in ${options.atomicSendFailure === true ? '*send-keys*) exit 1 ;; ' : ''}*capture-pane*) printf '%s\\n' '›' ;; *display-message\\ -p\\ __OMX_PANE_MUTATION_[a-f0-9]*__*) printf '%s\\n' "$receipt" ;; esac`,
     '    ;;',
   ];
 }
@@ -2857,6 +2857,7 @@ describe('scaleDown worktree AGENTS cleanup', () => {
           '    ;;',
           '  kill-pane) exit 0 ;;',
           "  show-option) printf 'team:scale-down-worktree\\n' ;;",
+          "  if-shell) success=\"\${6:-}\"; receipt=\"\${success##*display-message -p }\"; receipt=\"\${receipt%% *}\"; case \"$receipt\" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\\n' \"$receipt\" ;; esac ;;",
           'esac',
           '',
         ].join('\n'),
@@ -3098,6 +3099,7 @@ case "\${1:-}" in
     esac
     ;;
   show-option) printf 'team:exclusions\n' ;;
+  if-shell) success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; case "$receipt" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;; esac ;;
 esac
 `,
       );
