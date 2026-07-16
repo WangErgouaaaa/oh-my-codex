@@ -326,7 +326,7 @@ case "$cmd" in
     fi
     ;;
   load-buffer) cp "$3" "$OMX_TEST_PAYLOAD_CAPTURE" ;;
-  if [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]]; then printf '%s\n' "\${BASH_REMATCH[1]}"; fi ;;
+  if-shell) if [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]]; then printf '%s\n' "\${BASH_REMATCH[1]}"; fi ;;
   delete-buffer) ;;
   *) exit 1 ;;
 esac
@@ -362,7 +362,7 @@ esac
       const commandLogPath = join(fakeBinDir, 'commands.log');
       const pasteExecutionPath = join(fakeBinDir, 'paste.executions');
       const previousPath = process.env.PATH;
-      const multiline = "run-shell 'looks executable'; split-window -h\\nUnicode 雪 🚀";
+      const multiline = "run-shell 'looks executable'; split-window -h\nUnicode 雪 🚀";
       try {
         await writeFile(fakeTmuxPath, `#!/usr/bin/env bash
 set -eu

@@ -200,12 +200,6 @@ function readGlobalTmuxPaneIdSnapshot(): Set<string> | null {
   return paneIds;
 }
 
-function readScaleSessionId(paneId: string): string | null {
-  const result = spawnSync('tmux', ['display-message', '-p', '-t', paneId, '#{session_id}'], { encoding: 'utf-8' });
-  if (result.status !== 0 || result.error) return null;
-  const sessionId = parseExactTmuxAuthorityScalar(result.stdout || '');
-  return sessionId && /^\$[0-9]+$/.test(sessionId) ? sessionId : null;
-}
 
 type TeamPaneOwnerSnapshot = Map<string, string>;
 
@@ -288,7 +282,6 @@ type VerifiedScaleSplitPane = {
   panePid: string;
   sessionId: string;
   sessionName: string;
-  sessionId: string;
   ownerId: string;
   ownerOption: string;
   ownerProof: string;
@@ -390,17 +383,20 @@ function hasScaleSplitRollbackAuthority(authority: VerifiedScaleSplitPane): bool
   const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
   const sessionPaneOwners = readTeamPaneOwnerSnapshot(authority.sessionName);
   const incarnation = paneId ? readScalePaneIncarnation(paneId) : null;
-  return Boolean(
+  const markerPaneId = findScaleSplitOperationMarkerPaneId(authority.operationMarker);
+  const optionProof = readTmuxOptionExactly(authority.ownerOption);
+  const valid = Boolean(
     paneId
       && paneId === authority.paneId
-      && findScaleSplitOperationMarkerPaneId(authority.operationMarker) === paneId
+      && markerPaneId === paneId
       && globalPaneIds?.has(paneId)
       && sessionPaneOwners?.has(paneId)
       && isConsistentTeamPaneSnapshot(globalPaneIds, sessionPaneOwners)
       && incarnation?.panePid === authority.panePid
       && incarnation.sessionId === authority.sessionId
-      && readTmuxOptionExactly(authority.ownerOption) === authority.ownerProof,
+      && optionProof === authority.ownerProof,
   );
+  return valid;
 }
 
 function revalidateScaleSplitAuthority(authority: VerifiedScaleSplitPane): boolean {
@@ -1078,7 +1074,7 @@ export async function scaleUp(
         });
       }
       provisionalAuthority.ownerProof = boundProof;
-      if (parseFreshTmuxPaneId(result.stdout) !== paneId) {
+      if (result.stdout !== `${paneId}\n`) {
         return await rollbackScaleUp(`Failed to validate tmux split output for ${workerName}`, {
           paneId,
           workerName,
@@ -1501,6 +1497,7 @@ export async function scaleDown(
 
     // Phase 3: Kill tmux panes and remove from config
     const expectedTargetPanePids = new Map<string, number>();
+    const expectedTargetPaneSessionIds = new Map<string, string>();
     const targetPaneIds: string[] = [];
     for (const worker of targetWorkers) {
       const paneId = persistedPaneIds.workerPaneIds.get(worker);
@@ -1513,8 +1510,13 @@ export async function scaleDown(
       if (typeof panePid !== 'number' || !Number.isSafeInteger(panePid) || panePid <= 0) {
         return { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' };
       }
+      const incarnation = readScalePaneIncarnation(canonicalPaneId);
+      if (!incarnation || incarnation.panePid !== String(panePid)) {
+        return { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' };
+      }
       targetPaneIds.push(canonicalPaneId);
       expectedTargetPanePids.set(canonicalPaneId, panePid);
+      expectedTargetPaneSessionIds.set(canonicalPaneId, incarnation.sessionId);
     }
     if (new Set(targetPaneIds).size !== targetPaneIds.length) {
       return { ok: false, error: 'duplicate_target_tmux_pane_ids' };
@@ -1535,6 +1537,7 @@ export async function scaleDown(
         sessionName,
         expectedOwnerId: `team:${config.name}`,
         expectedPanePids: expectedTargetPanePids,
+        expectedPaneSessionIds: expectedTargetPaneSessionIds,
         revalidate: (paneId) => isFreshOwnedTeamPane(paneId, sessionName, `team:${config.name}`),
       },
     });

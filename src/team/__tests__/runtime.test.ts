@@ -677,12 +677,12 @@ if (args[0] === 'if-shell' && args[1] === '-F') {
   if (result.stderr) process.stderr.write(result.stderr);
   process.exit(result.status ?? 1);
 }
-if (args[0] === 'set-option' && args[1] === '-g' && args[2]?.startsWith('@omx_split_owner_nonce_')) {
+if (args[0] === 'set-option' && args[1] === '-g' && /^@omx_(?:split_(?:owner_nonce|rollback)|hud_adopt_owner_nonce)_/.test(args[2] || '')) {
   appendFileSync(log, args.join(' ') + '\\n');
   appendFileSync(optionState, [args[2], args[3]].join('\\t') + '\\n');
   process.exit(0);
 }
-if (args[0] === 'show-options' && args[1] === '-g' && args[2] === '-v' && args[3]?.startsWith('@omx_split_owner_nonce_')) {
+if (args[0] === 'show-options' && args[1] === '-g' && args[2] === '-v' && /^@omx_(?:split_(?:owner_nonce|rollback)|hud_adopt_owner_nonce)_/.test(args[3] || '')) {
   appendFileSync(log, args.join(' ') + '\\n');
   if (!existsSync(optionState)) process.exit(1);
   const match = readFileSync(optionState, 'utf8').split('\\n').filter(Boolean).reverse()
@@ -712,6 +712,14 @@ if ((args[0] === 'show-option' || args[0] === 'show-options') && args[1] === '-q
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   process.exit(result.status ?? 1);
+}
+if (args[0] === 'display-message' && args[1] === '-p' && args[2] === '-t' && canonicalPaneId.test(args[3] || '') && args[4] === '#{session_id}') {
+  appendFileSync(log, args.join(' ') + '\\n');
+  const direct = spawnSync(real, args, { encoding: 'utf8', env: process.env });
+  const framed = String(direct.stdout || '');
+  if (direct.status === 0 && /^\\$[0-9]+\\n$/.test(framed)) process.stdout.write(framed);
+  else process.stdout.write('$1\\n');
+  process.exit(0);
 }
 if (isIdOnly) {
   appendFileSync(log, args.join(' ') + '\\n');

@@ -56,16 +56,21 @@ describe('HUD pane identity boundaries', () => {
     }
   });
 
-  it('fails closed when no immutable split authority accompanies a destructive pane sink', () => {
+  it('uses exact incarnation-bound retained destructive pane sinks', () => {
     const calls: string[][] = [];
     const execTmuxSync = (args: string[]) => {
       calls.push(args);
-      return '__omx_hud_mutation_anything\n';
+      return '__omx_hud_mutation_wrong\n';
     };
 
     assert.equal(killTmuxPaneIfCurrent('%9', '909', execTmuxSync), false);
     assert.equal(resizeTmuxPaneIfCurrent('%9', '909', 3, execTmuxSync), false);
-    assert.deepEqual(calls, []);
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      assert.equal(call[0], 'if-shell');
+      assert.match(call[4]!, /#\{==:#\{pane_id\},%9\}/);
+      assert.match(call[4]!, /#\{==:#\{pane_pid\},909\}/);
+    }
   });
 
   it('rejects whitespace, blank rows, and duplicate rows without partially accepting snapshots', () => {
@@ -125,12 +130,12 @@ describe('HUD pane identity boundaries', () => {
     const options = new Map<string, string>();
     const calls: string[][] = [];
     let split = false;
-    let markerProbeCount = 0;
     let splitStartCommand = '';
     const execTmuxSync = (args: string[]) => {
       calls.push(args);
       const format = args.at(-1);
       if (args[0] === 'set-option') {
+        if (args[1] === '-p') throw new Error('owner adoption failed');
         options.set(args[2]!, args[3]!);
         return '';
       }
@@ -138,14 +143,14 @@ describe('HUD pane identity boundaries', () => {
       if (args[0] === 'split-window') {
         split = true;
         splitStartCommand = args.at(-1)!;
-        return '%2\n';
+        return '%2\nextra\n';
       }
       if (args[0] === 'list-panes' && format === '#{pane_id}') return split ? '%1\n%2\n' : '%1\n';
+      if (args[0] === 'list-panes' && format === '#{pane_id} #{pane_dead} #{pane_pid}') return '%1 0 101\n%2 0 202\n';
+      if (args[0] === 'display-message' && args.at(-1) === '#{session_id}') return '$1\n';
+      if (args[0] === 'if-shell') return '__omx_hud_rollback_rejected__\n';
       if (args[0] === 'list-panes' && format === '#{pane_id}\t#{pane_start_command}') {
-        markerProbeCount += 1;
-        return markerProbeCount === 1
-          ? `%1\tcodex\n%2\t${splitStartCommand}\n`
-          : '%1\tcodex\n%2\tforeign-command\n';
+        return `%1\tcodex\n%2\t${splitStartCommand}\n`;
       }
       throw new Error(`unexpected tmux argv: ${args.join(' ')}`);
     };
@@ -153,7 +158,7 @@ describe('HUD pane identity boundaries', () => {
     assert.equal(createHudWatchPane('/repo', 'node omx.js hud --watch', { targetPaneId: '%1' }, execTmuxSync), null);
     const rollback = calls.find((args) => args[0] === 'if-shell');
     assert.ok(rollback);
-    assert.match(rollback![3]!, /#{m:\*.*\*,#\{pane_start_command\}}/);
+    assert.match(rollback![4]!, /#{m:\*.*\*,#\{pane_start_command\}}/);
     assert.equal(calls.some((args) => args[0] === 'kill-pane'), false);
   });
 

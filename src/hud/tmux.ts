@@ -1285,15 +1285,15 @@ function readHudPaneIncarnation(paneId: string, execTmuxSync: TmuxExecSync): { p
   try {
     const lines = parseExactTmuxAuthorityLines(execTmuxSync(['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}']));
     if (!lines) return null;
-    const seenLive = new Set<string>();
+    const seenPaneIds = new Set<string>();
     let incarnation: { paneDead: boolean; panePid: string } | null = null;
     for (const line of lines) {
       const match = /^(%\S+) ([01]) ([0-9]+)$/.exec(line);
       const observedPaneId = match ? parseCanonicalTmuxPaneId(match[1]) : null;
-      if (!match || !observedPaneId || observedPaneId !== match[1]) return null;
+      if (!match || !observedPaneId || observedPaneId !== match[1] || seenPaneIds.has(observedPaneId)) return null;
+      seenPaneIds.add(observedPaneId);
       if (match[2] === '1') continue;
-      if (!/^[1-9][0-9]*$/.test(match[3]) || seenLive.has(observedPaneId)) return null;
-      seenLive.add(observedPaneId);
+      if (!/^[1-9][0-9]*$/.test(match[3])) return null;
       if (observedPaneId === paneId) incarnation = { paneDead: false, panePid: match[3]! };
     }
     return incarnation;
@@ -1449,14 +1449,27 @@ export function mutateHudWatchPaneIfCurrent(
   }
 }
 
-/** Executes a pane mutation only while a retained immutable HUD authority proves the exact target. */
+/** Executes a retained pane mutation only while the exact target incarnation remains live. */
 function mutateTmuxPaneIfCurrent(
   paneId: string,
   expectedPanePid: string,
   mutation: string,
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): boolean {
-  return mutateHudWatchPaneIfCurrent(paneId, expectedPanePid, mutation, execTmuxSync);
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId || !/^[1-9][0-9]*$/.test(expectedPanePid)) return false;
+  const marker = `__omx_hud_mutation_${randomUUID()}`;
+  try {
+    const output = execTmuxSync([
+      'if-shell', '-F', '-t', canonicalPaneId,
+      buildHudHookIncarnationCondition(canonicalPaneId, expectedPanePid),
+      `${mutation} \\; display-message -p ${marker}`,
+      `display-message -p __omx_hud_mutation_failed_${marker}`,
+    ]);
+    return parseExactTmuxAuthorityScalar(output) === marker;
+  } catch {
+    return false;
+  }
 }
 
 /** Kills a pane only while its exact live incarnation remains the target. */

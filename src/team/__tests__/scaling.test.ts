@@ -239,7 +239,7 @@ async function writeSuccessfulScaleUpTmuxStub(
       '  set-option)',
       '    case "${2:-}" in',
       '      -g) printf "%s" "${4:-}" > "$0.option-${3:-}" ;;',
-      '      -p) if [ "${3:-}" = "-t" ] && [ "${5:-}" = "@omx_team_pane_owner_id" ]; then printf "%s" "${6:-}" > "$0.pane-owner-${4:-}"; : > "$0.owner-tagged"; fi ;;',
+      '      -p) if [ "${3:-}" = "-t" ] && [ "${5:-}" = "@omx_team_pane_owner_id" ]; then printf "%s\n" "${6:-}" > "$0.pane-owner-${4:-}"; : > "$0.owner-tagged"; fi ;;',
       '    esac',
       '    ;;',
       '  show-options)',
@@ -307,7 +307,7 @@ function tmuxAuthorityListPanesCase(
   return [
     '  set-option)',
     '    if [ "${2:-}" = "-g" ] && [ -n "${3:-}" ]; then printf "%s" "${4:-}" > "$0.global-option-${3:-}"; fi',
-    '    if [ "${2:-}" = "-p" ] && [ "${3:-}" = "-t" ] && [ "${5:-}" = "@omx_team_pane_owner_id" ]; then printf "%s" "${6:-}" > "$0.pane-owner-${4:-}"; : > "$0.owner-tagged"; fi',
+    '    if [ "${2:-}" = "-p" ] && [ "${3:-}" = "-t" ] && [ "${5:-}" = "@omx_team_pane_owner_id" ]; then printf "%s\n" "${6:-}" > "$0.pane-owner-${4:-}"; : > "$0.owner-tagged"; fi',
     '    ;;',
     '  show-options)',
     '    if [ "${2:-}" = "-g" ] && [ "${3:-}" = "-v" ]; then cat "$0.global-option-${4:-}"; printf "\\n"; else exit 1; fi',
@@ -315,7 +315,7 @@ function tmuxAuthorityListPanesCase(
     '    ;;',
     '  list-panes)',
     '    case "${2:-}" in',
-    `      -a) case "\${4:-}" in '#{pane_id}\t#{pane_start_command}') if [ "${options.recycleOperationMarker === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf '%s\tbash\n' '%31'; elif [ -f "$0.created-pane-commands" ]; then printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\tbash\n' "$pane"; done; while IFS="$(printf '\t')" read -r pane command; do printf '%s\t%s\n' "$pane" "$command"; done < "$0.created-pane-commands"; fi ;; '#{pane_id} #{pane_dead} #{pane_pid}') if [ "${options.malformedLivenessBatch === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf "${staticLivenessFormat}%s 1 0\n" '${paneIds[0]}'; else ${createdLiveness} printf "${staticLivenessFormat}"; if [ -f "$0.created-pane-pids" ]; then while IFS="$(printf '\t')" read -r pane pid; do if [ "${deadAfterInitialLive ? '$probe_count' : '0'}" -ge 5 ]; then printf '%s 1 %s\n' "$pane" "$pid"; else ${options.recyclePidAtLivenessProbe ? `if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe} ]; then pid=$((pid + 1)); fi;` : ''} printf '%s 0 %s\n' "$pane" "$pid"; fi; done < "$0.created-pane-pids"; fi; fi ;; '#{pane_id} #{pane_dead}') printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s 0\n' "$pane"; done; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do printf '%s 0\n' "$pane"; done < "$0.created-panes"; fi ;; *) if [ "${options.malformedFirstPostSplitSnapshot === true ? '1' : '0'}" = 1 ] && [ -f "$0.created-panes" ] && [ ! -f "$0.malformed-post-snapshot" ]; then : > "$0.malformed-post-snapshot"; printf 'malformed\n'; else printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; fi ;; esac ;;`,
+    `      -a) case "\${4:-}" in '#{pane_id}\t#{pane_start_command}') if [ "${options.recycleOperationMarker === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf '%s\tbash\n' '%31'; elif [ -f "$0.created-pane-commands" ]; then printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\tbash\n' "$pane"; done; while IFS="$(printf '\t')" read -r pane command; do printf '%s\t%s\n' "$pane" "$command"; done < "$0.created-pane-commands"; fi ;; '#{pane_id} #{pane_dead} #{pane_pid}') if [ "${options.malformedLivenessBatch === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf "${staticLivenessFormat}%s 1 0\n" '${paneIds[0]}'; else ${createdLiveness} printf "${staticLivenessFormat}"; if [ -f "$0.created-pane-pids" ]; then while IFS="$(printf '\t')" read -r pane pid; do if [ "${deadAfterInitialLive ? '$probe_count' : '0'}" -ge 18 ]; then printf '%s 1 %s\n' "$pane" "$pid"; else ${options.recyclePidAtLivenessProbe ? `if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe} ]; then pid=$((pid + 1)); fi;` : ''} printf '%s 0 %s\n' "$pane" "$pid"; fi; done < "$0.created-pane-pids"; fi; fi ;; '#{pane_id} #{pane_dead}') printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s 0\n' "$pane"; done; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do printf '%s 0\n' "$pane"; done < "$0.created-panes"; fi ;; *) if [ "${options.malformedFirstPostSplitSnapshot === true ? '1' : '0'}" = 1 ] && [ -f "$0.created-panes" ] && [ ! -f "$0.malformed-post-snapshot" ]; then : > "$0.malformed-post-snapshot"; printf 'malformed\n'; else printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; fi ;; esac ;;`,
 
     '      -t)',
     '        session="${3:-}"',
@@ -336,7 +336,7 @@ function tmuxAuthorityListPanesCase(
 }
 
 function tmuxCreatedPaneMarkerLine(paneId: string): string {
-  const panePid = `1000000${paneId.slice(1)}`;
+  const panePid = `10000000${paneId.slice(1)}`;
   return `    split_command=""; for arg do split_command="$arg"; done
     printf '%s\\n' '${paneId}' >> "$0.created-panes"
     printf '%s\\t%s\\n' '${paneId}' '${panePid}' >> "$0.created-pane-pids"
@@ -833,7 +833,7 @@ esac
       ];
       for (const [index, testCase] of cases.entries()) {
         const globalPaneFormat = testCase.globalPaneIds
-          .map((paneId) => `${paneId.replace('%', '%%')}\\n`)
+          .map((paneId) => `${paneId.replace('%', '%%')} 0 42424\\n`)
           .join('');
         const sessionCommands = testCase.sessionRows.map(([paneId, owner]) => {
           const formatPaneId = paneId.replace('%', '%%');
@@ -919,7 +919,7 @@ esac
         cwd,
         { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
       );
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, true, JSON.stringify(result));
       const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-scale-up-owned-panes ')));
       assert.ok(commands.some((command) => command.startsWith('split-window -v -t %21 ')));
@@ -965,7 +965,9 @@ esac
             '    echo "tmux 3.2a"',
             '    ;;',
             '  split-window)',
-            `    printf '%s\\n' ${testCase.output.map((paneId) => `'${paneId}'`).join(' ')}`,
+            testCase.output.length === 2
+              ? `    { printf '%s\\n' '${testCase.output[0]}'; printf '%s\\n' '${testCase.output[1]}'; } | tee "$0.split-output"`
+              : `    printf '%s\\n' '${testCase.output[0]}' | tee "$0.split-output"`,
             tmuxCreatedPaneMarkerLine('%31'),
 
             '    ;;',
@@ -996,6 +998,9 @@ esac
           cwd,
           { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
         );
+        if (testCase.name === 'multiline output') {
+          assert.equal(await readFile(`${tmuxStubPath}.split-output`, 'utf-8'), '%31\n%32\n');
+        }
         assert.equal(result.ok, false, testCase.name);
         const config = await readTeamConfig(teamName, cwd);
         assert.equal(config?.workers.length, 1, testCase.name);
@@ -1010,6 +1015,7 @@ esac
           commands.some((command) => command !== '-V'
             && command !== 'list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'
             && command !== 'list-panes -a -F #{pane_id}\t#{pane_start_command}'
+            && command !== 'display-message -p -t %31 #{session_id}'
             && !command.startsWith('list-panes -t omx-team-')
             && !command.startsWith('set-option -g @omx_scale_split_owner_nonce_')
             && !command.startsWith('show-options -g -v @omx_scale_split_owner_nonce_')
@@ -1454,7 +1460,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     const previousPath = process.env.PATH;
 
     try {
-      for (const receiptMode of ['exact', 'missing-lf', 'crlf', 'extra-line', 'recycled-at-transaction'] as const) {
+      for (const [receiptIndex, receiptMode] of (['exact', 'missing-lf', 'crlf', 'extra-line', 'recycled-at-transaction'] as const).entries()) {
         await Promise.all([
           rm(`${tmuxStubPath}.created-panes`, { force: true }),
           rm(`${tmuxStubPath}.created-pane-pids`, { force: true }),
@@ -1481,7 +1487,6 @@ printf '%s\\n' "$@" > '${capturePath}'
             '    ;;',
             '  show-options) cat "$0.option-${4:-}"; printf "\\n" ;;',
             "  display-message) case \"$*\" in *'#{session_id}') printf '$1\\n' ;; esac ;;",
-            ...tmuxAuthorityListPanesCase(['%11', '%21']),
             '  if-shell)',
             '    success="${6:-}"; receipt="${success##*display-message -p }"; receipt="${receipt%% *}"',
             '    case "$success" in',
@@ -1496,6 +1501,8 @@ printf '%s\\n' "$@" > '${capturePath}'
                     ? '        printf "%s\\nextra\\n" "$receipt" ;;'
                     : '        printf "%s\\n" "__omx_scale_split_rollback_rejected_${receipt}" ;;',
             '    esac',
+            '    ;;',
+            ...tmuxAuthorityListPanesCase(['%11', '%21']),
             `  kill-pane) : > "${unrelatedKillPath}" ;;`,
             'esac',
             'exit 0',
@@ -1507,7 +1514,7 @@ printf '%s\\n' "$@" > '${capturePath}'
         await rm(unrelatedKillPath, { force: true });
         process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
-        const teamName = `scale-up-atomic-rollback-${receiptMode}`;
+        const teamName = `scale-rb-${receiptIndex}`;
         await initTeamState(teamName, 'task', 'executor', 1, cwd);
         await configureScaleUpTeamForDirectDispatch(teamName, cwd);
         const result = await scaleUp(
@@ -1519,11 +1526,11 @@ printf '%s\\n' "$@" > '${capturePath}'
           { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
         );
 
-        assert.equal(result.ok, false, receiptMode);
+        assert.equal(result.ok, false, `${receiptMode}: ${JSON.stringify(result)}`);
         assert.equal(existsSync(unrelatedKillPath), false, receiptMode);
         const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
         const rollback = commands.find((command) => command.startsWith('if-shell -F -t %31 '));
-        assert.ok(rollback, receiptMode);
+        assert.ok(rollback, `${receiptMode}: ${JSON.stringify(result)}\n${commands.join('\n')}`);
         assert.match(rollback, /#\{==:#\{pane_id\},%31\}/, receiptMode);
         assert.match(rollback, /#\{==:#\{pane_pid\},1000000031\}/, receiptMode);
         assert.match(rollback, /#\{==:#\{session_id\},\$1\}/, receiptMode);
@@ -1658,7 +1665,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     const cases = [
       { phase: 'readiness', recyclePidAtLivenessProbe: 11, readyCapture: true, skipReadyWait: false, expectDispatch: false },
       { phase: 'dispatch', recyclePidAtLivenessProbe: 11, readyCapture: false, skipReadyWait: true, expectDispatch: false },
-      { phase: 'pre-save', recyclePidAtLivenessProbe: 22, readyCapture: false, skipReadyWait: true, expectDispatch: true },
+      { phase: 'pre-save', recyclePidAtLivenessProbe: 60, readyCapture: false, skipReadyWait: true, expectDispatch: true },
     ] as const;
 
     for (const testCase of cases) {
@@ -1689,7 +1696,7 @@ printf '%s\\n' "$@" > '${capturePath}'
         assert.equal(config?.workers.length, 1, testCase.phase);
         const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
         assert.equal(commands.some((command) => command.startsWith('kill-pane -t %31')), false, commands.join('\n'));
-        assert.equal(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{==:#{pane_id},%31}') && command.includes('#{==:#{pane_dead},0}') && command.includes('#{==:#{pane_pid},1000000031}') && command.includes('#{==:#{session_id},$1}') && command.includes('send-keys -t %31') && command.includes('display-message -p "__omx_send_authority_rejected__"')), testCase.expectDispatch, commands.join('\n'));
+        assert.equal(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{==:#{pane_id},%31}') && command.includes('#{==:#{pane_dead},0}') && command.includes('#{==:#{pane_pid},1000000031}') && command.includes('send-keys -t %31') && command.includes('display-message -p "__omx_send_authority_rejected__"')), testCase.expectDispatch, commands.join('\n'));
         assert.ok(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{m:*') && command.includes('kill-pane -t %31 \\; display-message -p __OMX_PANE_MUTATION_')), commands.join('\n'));
         assert.equal(
           existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'workers', 'worker-2', 'identity.json')),
@@ -2962,6 +2969,7 @@ describe('scaleDown worktree AGENTS cleanup', () => {
           "      -t) case \"\${5:-}\" in '#{pane_id}') printf '%%11\\n%%21\\n%%22\\n' ;; '#{pane_id} #{pane_dead} #{pane_pid}') printf '%%11 0 42421\\n%%21 0 42422\\n%%22 0 42423\\n' ;; '#{pane_id}\\t#{pane_current_command}\\t#{pane_start_command}') printf '%%11\\tbash\\tbash\\n%%21\\tbash\\tbash\\n%%22\\tbash\\tbash\\n' ;; '#{pane_dead} #{pane_pid}') printf '0 42423\\n' ;; *) printf '%%11\\tteam:scale-down-worktree\\n%%21\\tteam:scale-down-worktree\\n%%22\\tteam:scale-down-worktree\\n' ;; esac ;;",
           '    esac',
           '    ;;',
+          "  display-message) printf '$1\\n' ;;",
           '  kill-pane) exit 0 ;;',
           "  show-option) printf 'team:scale-down-worktree\\n' ;;",
           "  if-shell) success=\"\${6:-}\"; receipt=\"\${success##*display-message -p }\"; receipt=\"\${receipt%% *}\"; case \"$receipt\" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\\n' \"$receipt\" ;; esac ;;",
@@ -3111,7 +3119,7 @@ esac
       ];
       for (const [index, testCase] of cases.entries()) {
         const globalPaneFormat = testCase.globalPaneIds
-          .map((paneId) => `${paneId.replace('%', '%%')}\\n`)
+          .map((paneId) => `${paneId.replace('%', '%%')} 0 42424\\n`)
           .join('');
         const sessionCommands = testCase.sessionRows.map(([paneId, owner]) => {
           const formatPaneId = paneId.replace('%', '%%');
@@ -3205,6 +3213,7 @@ case "\${1:-}" in
       esac ;;
     esac
     ;;
+  display-message) printf '$1\n' ;;
   show-option) printf 'team:exclusions\n' ;;
   if-shell) success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; case "$receipt" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;; esac ;;
 esac

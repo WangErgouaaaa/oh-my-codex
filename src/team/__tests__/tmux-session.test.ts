@@ -6345,7 +6345,7 @@ esac
               assert.equal(rollbackTransactions.length, 1, 'the stale candidate is considered only by the final guarded rollback transaction');
               assert.match(tmuxLog, new RegExp(`if-shell -F -t ${escapedCandidatePaneId} #\\{&&:#\\{==:#\\{pane_id\\},${escapedCandidatePaneId}\\}`));
               const markerProbeCount = await readFile(join(dirname(logPath), 'marker-probe-count'), 'utf-8');
-              assert.equal(Number(markerProbeCount), 4, 'candidate recovery reaches PID rejection before final authority and rollback probes');
+              assert.equal(Number(markerProbeCount), 3, 'candidate recovery reaches PID rejection before final authority and rollback probes');
             }
 
             assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
@@ -7819,9 +7819,9 @@ describe('atomic teardown authority contract', () => {
     const source = await readFile(new URL('../tmux-session.js', import.meta.url), 'utf-8');
     const teardown = source.split('export async function teardownWorkerPanes')[1] ?? '';
     assert.match(teardown, /expectedPaneSessionIds/);
-    assert.match(teardown, /#\{==:#\{session_id\},\$\{expectedSessionId\}\}/);
+    assert.match(teardown, /sessionIdCondition = expectedSessionId/);
     assert.match(teardown, /ownershipProof === 'owner-tag'/);
-    assert.match(teardown, /#\{==:#\{@omx_team_pane_owner_id\},\}/);
+    assert.match(teardown, /OMX_TEAM_PANE_OWNER_OPTION\}\},\}/);
   });
 
   it('binds split rollback to its random global proof, exact incarnation, and operation marker at the sink', async () => {

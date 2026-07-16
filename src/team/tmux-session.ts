@@ -3992,10 +3992,8 @@ function hasFreshPaneTeardownAuthority(
     !canonicalPaneId
     || canonicalPaneId !== paneId
     || !/^[1-9][0-9]*$/.test(normalizedPid)
-    || !expectedSessionId
-    || !isSafeTmuxFormatOperand(expectedSessionId)
+    || (expectedSessionId !== undefined && (!isSafeTmuxFormatOperand(expectedSessionId) || readTmuxPaneSessionId(paneId) !== expectedSessionId))
     || !isTeamPaneIncarnationLive(paneId, normalizedPid)
-    || readTmuxPaneSessionId(paneId) !== expectedSessionId
   ) return null;
   const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
   const sessionPanes = listPanes(authority.sessionName);
@@ -4041,12 +4039,12 @@ export async function teardownWorkerPanes(
       break;
     }
     const expectedPanePid = String(options.authority.expectedPanePids?.get(paneId) ?? '');
-    const expectedSessionId = options.authority.expectedPaneSessionIds?.get(paneId) ?? '';
+    const expectedSessionId = options.authority.expectedPaneSessionIds?.get(paneId);
     const expectedOwnerId = options.authority.expectedOwnerId;
     const sessionName = options.authority.sessionName;
     if (
       !/^[1-9][0-9]*$/.test(expectedPanePid)
-      || !isSafeTmuxFormatOperand(expectedSessionId)
+      || (expectedSessionId !== undefined && !isSafeTmuxFormatOperand(expectedSessionId))
       || !isSafeTmuxFormatOperand(expectedOwnerId)
       || !isSafeTmuxFormatOperand(sessionName)
       || !ownershipProof
@@ -4058,7 +4056,8 @@ export async function teardownWorkerPanes(
     const ownerCondition = ownershipProof === 'owner-tag'
       ? `#{==:#{${OMX_TEAM_PANE_OWNER_OPTION}},${expectedOwnerId}}`
       : `#{==:#{${OMX_TEAM_PANE_OWNER_OPTION}},}`;
-    const condition = `#{&&:${buildTeamPaneIncarnationCondition(paneId, expectedPanePid)},#{&&:#{==:#{session_name},${sessionName}},#{&&:#{==:#{session_id},${expectedSessionId}},${ownerCondition}}}}`;
+    const sessionIdCondition = expectedSessionId ? `#{==:#{session_id},${expectedSessionId}}` : '1';
+    const condition = `#{&&:${buildTeamPaneIncarnationCondition(paneId, expectedPanePid)},#{&&:#{==:#{session_name},${sessionName}},#{&&:${sessionIdCondition},${ownerCondition}}}}`;
     const result = await runTmuxAsync([
       'if-shell', '-F', '-t', paneId,
       condition,
