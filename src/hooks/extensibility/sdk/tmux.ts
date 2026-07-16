@@ -1,7 +1,8 @@
-import { existsSync } from 'fs';
-import { createHash } from 'crypto';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { createHash, randomUUID } from 'crypto';
 import { mkdir, readFile, writeFile } from 'fs/promises';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
+import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { sleepSync } from '../../../utils/sleep.js';
 import { resolveCodexPane } from '../../../scripts/tmux-hook-engine.js';
@@ -97,8 +98,8 @@ interface TmuxTarget {
   sessionSnapshot?: SessionPaneSnapshot;
 }
 
-function tmuxCommandQuote(value: string): string {
-  return `'${value.replace(/'/g, "\\'")}'`;
+function tmuxCommandToken(value: string): string | null {
+  return /^[A-Za-z0-9_.:%-]+$/.test(value) ? value : null;
 }
 
 function paneAuthorityFormat(target: TmuxTarget): string | null {
@@ -111,8 +112,9 @@ function paneAuthorityFormat(target: TmuxTarget): string | null {
 
 function runPaneMutationAtomically(target: TmuxTarget, command: string[]): boolean {
   const condition = paneAuthorityFormat(target);
-  if (!condition) return false;
-  const thenCommand = `${command.map(tmuxCommandQuote).join(' ')} ; display-message -p __OMX_PANE_MUTATION_OK__`;
+  const commandTokens = command.map(tmuxCommandToken);
+  if (!condition || commandTokens.some((token) => token === null)) return false;
+  const thenCommand = `${commandTokens.join(' ')} ; display-message -p __OMX_PANE_MUTATION_OK__`;
   const result = runTmux(['if-shell', '-t', target.paneId, '-F', condition, thenCommand, '']);
   return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
 }
@@ -122,6 +124,22 @@ function confirmPaneAuthorityAtomically(target: TmuxTarget): boolean {
   if (!condition) return false;
   const result = runTmux(['if-shell', '-t', target.paneId, '-F', condition, 'display-message -p __OMX_PANE_MUTATION_OK__', '']);
   return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+}
+function pasteLiteralPanePayloadAtomically(target: TmuxTarget, payload: string): boolean {
+  const tempDir = mkdtempSync(join(tmpdir(), 'omx-tmux-payload-'));
+  const payloadPath = join(tempDir, 'payload');
+  const bufferName = `omx_payload_${randomUUID().replace(/-/g, '')}`;
+  try {
+    writeFileSync(payloadPath, payload, { encoding: 'utf8', flag: 'wx' });
+    const loaded = runTmux(['load-buffer', '-b', bufferName, payloadPath]);
+    if (!loaded.ok) return false;
+    return runPaneMutationAtomically(target, ['paste-buffer', '-b', bufferName, '-t', target.paneId, '-d']);
+  } catch {
+    return false;
+  } finally {
+    runTmux(['delete-buffer', '-b', bufferName]);
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 function isStrictPanePid(value: string): boolean {
@@ -354,7 +372,7 @@ async function sendTmuxKeys(
   if (!targetIsAuthoritative()) return missingAuthoritativeTarget();
 
   const markedText = `${text} ${INJECTION_MARKER}`;
-  if (!runPaneMutationAtomically(target, ['send-keys', '-t', target.paneId, '-l', markedText])) return missingAuthoritativeTarget();
+  if (!pasteLiteralPanePayloadAtomically(target, markedText)) return missingAuthoritativeTarget();
 
 
 

@@ -668,7 +668,7 @@ if [[ "$1" == "display-message" && "$*" == *'#{session_id}'* ]]; then
 fi
 if [[ "$1" == "list-panes" ]]; then
   if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
-    printf '%s\n' '%1 0 101' '%2 0 202' '%3 0 303'
+    printf '%s\n' '%1 0 101' '%2 0 202' '%3 0 303' '%99 1 0'
     exit 0
   fi
   if [[ "$*" == *'#{pane_id} #{pane_dead}'* ]]; then
@@ -722,6 +722,7 @@ exit 0
         /list-panes -t %1 -F #\{pane_id\}\x1f#\{pane_current_command\}(?:\x1f#\{[^}]+\})*\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}/,
       );
       assert.match(tmuxLog, /kill-pane -t %3/);
+      assert.match(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\} #\{pane_pid\}/);
       assert.match(tmuxLog, /resize-pane -t %2 -y \d+/);
       assert.doesNotMatch(tmuxLog, /split-window/);
       assert.ok(logs.some((line) => line.includes('Removed duplicate HUD panes and reused existing HUD pane')));
@@ -743,11 +744,12 @@ exit 0
     await writeFile(tmuxPath, `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
 if [[ "$1" == "list-panes" ]]; then
-  if [[ "$*" == *'#{pane_id} #{pane_dead}'* ]]; then printf '%1 0\n%2 1\n%3 1\n'; exit 0; fi
-  if [[ "$*" == *'-F #{pane_id}' ]]; then printf '%1\n%2\n%3\n'; exit 0; fi
-  printf '%1\tzsh\tzsh\n'
-  printf "%2\tnode\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch\n"
-  printf "%3\tnode\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch\n"
+  if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then printf '%%1 0 101\n%%2 1 0\n%%3 1 0\n'; exit 0; fi
+  if [[ "$*" == *'#{pane_id} #{pane_dead}'* ]]; then printf '%%1 0\n%%2 0\n%%3 0\n'; exit 0; fi
+  if [[ "$*" == *'-F #{pane_id}' ]]; then printf '%%1\n%%2\n%%3\n'; exit 0; fi
+  printf '%%1\tzsh\tzsh\n'
+  printf "%%2\tnode\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%%1' /node /omx.js hud --watch\n"
+  printf "%%3\tnode\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%%1' /node /omx.js hud --watch\n"
   exit 0
 fi
 exit 0
@@ -762,6 +764,7 @@ exit 0
       await hudCommand(['--tmux']);
       const tmuxLog = await readFile(logPath, 'utf8');
       assert.doesNotMatch(tmuxLog, /(?:kill-pane|resize-pane|set-hook)/);
+      assert.match(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\} #\{pane_pid\}/);
       assert.doesNotMatch(tmuxLog, /split-window/);
     } finally {
       for (const [key, value] of Object.entries(previousEnv)) {

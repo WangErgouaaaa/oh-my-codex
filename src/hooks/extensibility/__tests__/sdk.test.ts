@@ -245,6 +245,9 @@ if [[ "$cmd" == "if-shell" ]]; then
   exit 0
 fi
 
+if [[ "$cmd" == "load-buffer" || "$cmd" == "delete-buffer" ]]; then
+  exit 0
+fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
@@ -269,6 +272,60 @@ exit 1
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;
+        await rm(cwd, { recursive: true, force: true });
+        await rm(fakeBinDir, { recursive: true, force: true });
+      }
+    });
+    it('transports hostile literal payloads without tmux command reparsing', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
+      const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-sdk-bin-'));
+      const fakeTmuxPath = join(fakeBinDir, 'tmux');
+      const payloadCapturePath = join(fakeBinDir, 'payload.capture');
+      const commandLogPath = join(fakeBinDir, 'commands.log');
+      const previousPath = process.env.PATH;
+      const text = "apostrophe ' backslash \\\\ semicolon ; brackets [x] {y}\nUnicode 雪 🚀\nrun-shell 'touch /tmp/pwned'; split-window -h";
+      try {
+        await writeFile(fakeTmuxPath, `#!/usr/bin/env bash
+set -eu
+cmd="$1"
+shift || true
+printf '%s\\n' "$cmd $*" >> "$OMX_TEST_TMUX_COMMAND_LOG"
+case "$cmd" in
+  display-message) printf 'devsess\\n' ;;
+  list-panes)
+    if [[ "$*" == *"#{pane_active}"* ]]; then
+      printf "%%42\\t0\\t4242\\t1\\tcodex --model gpt-5\\n"
+    elif [[ "$*" == *"#{pane_dead}"* ]]; then
+      printf "%%42\\t0\\t4242\\n"
+    else
+      printf "%%42\\n"
+    fi
+    ;;
+  load-buffer) cp "$3" "$OMX_TEST_PAYLOAD_CAPTURE" ;;
+  if-shell) printf '__OMX_PANE_MUTATION_OK__\\n' ;;
+  delete-buffer) ;;
+  *) exit 1 ;;
+esac
+`);
+        await import('node:fs/promises').then((fs) => fs.chmod(fakeTmuxPath, 0o755));
+        process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+        process.env.OMX_TEST_PAYLOAD_CAPTURE = payloadCapturePath;
+        process.env.OMX_TEST_TMUX_COMMAND_LOG = commandLogPath;
+
+        const sdk = createHookPluginSdk({ cwd, pluginName: 'literal-payload', event: makeEvent(), sideEffectsEnabled: true });
+        const result = await sdk.tmux.sendKeys({ text, paneId: '%42', cooldownMs: 0, submit: false });
+
+        assert.equal(result.ok, true);
+        assert.equal(await readFile(payloadCapturePath, 'utf8'), `${text} [OMX_TMUX_INJECT]`);
+        const commandLog = await readFile(commandLogPath, 'utf8');
+        assert.match(commandLog, /load-buffer -b omx_payload_[a-f0-9]{32} \/.*\/payload/);
+        assert.match(commandLog, /if-shell .* paste-buffer -b omx_payload_[a-f0-9]{32} -t %42 -d ; display-message/);
+        assert.doesNotMatch(commandLog, /apostrophe|touch \/tmp\/pwned|split-window -h|send-keys -t %42 -l/);
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        delete process.env.OMX_TEST_PAYLOAD_CAPTURE;
+        delete process.env.OMX_TEST_TMUX_COMMAND_LOG;
         await rm(cwd, { recursive: true, force: true });
         await rm(fakeBinDir, { recursive: true, force: true });
       }
@@ -342,6 +399,9 @@ if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "$*" >> "$OMX_TEST_TMUX_LOG"
   if [[ "\${OMX_TEST_PID_RECYCLE:-}" == "1" ]]; then exit 0; fi
   printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+if [[ "$cmd" == "load-buffer" || "$cmd" == "delete-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
