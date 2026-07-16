@@ -573,7 +573,7 @@ function splitOutputMatchesPaneId(rawPaneOutput: string | null | undefined, pane
 type VerifiedSplitPane = {
   paneId: string;
   panePid: string;
-  sessionId: string;
+  sessionId?: string;
   adoptionOption: string;
   adoptionReceipt: string;
   operationMarker: string;
@@ -636,12 +636,12 @@ function splitAndAdoptPane(
     ? parseExactTmuxAuthorityScalar(sessionProbe.stdout)
     : null;
   const incarnation = candidate ? readPaneIncarnation(candidate) : null;
-  if (!candidate || !sessionId || !incarnation) return null;
+  if (!candidate || !incarnation) return null;
 
   const provisionalAuthority: VerifiedSplitPane = {
     paneId: candidate,
     panePid: incarnation.panePid,
-    sessionId,
+    ...(sessionId ? { sessionId } : {}),
     adoptionOption,
     adoptionReceipt,
     operationMarker,
@@ -704,11 +704,14 @@ function hasSplitPaneRollbackAuthority(authority: VerifiedSplitPane): boolean {
 
 function buildSplitPaneRollbackCondition(authority: VerifiedSplitPane): string | null {
   if (
-    !isSafeTmuxFormatOperand(authority.sessionId)
+    (authority.sessionId !== undefined && !isSafeTmuxFormatOperand(authority.sessionId))
     || !isSafeTmuxFormatOperand(authority.adoptionOption)
     || !isSafeTmuxFormatOperand(authority.adoptionReceipt)
   ) return null;
-  return `#{&&:${buildTeamPaneIncarnationCondition(authority.paneId, authority.panePid)},#{&&:#{==:#{session_id},${authority.sessionId}},#{==:#{${authority.adoptionOption}},${authority.adoptionReceipt}}}}`;
+  const sessionCondition = authority.sessionId
+    ? `#{==:#{session_id},${authority.sessionId}}`
+    : '1';
+  return `#{&&:${buildTeamPaneIncarnationCondition(authority.paneId, authority.panePid)},#{&&:${sessionCondition},#{==:#{${authority.adoptionOption}},${authority.adoptionReceipt}}}}`;
 }
 
 function rollbackSplitPaneAuthority(authority: VerifiedSplitPane): boolean {

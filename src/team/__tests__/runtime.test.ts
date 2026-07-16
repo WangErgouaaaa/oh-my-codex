@@ -699,7 +699,7 @@ if (args[0] === 'set-option' && args[1] === '-p' && args[2] === '-t' && canonica
   if (result.status === 0) appendFileSync(paneOptionState, [args[3], args[4], args[5] ?? ''].join('\\t') + '\\n');
   process.exit(result.status ?? 1);
 }
-if (args[0] === 'show-option' && args[1] === '-qv' && args[2] === '-p' && args[3] === '-t' && canonicalPaneId.test(args[4] || '') && args[5]) {
+if ((args[0] === 'show-option' || args[0] === 'show-options') && args[1] === '-qv' && args[2] === '-p' && args[3] === '-t' && canonicalPaneId.test(args[4] || '') && args[5]) {
   appendFileSync(log, args.join(' ') + '\\n');
   const persisted = existsSync(paneOptionState)
     ? readFileSync(paneOptionState, 'utf8').split('\\n').filter(Boolean).reverse().map((row) => row.split('\\t')).find(([paneId, option]) => paneId === args[4] && option === args[5])

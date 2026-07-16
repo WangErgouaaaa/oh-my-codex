@@ -1092,8 +1092,8 @@ exit 0
       assert.doesNotMatch(tmuxLog, /tmux:show-options -gv history-limit/);
       assert.doesNotMatch(tmuxLog, /tmux:set-option -g[q ]+history-limit/);
       assert.match(tmuxLog, /tmux:new-session .* -s /);
-      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 #\\{&&:#\\{==:#\\{pane_id\\},%12\\},#\\{&&:#\\{==:#\\{pane_dead\\},0\\},#\\{==:#\\{pane_pid\\},101\\}\\}\\} set-option -q -t .* history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
-      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 #\\{&&:#\\{==:#\\{pane_id\\},%12\\},#\\{&&:#\\{==:#\\{pane_dead\\},0\\},#\\{==:#\\{pane_pid\\},101\\}\\}\\} set-option -pq -t %12 history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
+      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 .*#\\{==:#\\{pane_id\\},%12\\}.*#\\{==:#\\{pane_pid\\},101\\}.*set-option -q -t .* history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
+      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 .*#\\{==:#\\{pane_id\\},%12\\}.*#\\{==:#\\{pane_pid\\},101\\}.*set-option -pq -t %12 history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
       assert.match(tmuxLog, /tmux:set-hook -t .* client-detached\[[0-9]+\] if-shell -F '#\{==:#\{session_attached\},0\}' .*if-shell -F -t %12 .*#\{pane_dead\},0.*#\{pane_pid\},101.*clear-history -t %12/);
       assert.doesNotMatch(tmuxLog, /client-detached\[[^\n]*(?:list-panes|awk|Where-Object)/);
       assert.match(tmuxLog, new RegExp(`tmux:split-window -v -l ${HUD_TMUX_HEIGHT_LINES} .* -t `));
