@@ -217,6 +217,11 @@ if [ "$command" = "if-shell" ]; then
   eval "set -- $inner_command"
   "$fixture" "$@"
   status=$?
+  if [ "$status" -eq 0 ]; then
+    case "$inner_command" in
+      *"display-message -p __OMX_PANE_MUTATION_OK__"*) printf '__OMX_PANE_MUTATION_OK__\n' ;;
+    esac
+  fi
   truncate -s "$log_size" "$(dirname "$0")/tmux.log"
   exit "$status"
 fi
@@ -499,6 +504,17 @@ describe('HUD resize hook command builders', () => {
       args[4],
       `run-shell -b 'tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true'`,
     );
+  });
+
+  it('passes hook registration separators as direct tmux semicolon tokens', () => {
+    const resizeArgs = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1');
+    const attachedArgs = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
+    for (const args of [resizeArgs, attachedArgs]) {
+      assert.ok(args.includes(';'));
+      assert.equal(args.includes('\\;'), false);
+      const separatorIndex = args.indexOf(';');
+      assert.equal(args[separatorIndex + 1], 'set-option');
+    }
   });
 
   it('uses one tmux-server conditional transaction for exact leader and HUD incarnations', () => {
@@ -4701,7 +4717,14 @@ esac
         (logPath) => `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${logPath}"
+case "$*" in
+  *if-shell*)
+    printf '__OMX_PANE_MUTATION_OK__\n'
+    exit 0
+    ;;
+esac
 case "\${1:-}" in
+
   -V)
     echo "tmux 3.4"
     exit 0
@@ -4719,6 +4742,10 @@ case "\${1:-}" in
     ;;
   list-panes)
     case "$*" in
+      *'#{pane_id} #{pane_dead} #{pane_pid}'*)
+        printf "%%1 0 101\n%%7 0 107\n%%2 0 102\n%%8 0 108\n"
+        ;;
+
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
         printf "%%7\\tnode\\t'codex neighbor'\\n"
@@ -4742,7 +4769,15 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
-  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys|kill-pane)
+  kill-pane)
+    case "$*" in
+      *"display-message -p __OMX_PANE_MUTATION_OK__"*)
+        printf '__OMX_PANE_MUTATION_OK__\n'
+        ;;
+    esac
+    exit 0
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys)
     exit 0
     ;;
   *)
@@ -4766,7 +4801,7 @@ esac
           assert.equal(session.hudPaneId, '%4');
 
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
+          assert.match(tmuxLog, /if-shell -t %2 -F #\{&&:#\{==:#\{pane_id\},%2\},#\{&&:#\{==:#\{pane_dead\},0\},#\{==:#\{pane_pid\},102\}\}\} kill-pane -t %2 \\; display-message -p __OMX_PANE_MUTATION_OK__/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %8/);
           assert.match(tmuxLog, /split-window -v -f -l 3 -t shared:0 -d -P -F #\{pane_id\}/);
         },
@@ -5450,6 +5485,10 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  if-shell)
+    printf '__OMX_PANE_MUTATION_OK__\n'
+    exit 0
+    ;;
   resize-pane|select-layout|set-window-option|select-pane|kill-pane|set-hook|run-shell)
     exit 0
     ;;
@@ -5588,6 +5627,10 @@ case "\${1:-}" in
         echo "%3"
         ;;
     esac
+    exit 0
+    ;;
+  if-shell)
+    printf '__OMX_PANE_MUTATION_OK__\n'
     exit 0
     ;;
   resize-pane|select-layout|set-window-option|select-pane|kill-pane|set-hook|run-shell)
@@ -6360,6 +6403,10 @@ case "\${1:-}" in
   split-window)
     : > "$hud_state"
     echo "%44"
+    exit 0
+    ;;
+  if-shell)
+    printf '__OMX_PANE_MUTATION_OK__\n'
     exit 0
     ;;
   resize-pane|select-pane|set-hook|run-shell)

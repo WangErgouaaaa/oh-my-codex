@@ -23,12 +23,13 @@ import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 import {
   createHudWatchPane,
   buildHudRuntimeEnv,
-  killTmuxPane,
+  killTmuxPaneIfCurrent,
   findHudWatchPaneIds,
   listCurrentWindowPanes,
   OMX_TMUX_HUD_LEADER_PANE_ENV,
   readActiveTmuxPaneId,
   registerHudResizeHook,
+  resizeTmuxPaneIfCurrent,
   resizeTmuxPane,
   parseCanonicalTmuxPaneId,
   verifyHudWatchPaneAuthority,
@@ -536,14 +537,16 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
     let removedDuplicateCount = 0;
     for (const paneId of duplicatePaneIds) {
       if (!hasFreshHudPaneAuthority(paneId, panePids?.get(paneId) ?? '', leaderPaneId, leaderPanePid, owner)) continue;
-      killTmuxPane(paneId);
-      removedDuplicateCount += 1;
+      if (killTmuxPaneIfCurrent(paneId, panePids?.get(paneId) ?? '')) removedDuplicateCount += 1;
     }
     const config = await readHudConfig(cwd);
     const ctx = await readAllState(cwd, config);
     const desiredHeight = getHudRenderMaxLines(ctx);
-    if (hasFreshHudPaneAuthority(keeperPaneId, panePids?.get(keeperPaneId) ?? '', leaderPaneId, leaderPanePid, owner)) {
-      resizeTmuxPane(keeperPaneId, desiredHeight);
+    if (!hasFreshHudPaneAuthority(keeperPaneId, panePids?.get(keeperPaneId) ?? '', leaderPaneId, leaderPanePid, owner)
+      || !resizeTmuxPaneIfCurrent(keeperPaneId, panePids?.get(keeperPaneId) ?? '', desiredHeight)) {
+      console.error('Failed to resize the exact current tmux HUD pane.');
+      process.exitCode = 1;
+      return;
     }
     if (hasFreshHudPaneAuthority(keeperPaneId, panePids?.get(keeperPaneId) ?? '', leaderPaneId, leaderPanePid, owner)) {
       registerHudResizeHook(keeperPaneId, leaderPaneId, desiredHeight);

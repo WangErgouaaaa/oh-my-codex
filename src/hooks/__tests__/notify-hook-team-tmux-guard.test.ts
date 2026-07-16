@@ -721,4 +721,50 @@ if [[ "$1" == "capture-pane" ]]; then printf '%s' ${JSON.stringify(captureOutput
       }
     }
   });
+  it('rejects psmux aliases, overflows, and missing targets before any tmux target or input sink', async () => {
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    for (const paneTarget of ['%00', '%4294967296', '']) {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-invalid-target-'));
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+      try {
+        await mkdir(fakeBinDir, { recursive: true });
+        await writeFile(join(fakeBinDir, 'tmux'), `#!/usr/bin/env bash
+printf '[%s]' "$@" >> "${tmuxLogPath}"
+printf '\n' >> "${tmuxLogPath}"
+`);
+        await chmod(join(fakeBinDir, 'tmux'), 0o755);
+        const result = runSendPaneInputInChild({ fakeBinDir, moduleUrl, paneTarget, prompt: 'must not sink', submitKeyPresses: 1, typePrompt: true });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(JSON.parse(result.stdout).sent, false);
+        assert.equal((await readFile(tmuxLogPath, 'utf-8').catch(() => '')), '', paneTarget);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('rejects an observed pane alias before an input sink', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-observed-alias-'));
+    const fakeBinDir = join(cwd, 'fake-bin');
+    const tmuxLogPath = join(cwd, 'tmux.log');
+    try {
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, 'tmux'), `#!/usr/bin/env bash
+printf '[%s]' "$@" >> "${tmuxLogPath}"
+printf '\n' >> "${tmuxLogPath}"
+if [[ "$1" == "display-message" ]]; then printf '%%00\\t0\\t4242\\n'; fi
+`);
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+      const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+      const result = runSendPaneInputInChild({ fakeBinDir, moduleUrl, paneTarget: '%42', prompt: 'must not sink', submitKeyPresses: 1, typePrompt: true });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(JSON.parse(result.stdout).reason, 'pane_authority_invalid');
+      const log = await readFile(tmuxLogPath, 'utf-8');
+      assert.match(log, /\[display-message\]/);
+      assert.doesNotMatch(log, /(?:set-buffer|paste-buffer|send-keys|if-shell)/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

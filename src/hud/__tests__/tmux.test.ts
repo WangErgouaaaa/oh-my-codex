@@ -14,6 +14,7 @@ import {
   findHudWatchPaneIds,
   hudPaneMatchesOwner,
   killTmuxPane,
+  killTmuxPaneIfCurrent,
   listCurrentWindowHudPaneIds,
   OMX_TMUX_HUD_LEADER_PANE_ENV,
   TMUX_PANE_FIELD_SEPARATOR_OCTAL_ESCAPE,
@@ -27,6 +28,7 @@ import {
   readCurrentWindowSize,
   reapDeadHudPanes,
   resizeTmuxPane,
+  resizeTmuxPaneIfCurrent,
   parseHudResizeHookContext,
   registerHudResizeHook,
   unregisterHudResizeHook,
@@ -51,6 +53,38 @@ describe('HUD pane identity boundaries', () => {
     for (const malformed of ['%1', '%1\r\n', '%1\r', '%1\n\n', '%1\n%2']) {
       assert.equal(parseExactTmuxAuthorityLines(malformed), null, JSON.stringify(malformed));
       assert.equal(parseExactTmuxAuthorityScalar(malformed), null, JSON.stringify(malformed));
+    }
+  });
+
+  it('uses one server-side incarnation transaction and explicit receipt for destructive pane sinks', () => {
+    const calls: string[][] = [];
+    const execTmuxSync = (args: string[]) => {
+      calls.push(args);
+      const marker = /display-message -p (__omx_hud_mutation_[0-9a-f-]+)/.exec(args[5] ?? '')?.[1];
+      return marker ? `${marker}\n` : '';
+    };
+
+    assert.equal(killTmuxPaneIfCurrent('%9', '909', execTmuxSync), true);
+    assert.equal(resizeTmuxPaneIfCurrent('%9', '909', 3, execTmuxSync), true);
+    for (const args of calls) {
+      assert.deepEqual(args.slice(0, 4), ['if-shell', '-F', '-t', '%9']);
+      assert.match(args[4] ?? '', /#\{pane_id\},%9/);
+      assert.match(args[4] ?? '', /#\{pane_dead\},0/);
+      assert.match(args[4] ?? '', /#\{pane_pid\},909/);
+      assert.match(args[5] ?? '', /display-message -p __omx_hud_mutation_/);
+    }
+    assert.match(calls[0]?.[5] ?? '', /^kill-pane -t %9/);
+    assert.match(calls[1]?.[5] ?? '', /^resize-pane -t %9 -y 3/);
+  });
+
+  it('fails closed for target removal or PID recycle at the final server sink', () => {
+    for (const receipt of ['__omx_hud_mutation_failed\n', '__omx_hud_mutation_pid_recycled\n']) {
+      const calls: string[][] = [];
+      assert.equal(killTmuxPaneIfCurrent('%9', '909', (args) => {
+        calls.push(args);
+        return receipt;
+      }), false);
+      assert.equal(calls.length, 1);
     }
   });
 
@@ -896,6 +930,10 @@ describe('HUD pane ownership helpers', () => {
 
     assert.equal(paneId, '%7');
     assert.deepEqual(calls, [['display-message', '-p', '#{pane_id}']]);
+  });
+
+  it('fails closed instead of using an out-of-range psmux active-pane fallback', () => {
+    assert.equal(readActiveTmuxPaneId(() => '%4294967296\n'), null);
   });
 
   it('tags reconciled HUD watch commands with the leader pane owner', () => {

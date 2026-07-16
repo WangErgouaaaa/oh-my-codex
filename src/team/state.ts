@@ -1346,6 +1346,7 @@ export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string)
 async function readTeamManifestV2Outcome(
   teamName: string,
   cwd: string,
+  compatibilityDefaults?: Pick<TeamConfig, 'agent_type' | 'max_workers'>,
 ): Promise<TeamStateFileReadOutcome<TeamManifestV2>> {
   const p = teamManifestV2Path(teamName, cwd);
   if (!existsSync(p)) return { status: 'absent' };
@@ -1362,6 +1363,20 @@ async function readTeamManifestV2Outcome(
     parsed = JSON.parse(raw) as unknown;
   } catch {
     return { status: 'invalid', reason: 'malformed' };
+  }
+  if (
+    compatibilityDefaults
+    && parsed
+    && typeof parsed === 'object'
+    && !Array.isArray(parsed)
+    && (parsed as Record<string, unknown>).schema_version === 2
+  ) {
+    const manifest = parsed as Record<string, unknown>;
+    parsed = {
+      ...manifest,
+      agent_type: manifest.agent_type ?? compatibilityDefaults.agent_type,
+      max_workers: manifest.max_workers ?? compatibilityDefaults.max_workers,
+    };
   }
   if (!isTeamManifestV2(parsed)) return { status: 'invalid', reason: 'malformed' };
   if (parsed.name !== teamName) return { status: 'invalid', reason: 'malformed' };
@@ -1543,10 +1558,14 @@ async function readTeamConfigFileOutcome(
  * outcome rather than nullable compatibility readers.
  */
 export async function readTeamStateOutcome(teamName: string, cwd: string): Promise<TeamStateReadOutcome> {
-  const [configOutcome, manifestOutcome] = await Promise.all([
-    readTeamConfigFileOutcome(teamName, cwd),
-    readTeamManifestV2Outcome(teamName, cwd),
-  ]);
+  const configOutcome = await readTeamConfigFileOutcome(teamName, cwd);
+  const manifestOutcome = await readTeamManifestV2Outcome(
+    teamName,
+    cwd,
+    configOutcome.status === 'valid'
+      ? { agent_type: configOutcome.value.agent_type, max_workers: configOutcome.value.max_workers }
+      : undefined,
+  );
   if (configOutcome.status === 'invalid') {
     return { status: 'invalid', source: 'config', reason: configOutcome.reason };
   }

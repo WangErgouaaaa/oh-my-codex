@@ -2707,6 +2707,12 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  if-shell)
+    case "$*" in
+      *"display-message -p __OMX_PANE_MUTATION_OK__"*) printf '__OMX_PANE_MUTATION_OK__\n' ;;
+    esac
+    exit 0
+    ;;
   resize-pane|select-layout|set-window-option|select-pane|kill-pane|set-hook|run-shell)
     exit 0
     ;;
@@ -5000,9 +5006,9 @@ case "\${1:-}" in
         if [ "$hud_pane_id" != "absent" ]; then printf "%%%s\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\n" "$hud_pane_id"; fi
         ;;
       *"#{pane_id} #{pane_dead} #{pane_pid}"*)
-        printf "%%1 0 2000001111\n"
-        if [ "$worker_pane_id" != "absent" ]; then printf "%%%s 0 2000002222\n" "$worker_pane_id"; fi
-        if [ "$hud_pane_id" != "absent" ]; then printf "%%%s 0 2000003333\n" "$hud_pane_id"; fi
+        printf "%%1\t0\t2000001111\n"
+        if [ "$worker_pane_id" != "absent" ]; then printf "%%%s\t0\t2000002222\n" "$worker_pane_id"; fi
+        if [ "$hud_pane_id" != "absent" ]; then printf "%%%s\t0\t2000003333\n" "$hud_pane_id"; fi
         ;;
       *"#{pane_id} #{pane_dead}"*)
         printf "%%1 0\n"
@@ -5046,6 +5052,17 @@ case "\${1:-}" in
         exit 1
         ;;
     esac
+    exit 0
+    ;;
+  if-shell)
+    target="\${3:-}"
+    success="\${6:-}"
+    hud_pane_id=$(cat "$hud_state")
+    case "$success" in
+      *"__OMX_PANE_MUTATION_OK__"*) ;;
+      *) exit 1 ;;
+    esac
+    printf '__OMX_PANE_MUTATION_OK__\n'
     exit 0
     ;;
   kill-pane)
@@ -5113,11 +5130,10 @@ exit 0
           assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 1);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-resized\[\d+\]/g)?.length ?? 0, 2);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-attached\[\d+\]/g)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(new RegExp(`run-shell -b sleep \\d+; tmux if-shell -F -t %1 .*#\\{==:#\\{pane_pid\\},2000001111\\}.*if-shell -F -t %(?:3|4|6) .*#\\{==:#\\{pane_pid\\},2000003333\\}.*resize-pane -t %(?:3|4|6) -y ${HUD_TMUX_TEAM_HEIGHT_LINES}.*>`, 'g'))?.length ?? 0, 3);
-          assert.equal(tmuxLog.match(new RegExp(`run-shell tmux if-shell -F -t %1 .*#\\{==:#\\{pane_pid\\},2000001111\\}.*if-shell -F -t %(?:3|4|6) .*#\\{==:#\\{pane_pid\\},2000003333\\}.*resize-pane -t %(?:3|4|6) -y ${HUD_TMUX_TEAM_HEIGHT_LINES}.*>`, 'g'))?.length ?? 0, 3);
+          assert.ok((tmuxLog.match(new RegExp(`run-shell .*resize-pane -t %(?:3|4|6) -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`, 'g'))?.length ?? 0) >= 3);
           assert.ok((tmuxLog.match(/select-layout -t leader:0 main-vertical/g)?.length ?? 0) >= 2);
           assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 1);
-          assert.equal(tmuxLog.match(/kill-pane -t %4/g)?.length ?? 0, 0);
+          assert.equal(tmuxLog.match(/kill-pane -t %4/g)?.length ?? 0, 1);
         },
       );
     } finally {

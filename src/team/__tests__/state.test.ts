@@ -392,6 +392,29 @@ describe('team state', () => {
     }
   });
 
+  it('accepts legacy V2 manifests that predate agent_type and max_workers when config supplies them', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-legacy-v2-manifest-'));
+    const teamName = 'team-legacy-v2-manifest';
+    try {
+      await initTeamState(teamName, 't', 'executor', 2, cwd);
+      const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+      delete manifest.agent_type;
+      delete manifest.max_workers;
+      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+
+      const outcome = await readTeamStateOutcome(teamName, cwd);
+      assert.equal(outcome.status, 'valid');
+      if (outcome.status !== 'valid') return;
+      assert.equal(outcome.config.agent_type, 'executor');
+      assert.equal(outcome.config.max_workers, DEFAULT_MAX_WORKERS);
+      assert.equal(outcome.manifest.agent_type, 'executor');
+      assert.equal(outcome.manifest.max_workers, DEFAULT_MAX_WORKERS);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('rejects matching noncanonical resize hook metadata, including hash-slot aliases', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-resize-hook-authority-'));
     const teamName = 'b0';

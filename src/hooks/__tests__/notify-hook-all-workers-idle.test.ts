@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initTeamState } from '../../team/state.js';
 
+
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
 async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<void> {
@@ -16,6 +17,11 @@ async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+}
+
+async function writeJsonIndependent(path: string, value: unknown): Promise<void> {
+  await mkdir(join(path, '..'), { recursive: true });
+  await writeFile(path, JSON.stringify(value, null, 2));
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
@@ -992,7 +998,8 @@ exit 0
     });
   });
 
-  it('uses manifest.v2.json over config.json when both present', async () => {
+  it('fails closed when config.json and manifest.v2.json diverge', async () => {
+
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
       const stateDir = join(omxDir, 'state');
@@ -1008,15 +1015,17 @@ exit 0
       await mkdir(workersDir, { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
 
-      // Write BOTH config.json and manifest.v2.json
-      // They differ in tmux_session — manifest should win
-      await writeJson(join(teamDir, 'config.json'), {
+      // Write an independently divergent authority pair. The hook must not
+      // quietly mirror one file into the other or prefer a stale target.
+
+      await writeJsonIndependent(join(teamDir, 'config.json'), {
+
         name: teamName,
-        tmux_session: 'correct-session:1',
+        tmux_session: 'wrong-session:1',
         leader_pane_id: '%123',
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
       });
-      await writeJson(join(teamDir, 'manifest.v2.json'), {
+      await writeJsonIndependent(join(teamDir, 'manifest.v2.json'), {
         schema_version: 2,
         name: teamName,
         task: 'test',
@@ -1045,10 +1054,10 @@ exit 0
       const result = runNotifyHookAsWorker(cwd, fakeBinDir, `${teamName}/worker-1`);
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
-      assert.ok(existsSync(tmuxLogPath), 'tmux should have been called');
-      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /-t %123/, 'should use leader_pane_id from manifest.v2.json');
-      assert.doesNotMatch(tmuxLog, /wrong-session/, 'should not use tmux_session from config.json');
+      if (existsSync(tmuxLogPath)) {
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        assert.doesNotMatch(tmuxLog, /send-keys|paste-buffer|if-shell/, 'divergent team authority must not inject into either leader target');
+      }
     });
   });
 });

@@ -3223,7 +3223,8 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, livePane);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /display-message -p -t %99 #S/);
+      assert.match(tmuxLog, /display-message -p -t %99 #{pane_id}\t#{pane_dead}\t#{pane_pid}/);
+      assert.doesNotMatch(tmuxLog, /display-message -p -t %99 #S/);
       assert.match(tmuxLog, /list-panes -s -t .*sess-ralph-dead-anchor/);
       assert.match(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
       assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);

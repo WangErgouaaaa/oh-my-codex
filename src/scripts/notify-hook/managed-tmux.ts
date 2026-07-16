@@ -6,6 +6,7 @@ import { runProcess } from './process-runner.js';
 import { safeString } from './utils.js';
 import { sameFilePath } from '../../utils/paths.js';
 import type { ResolvedPromptTurnContext } from '../../hooks/prompt-session-provenance.js';
+import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
 
 
 const OMX_INSTANCE_OPTION = '@omx_instance_id';
@@ -127,14 +128,36 @@ export interface ActualTmuxInstanceEvidence {
 }
 
 export async function probeActualTmuxInstanceEvidence(paneTarget?: string): Promise<ActualTmuxInstanceEvidence> {
-  const resolvedPaneTarget = safeString(paneTarget ?? process.env.TMUX_PANE ?? '').trim();
+  const requestedPaneTarget = paneTarget ?? process.env.TMUX_PANE ?? '';
+  const resolvedPaneTarget = parseCanonicalTmuxPaneId(requestedPaneTarget);
+  if (requestedPaneTarget && (!resolvedPaneTarget || resolvedPaneTarget !== requestedPaneTarget)) {
+    return { paneTarget: '', sessionName: '', paneInstanceId: '', sessionInstanceId: '', instanceId: '', source: 'none', paneTagStatus: 'not-requested' };
+  }
   let sessionName = '';
+  let observedPanePid = '';
+  const revalidatePaneIncarnation = async (): Promise<boolean> => {
+    if (!resolvedPaneTarget) return true;
+    try {
+      const result = await runProcess('tmux', ['display-message', '-p', '-t', resolvedPaneTarget, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 2000);
+      const match = /^([^\t\r\n]+)\t0\t([1-9][0-9]*)\n$/.exec(safeString(result.stdout));
+      return parseCanonicalTmuxPaneId(match?.[1]) === resolvedPaneTarget && match?.[2] === observedPanePid;
+    } catch {
+      return false;
+    }
+  };
   if (resolvedPaneTarget) {
     try {
+      const paneResult = await runProcess('tmux', ['display-message', '-p', '-t', resolvedPaneTarget, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 2000);
+      const paneMatch = /^([^\t\r\n]+)\t0\t([1-9][0-9]*)\n$/.exec(safeString(paneResult.stdout));
+      const observedPaneTarget = parseCanonicalTmuxPaneId(paneMatch?.[1]);
+      observedPanePid = paneMatch?.[2] ?? '';
+      if (observedPaneTarget !== resolvedPaneTarget || !observedPanePid) {
+        return { paneTarget: '', sessionName: '', paneInstanceId: '', sessionInstanceId: '', instanceId: '', source: 'none', paneTagStatus: 'error' };
+      }
       const result = await runProcess('tmux', ['display-message', '-p', '-t', resolvedPaneTarget, '#S'], 2000);
       sessionName = safeString(result.stdout).trim();
     } catch {
-      // A pane target without a session cannot provide session-tag evidence.
+      return { paneTarget: '', sessionName: '', paneInstanceId: '', sessionInstanceId: '', instanceId: '', source: 'none', paneTagStatus: 'error' };
     }
   } else {
     sessionName = readCurrentTmuxSessionName();
@@ -144,9 +167,12 @@ export async function probeActualTmuxInstanceEvidence(paneTarget?: string): Prom
     ? await probeTmuxOption(resolvedPaneTarget, OMX_PANE_INSTANCE_OPTION, { pane: true })
     : { status: 'absent' as const, value: '' };
   const paneTagStatus = resolvedPaneTarget ? paneProbe.status : 'not-requested';
+  if (!(await revalidatePaneIncarnation())) {
+    return { paneTarget: '', sessionName: '', paneInstanceId: '', sessionInstanceId: '', instanceId: '', source: 'none', paneTagStatus: 'error' };
+  }
   if (paneProbe.status === 'present') {
     return {
-      paneTarget: resolvedPaneTarget,
+      paneTarget: resolvedPaneTarget ?? '',
       sessionName,
       paneInstanceId: paneProbe.value,
       sessionInstanceId: '',
@@ -157,7 +183,7 @@ export async function probeActualTmuxInstanceEvidence(paneTarget?: string): Prom
   }
   if (paneProbe.status === 'error') {
     return {
-      paneTarget: resolvedPaneTarget,
+      paneTarget: resolvedPaneTarget ?? '',
       sessionName,
       paneInstanceId: '',
       sessionInstanceId: '',
@@ -170,8 +196,11 @@ export async function probeActualTmuxInstanceEvidence(paneTarget?: string): Prom
   const sessionInstanceId = sessionName
     ? await readTmuxSessionInstanceId(sessionName)
     : '';
+  if (!(await revalidatePaneIncarnation())) {
+    return { paneTarget: '', sessionName: '', paneInstanceId: '', sessionInstanceId: '', instanceId: '', source: 'none', paneTagStatus: 'error' };
+  }
   return {
-    paneTarget: resolvedPaneTarget,
+    paneTarget: resolvedPaneTarget ?? '',
     sessionName,
     paneInstanceId: '',
     sessionInstanceId,
@@ -311,6 +340,18 @@ export async function resolveManagedSessionContext(
         canonicalSessionId || invocationSessionId,
       );
     const evidence = await probeActualTmuxInstanceEvidence(paneTarget);
+    if (paneTarget && evidence.paneTarget !== paneTarget) {
+      return {
+        managed: false,
+        reason: 'pane_target_mismatch',
+        invocationSessionId,
+        sessionState,
+        expectedTmuxSessionName,
+        currentTmuxSessionName: '',
+        currentTmuxPaneTarget: '',
+        taggedTmuxSessionName: '',
+      };
+    }
     const currentTmuxSessionName = evidence.sessionName || readCurrentTmuxSessionName();
     const currentTmuxPaneTarget = evidence.paneTarget;
     const currentTmuxPaneInstanceId = evidence.paneInstanceId;
@@ -490,8 +531,8 @@ export async function resolveManagedPaneFromAnchorAtPromptContext(anchorPane: st
 }
 
 export async function verifyManagedPaneTarget(paneId: string, cwd: string, payload: any, { allowTeamWorker = true } = {}): Promise<any> {
-  const paneTarget = safeString(paneId);
-  if (!isCanonicalPaneId(paneTarget)) {
+  const paneTarget = parseCanonicalTmuxPaneId(paneId);
+  if (!paneTarget || paneTarget !== paneId) {
     return { ok: false, reason: 'missing_pane_target', paneTarget: '' };
   }
 
@@ -614,12 +655,7 @@ interface ManagedSessionPaneRow {
 }
 
 function isCanonicalPaneId(value: string): boolean {
-  if (!/^%(?:0|[1-9]\d*)$/.test(value)) return false;
-  try {
-    return BigInt(value.slice(1)) <= BigInt(Number.MAX_SAFE_INTEGER);
-  } catch {
-    return false;
-  }
+  return parseCanonicalTmuxPaneId(value) === value;
 }
 
 function parseManagedSessionPaneRows(stdout: string): ManagedSessionPaneRow[] | null {

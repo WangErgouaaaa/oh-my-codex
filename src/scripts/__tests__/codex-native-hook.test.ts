@@ -358,7 +358,13 @@ function buildSessionOwnerEvidenceTmux(paneInstanceId: string, sessionInstanceId
   return `#!/usr/bin/env bash
 set -eu
 case "\${1:-}" in
-display-message) printf '%s\n' "omx-owner-evidence" ;;
+  display-message)
+    if [[ "\${@: -1}" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+      printf '%%3138\t0\t3138\n'
+    else
+      printf '%s\n' "omx-owner-evidence"
+    fi
+    ;;
 show-option|show-options)
 case "\${@: -1}" in
 @omx_pane_instance_id) printf '%s\n' "${paneInstanceId}" ;;

@@ -11,13 +11,13 @@ import {
   findHudWatchPaneIds,
   isHudWatchPane,
   hasValidHudOwnerMarker,
-  killTmuxPane,
+  killTmuxPaneIfCurrent,
   listCurrentWindowPanes,
   readCurrentWindowSize,
   readHudPaneOwner,
   registerHudResizeHook,
   unregisterHudResizeHook,
-  resizeTmuxPane,
+  resizeTmuxPaneIfCurrent,
   parseCanonicalTmuxPaneId,
   rollbackHudWatchPaneAuthority,
   verifyHudWatchPaneAuthority,
@@ -84,7 +84,7 @@ function killFreshHudPanes(
   expectedLeader: TmuxPaneSnapshot,
   currentPaneId: string | undefined,
   listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[],
-  killPane: (paneId: string) => boolean,
+  killPane: (pane: TmuxPaneSnapshot) => boolean,
   shouldKill: FreshHudKillPredicate,
 ): { reaped: string[]; complete: boolean } {
   const candidatePaneIds = [...new Set(paneIds)];
@@ -103,7 +103,7 @@ function killFreshHudPanes(
     }
     const pane = panes.find((candidate) => candidate.paneId === paneId);
     const expectedPane = expectedById.get(paneId);
-    if (!pane || !expectedPane || !samePaneIncarnation(expectedPane, pane) || !isHudWatchPane(pane) || !shouldKill(pane, panes) || !killPane(paneId)) {
+    if (!pane || !expectedPane || !samePaneIncarnation(expectedPane, pane) || !isHudWatchPane(pane) || !shouldKill(pane, panes) || !killPane(pane)) {
       return { reaped, complete: false };
     }
     reaped.push(paneId);
@@ -183,7 +183,7 @@ function reapOrphanedSessionHudPanes(
     currentPaneId: string | undefined;
     expectedLeader: TmuxPaneSnapshot;
     listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[];
-    killPane: (paneId: string) => boolean;
+    killPane: (pane: TmuxPaneSnapshot) => boolean;
   },
 ): { reaped: string[]; complete: boolean } {
   const { sessionId, currentPaneId, killPane, listPanes } = opts;
@@ -225,7 +225,7 @@ function reapStaleCurrentLeaderHudPanes(
     currentPaneId: string | undefined;
     listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[];
     expectedLeader: TmuxPaneSnapshot;
-    killPane: (paneId: string) => boolean;
+    killPane: (pane: TmuxPaneSnapshot) => boolean;
   },
 ): { reaped: string[]; complete: boolean } {
   const { currentPaneId, killPane, listPanes } = opts;
@@ -531,8 +531,12 @@ export async function reconcileHudForPromptSubmit(
 
   const listPanes = deps.listCurrentWindowPanes ?? ((paneId) => listCurrentWindowPanes(undefined, paneId));
   const createPane = deps.createHudWatchPane ?? ((hudCwd, hudCmd, options) => createHudWatchPane(hudCwd, hudCmd, options));
-  const killPane = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
-  const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
+  const killPane = deps.killTmuxPane
+    ? (pane: TmuxPaneSnapshot) => deps.killTmuxPane!(pane.paneId)
+    : (pane: TmuxPaneSnapshot) => killTmuxPaneIfCurrent(pane.paneId, pane.panePid ?? '');
+  const resizePane = deps.resizeTmuxPane
+    ? (pane: TmuxPaneSnapshot, lines: number) => deps.resizeTmuxPane!(pane.paneId, lines)
+    : (pane: TmuxPaneSnapshot, lines: number) => resizeTmuxPaneIfCurrent(pane.paneId, pane.panePid ?? '', lines);
 
   const lockPath = join(cwd, '.omx', 'state', 'hud-reconcile.lock');
   const lockDirReady = await mkdir(dirname(lockPath), { recursive: true }).then(() => true).catch(() => false);
@@ -646,7 +650,7 @@ export async function reconcileHudForPromptSubmit(
     const shouldResize = needsHudHeightResize(singleHudPane, desiredHeight);
     const paneForResize = matchesFreshHudPane(singleHudPane.paneId, singleHudPane, expectedLeaderPane, currentPaneId, owner, listPanes);
     if (!paneForResize) return failedReconcileResult(desiredHeight, duplicateCount);
-    const resized = shouldResize ? resizePane(paneForResize.paneId, desiredHeight) : true;
+    const resized = shouldResize ? resizePane(paneForResize, desiredHeight) : true;
     const paneForHook = resized
       ? matchesFreshHudPane(paneForResize.paneId, paneForResize, expectedLeaderPane, currentPaneId, owner, listPanes)
       : null;
@@ -687,7 +691,7 @@ export async function reconcileHudForPromptSubmit(
       ) return failedReconcileResult(desiredHeight, duplicateCount);
       const keeperForResize = matchesFreshHudPane(freshKeeperPane.paneId, freshKeeperPane, expectedLeaderPane, currentPaneId, owner, listPanes);
       if (!keeperForResize) return failedReconcileResult(desiredHeight, duplicateCount);
-      const resized = resizePane(keeperForResize.paneId, desiredHeight);
+      const resized = resizePane(keeperForResize, desiredHeight);
       const keeperForHook = resized
         ? matchesFreshHudPane(keeperForResize.paneId, keeperForResize, expectedLeaderPane, currentPaneId, owner, listPanes)
         : null;
@@ -820,7 +824,7 @@ export async function reconcileHudForPromptSubmit(
     if (createdBySharedPrimitive) rollbackHudWatchPaneAuthority(paneId);
     return failedReconcileResult(desiredHeight, postCreate.duplicatePaneIds.length);
   }
-  const resized = resizePane(paneForResize.paneId, desiredHeight);
+  const resized = resizePane(paneForResize, desiredHeight);
   if (!resized) {
     if (createdBySharedPrimitive) rollbackHudWatchPaneAuthority(paneId);
     return {

@@ -1,5 +1,6 @@
 import { safeString } from './utils.js';
 import { runProcess } from './process-runner.js';
+import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
 import {
   buildCapturePaneArgv,
   buildPaneInModeArgv,
@@ -48,8 +49,9 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   requireCaptureEvidence = undefined,
 } = {}): Promise<any> {
   const normalizedRequireObservableState = typeof requireCaptureEvidence === 'boolean' ? requireCaptureEvidence : requireObservableState;
-  const target = safeString(paneTarget).trim();
-  if (!target) {
+  const requestedTarget = safeString(paneTarget);
+  const target = parseCanonicalTmuxPaneId(requestedTarget);
+  if (!target || target !== requestedTarget) {
     return {
       ok: false,
       sent: false,
@@ -156,8 +158,9 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
 function parseExactPaneAuthoritySnapshot(value: any): { paneId: string; panePid: string } | null {
   const raw = safeString(value);
   if (!raw || raw.includes('\r') || !raw.endsWith('\n') || raw.endsWith('\n\n')) return null;
-  const [paneId, paneDead, panePid, ...extra] = raw.slice(0, -1).split('\t');
-  if (extra.length > 0 || !/^%(?:0|[1-9][0-9]*)$/.test(paneId) || paneDead !== '0' || !/^[1-9][0-9]*$/.test(panePid)) return null;
+  const [rawPaneId, paneDead, panePid, ...extra] = raw.slice(0, -1).split('\t');
+  const paneId = parseCanonicalTmuxPaneId(rawPaneId);
+  if (extra.length > 0 || !paneId || paneDead !== '0' || !/^[1-9][0-9]*$/.test(panePid)) return null;
   return { paneId, panePid };
 }
 
@@ -183,11 +186,12 @@ async function confirmPaneAuthorityAtomically(paneId: string, panePid: string): 
 
 
 export async function capturePaneInputAuthority(paneTarget: any): Promise<{ paneTarget: string; panePid: string; assertPaneAuthority: () => Promise<boolean> } | null> {
-  const requestedTarget = safeString(paneTarget).trim();
-  if (!requestedTarget) return null;
+  const requestedTarget = safeString(paneTarget);
+  const canonicalTarget = parseCanonicalTmuxPaneId(requestedTarget);
+  if (!canonicalTarget || canonicalTarget !== requestedTarget) return null;
   try {
-    const initial = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', requestedTarget, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 3000)).stdout);
-    if (!initial) return null;
+    const initial = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', canonicalTarget, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 3000)).stdout);
+    if (!initial || initial.paneId !== canonicalTarget) return null;
     return {
       panePid: initial.panePid,
 
@@ -216,8 +220,9 @@ export async function sendPaneInput({
   queueFirstSubmit = false,
   assertPaneAuthority,
 }: any): Promise<any> {
-  const target = safeString(paneTarget).trim();
-  if (!target) {
+  const requestedTarget = safeString(paneTarget);
+  const target = parseCanonicalTmuxPaneId(requestedTarget);
+  if (!target || target !== requestedTarget) {
     return { ok: false, sent: false, reason: 'missing_pane_target', paneTarget: '' };
   }
   const capturedAuthority = await capturePaneInputAuthority(target);
@@ -323,10 +328,14 @@ export async function queuePaneInput({
   submitDelayMs = 80,
   assertPaneAuthority,
 }: any): Promise<any> {
-  const requestedTarget = safeString(paneTarget).trim();
-  const capturedAuthority = await capturePaneInputAuthority(requestedTarget);
+  const requestedTarget = safeString(paneTarget);
+  const canonicalTarget = parseCanonicalTmuxPaneId(requestedTarget);
+  if (!canonicalTarget || canonicalTarget !== requestedTarget) {
+    return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: '' };
+  }
+  const capturedAuthority = await capturePaneInputAuthority(canonicalTarget);
   const paneAuthority = assertPaneAuthority || capturedAuthority?.assertPaneAuthority;
-  if (!capturedAuthority || !paneAuthority) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: requestedTarget };
+  if (!capturedAuthority || !paneAuthority) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: canonicalTarget };
   const authoritativeTarget = capturedAuthority.paneTarget;
 
   const sendResult = await sendPaneInput({

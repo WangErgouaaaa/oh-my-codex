@@ -80,6 +80,19 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  format=""
+  while (($#)); do
+    case "$1" in
+      -p) shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   echo "shared-session"
   exit 0
 fi
@@ -128,6 +141,19 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  format=""
+  while (($#)); do
+    case "$1" in
+      -p) shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   echo "shared-session"
   exit 0
 fi
@@ -177,6 +203,19 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  format=""
+  while (($#)); do
+    case "$1" in
+      -p) shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   echo "shared-session"
   exit 0
 fi
@@ -376,6 +415,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ "$target" == "%42" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -417,6 +460,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ "$target" == "%42" && "$format" == "#S" ]]; then
     echo "${sharedTmuxSession}"
     exit 0
@@ -502,6 +549,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -593,6 +644,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -763,6 +818,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -854,6 +913,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -945,6 +1008,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -1036,6 +1103,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -1128,6 +1199,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -1229,6 +1304,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0
@@ -1320,6 +1399,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%%42\t0\t123\n'
+    exit 0
+  fi
   if [[ -z "$target" && "$format" == "#S" ]]; then
     echo "${managedSessionName}"
     exit 0

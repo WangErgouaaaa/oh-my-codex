@@ -161,6 +161,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then
     echo "%42"
     exit 0
@@ -293,6 +297,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then
     echo "%42"
     exit 0
@@ -748,6 +756,7 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then printf '%%42\t0\t4242\n'; exit 0; fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then echo "%42"; exit 0; fi
   if [[ "$format" == "#{pane_current_path}" && "$target" == "%42" ]]; then echo "${cwd}"; exit 0; fi
   if [[ "$format" == "#{pane_start_command}" && "$target" == "%42" ]]; then echo "codex"; exit 0; fi
@@ -868,6 +877,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then
     echo "%42"
     exit 0
@@ -985,6 +998,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$target" == "%42" && "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$target" == "%42" && "$format" == "#{pane_id}" ]]; then
     echo "%42"
     exit 0
@@ -1540,6 +1557,7 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && ( "$target" == "%42" || "$target" == "%99" ) ]]; then printf '%s\t0\t4242\n' "$target"; exit 0; fi
   if [[ "$format" == "#{pane_id}" && ( "$target" == "%42" || "$target" == "%99" ) ]]; then echo "$target"; exit 0; fi
   if [[ "$format" == "#{pane_current_path}" && ( "$target" == "%42" || "$target" == "%99" ) ]]; then echo "${cwd}"; exit 0; fi
   if [[ "$format" == "#{pane_current_command}" && ( "$target" == "%42" || "$target" == "%99" ) ]]; then echo "codex"; exit 0; fi
@@ -1747,6 +1765,7 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then printf '%%42\t0\t4242\n'; exit 0; fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then echo "%42"; exit 0; fi
   if [[ "$format" == "#{pane_current_path}" && "$target" == "%42" ]]; then echo "${cwd}"; exit 0; fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%42" ]]; then echo "codex"; exit 0; fi
@@ -2115,6 +2134,7 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then printf '%%42\t0\t4242\n'; exit 0; fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then
     echo "%42"
     exit 0

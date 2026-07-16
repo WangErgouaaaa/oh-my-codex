@@ -684,6 +684,10 @@ if [[ "$1" == "list-panes" ]]; then
   printf '%s\n' "%3	node	exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch"
   exit 0
 fi
+if [[ "$*" =~ (__omx_hud_mutation_[0-9a-f-]+) ]]; then
+  printf '%s\n' "\${BASH_REMATCH[1]}"
+  exit 0
+fi
 if [[ "$1" == "resize-pane" || "$1" == "set-hook" || "$1" == "kill-pane" ]]; then
   exit 0
 fi
@@ -798,6 +802,10 @@ if [[ "$1" == "list-panes" ]]; then
   fi
   printf '%s\\n' '%1	codex	codex'
   printf '%s\\n' "%2	node	exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch"
+  exit 0
+fi
+if [[ "$*" =~ (__omx_hud_mutation_[0-9a-f-]+) ]]; then
+  printf '%s\n' "\${BASH_REMATCH[1]}"
   exit 0
 fi
 if [[ "$1" == "resize-pane" || "$1" == "set-hook" ]]; then

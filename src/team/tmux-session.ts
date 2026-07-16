@@ -433,6 +433,34 @@ export function isTeamPaneIncarnationLive(
     && isPaneLiveInStrictGlobalProbe(paneId, normalizedPid);
 }
 
+function buildTeamPaneIncarnationCondition(paneId: string, panePid: string): string {
+  return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
+}
+
+/** Removes only the exact pane incarnation and requires a tmux-server receipt. */
+function removeTeamPaneIncarnation(pane: TeamPaneIncarnation): boolean {
+  const paneId = parseCanonicalTmuxPaneId(pane.paneId);
+  if (!paneId || paneId !== pane.paneId || !/^[1-9][0-9]*$/.test(pane.panePid)) return false;
+  const result = runTmux([
+    'if-shell', '-t', paneId, '-F', buildTeamPaneIncarnationCondition(paneId, pane.panePid),
+    `kill-pane -t ${paneId} \\; display-message -p __OMX_PANE_MUTATION_OK__`,
+    '',
+  ]);
+  return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+}
+/** Resizes only the exact live pane incarnation and requires a tmux-server receipt. */
+function resizeTeamPaneIncarnation(pane: TeamPaneIncarnation, heightLines: number): boolean {
+  const paneId = parseCanonicalTmuxPaneId(pane.paneId);
+  if (!paneId || paneId !== pane.paneId || !/^[1-9][0-9]*$/.test(pane.panePid)) return false;
+  const height = Number.isFinite(heightLines) && heightLines > 0 ? Math.floor(heightLines) : HUD_TMUX_TEAM_HEIGHT_LINES;
+  const result = runTmux([
+    'if-shell', '-t', paneId, '-F', buildTeamPaneIncarnationCondition(paneId, pane.panePid),
+    `resize-pane -t ${paneId} -y ${height} \\; display-message -p __OMX_PANE_MUTATION_OK__`,
+    '',
+  ]);
+  return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+}
+
 function isPaneStablyLiveInStrictGlobalProbe(
   paneId: string,
   expectedPid?: string,
@@ -1028,12 +1056,6 @@ function buildHudResizeCommand(hudPaneId: string, heightLines: number = HUD_TMUX
   return `resize-pane -t ${buildHudPaneTarget(hudPaneId)} -y ${resolveHudHeightLines(heightLines)}`;
 }
 
-function buildHudResizeArgs(
-  hudPaneId: string,
-  heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
-): string[] {
-  return ['resize-pane', '-t', buildHudPaneTarget(hudPaneId), '-y', String(resolveHudHeightLines(heightLines))];
-}
 
 function buildNestedTmuxShellCommand(command: string): string {
   if (process.platform !== 'win32') {
@@ -1138,7 +1160,7 @@ function buildGuardedHookUnregisterArgs(hookTarget: string, hookSlot: string, ho
 
 function buildHookIdentityRegistrationSuffix(hookTarget: string, hookSlot: string, hookName: string): string[] {
   return [
-    '\\;', 'set-option', '-t', hookTarget,
+    ';', 'set-option', '-t', hookTarget,
     hookIdentityOption(hookSlot), hookIdentityToken(hookName),
   ];
 }
@@ -2162,6 +2184,24 @@ export function createTeamSession(
     if (!leaderPaneId || !globalPaneIds.has(leaderPaneId)) {
       throw new Error(`failed to select a canonical team leader pane: ${selectedLeaderPaneId}`);
     }
+    const initialLeaderHudPaneIds = findHudWatchPaneIds(panes, leaderPaneId, { leaderPaneId });
+    const initialLeaderPaneIncarnation = initialLeaderHudPaneIds.length > 0
+      ? readTeamPaneIncarnation(leaderPaneId)
+      : null;
+    if (initialLeaderHudPaneIds.length > 0 && (!initialLeaderPaneIncarnation || !isTeamPaneIncarnationLive(leaderPaneId, initialLeaderPaneIncarnation.panePid))) {
+      throw new Error('failed to capture exact current leader pane authority before team creation');
+    }
+    const initialLeaderHudPaneIncarnations = initialLeaderHudPaneIds.map((paneId) => {
+      if (!globalPaneIds.has(paneId) || paneId === leaderPaneId) {
+        throw new Error('failed to validate initial leader HUD snapshot');
+      }
+      const incarnation = readTeamPaneIncarnation(paneId);
+      if (!incarnation || !isTeamPaneIncarnationLive(paneId, incarnation.panePid)) {
+        throw new Error('failed to capture exact initial leader HUD authority');
+      }
+      return incarnation;
+    });
+
     rollbackLeaderPaneId = leaderPaneId;
     for (const paneId of globalPaneIds) rollbackPreExistingPaneIds.add(paneId);
     const ownerSessionId = (options.ownerSessionId ?? process.env.OMX_SESSION_ID ?? '').trim();
@@ -2178,11 +2218,29 @@ export function createTeamSession(
 
     const omxEntry = resolveOmxCliEntryPath();
     const canRecreateTeamHud = Boolean(omxEntry && omxEntry.trim() !== '');
-    // Team mode prioritizes leader + worker visibility. Remove HUD panes only
-    // when we can recreate the team HUD. Otherwise keep the existing HUD alive
-    // instead of making it disappear on team startup failures or broken installs.
-    // Existing HUD panes predate this split and have no operation nonce. Preserve
-    // them rather than issuing a destructive command on stale provenance.
+    // Team mode prioritizes leader + worker visibility. Recreate any HUD owned
+    // by this leader only from the initial canonical snapshot; neighboring HUDs
+    // are never inferred from a later, mutable layout observation.
+    let hudPaneId: string | null = null;
+    let hudPaneIncarnation: TeamPaneIncarnation | null = null;
+    if (initialLeaderHudPaneIncarnations.length > 0) {
+      const leaderIncarnation = initialLeaderPaneIncarnation;
+      if (!leaderIncarnation) {
+        throw new Error('missing initial leader authority for leader-owned HUD reconciliation');
+      }
+      if (initialLeaderHudPaneIncarnations.length !== 1) {
+        throw new Error('cannot safely converge multiple leader-owned HUD panes during team creation');
+      }
+      const [existingHud] = initialLeaderHudPaneIncarnations;
+      if (!isTeamPaneIncarnationLive(leaderIncarnation.paneId, leaderIncarnation.panePid)
+        || !isTeamPaneIncarnationLive(existingHud!.paneId, existingHud!.panePid)) {
+        throw new Error('leader or existing HUD authority changed before Team HUD reconciliation');
+      }
+      if (!canRecreateTeamHud) {
+        hudPaneId = existingHud!.paneId;
+        hudPaneIncarnation = existingHud!;
+      }
+    }
 
 
     const workerPaneIds: string[] = [];
@@ -2266,14 +2324,12 @@ export function createTeamSession(
       }
     }
 
-    // Re-create a single team HUD as a full-width bottom strip spanning both
-    // leader + worker columns. Keep this after layout sizing so the main
-    // leader/worker topology stays readable and the HUD remains compact.
-    // Capture the HUD pane ID so it can be tracked and excluded from worker cleanup.
-    let hudPaneId: string | null = null;
+    // Create a full-width bottom strip after layout sizing when no existing
+    // leader-owned HUD can be reused safely.
     let resizeHookName: string | null = null;
     let resizeHookTarget: string | null = null;
-    if (canRecreateTeamHud && omxEntry) {
+
+    if (!hudPaneId && canRecreateTeamHud && omxEntry) {
       const hudCmd = buildHudStartupCommand({
         omxEntry,
         sessionId: ownerSessionId,
@@ -2297,17 +2353,18 @@ export function createTeamSession(
       tagPaneInstance(hudPaneCandidate, ownerSessionId);
       tagPaneTeamOwner(hudPaneCandidate, teamPaneOwnerId);
       hudPaneId = hudPaneCandidate;
+      hudPaneIncarnation = { paneId: hudAuthority.paneId, panePid: hudAuthority.panePid };
+
       if (!revalidateSplitPaneAuthority(hudAuthority)) {
         throw new Error('team HUD pane authority changed before resize or hook registration');
       }
 
 
           if (isNativeWindows()) {
-            // Native Windows tmux support may flow through psmux; issuing a
-            // direct control-plane resize avoids nested run-shell PATH drift.
-            const reconcile = runTmux(buildHudResizeArgs(hudPaneId));
-            if (!reconcile.ok) {
-              throw new Error(`failed to reconcile HUD resize: ${reconcile.stderr}`);
+            // Native Windows tmux support may flow through psmux; keep the
+            // authority check and resize in one server-side transaction.
+            if (!resizeTeamPaneIncarnation(hudAuthority, HUD_TMUX_TEAM_HEIGHT_LINES)) {
+              throw new Error('failed to reconcile exact HUD pane resize');
             }
           } else {
             const hookTarget = buildResizeHookTarget(sessionName, windowIndex);
@@ -2377,18 +2434,24 @@ export function createTeamSession(
 
       }
 
-    if (hudPaneId && !revalidateSplitPaneAuthority(rollbackPaneAuthorities.get(hudPaneId) ?? { paneId: '', panePid: '', ownerNonce: '', ownerOption: '', ownerProof: '', operationMarker: '', windowTarget: '' })) {
+    if (hudPaneId && (!hudPaneIncarnation || !isTeamPaneIncarnationLive(hudPaneIncarnation.paneId, hudPaneIncarnation.panePid))) {
       throw new Error('team HUD pane authority changed before leader selection');
     }
     runTmux(['select-pane', '-t', leaderPaneId]);
     redrawLeaderPaneAfterTeamLayout(leaderPaneId);
     sleepSeconds(0.5);
-    const finalPaneAuthorities = [
-      ...workerPaneIds.map((paneId) => rollbackPaneAuthorities.get(paneId)),
-      ...(hudPaneId ? [rollbackPaneAuthorities.get(hudPaneId)] : []),
-    ];
-    if (finalPaneAuthorities.some((authority) => !authority || !revalidateSplitPaneAuthority(authority) || !isPaneStablyLiveInStrictGlobalProbe(authority.paneId, authority.panePid))) {
+    const finalWorkerAuthorities = workerPaneIds.map((paneId) => rollbackPaneAuthorities.get(paneId));
+    if (
+      finalWorkerAuthorities.some((authority) => !authority || !revalidateSplitPaneAuthority(authority) || !isPaneStablyLiveInStrictGlobalProbe(authority.paneId, authority.panePid))
+      || (hudPaneIncarnation !== null && !isPaneStablyLiveInStrictGlobalProbe(hudPaneIncarnation.paneId, hudPaneIncarnation.panePid))
+    ) {
       throw new Error('team pane authority changed during final stabilization');
+    }
+    if (canRecreateTeamHud && initialLeaderHudPaneIncarnations.length === 1) {
+      const priorHud = initialLeaderHudPaneIncarnations[0]!;
+      if (!hudPaneIncarnation || hudPaneIncarnation.paneId === priorHud.paneId || !removeTeamPaneIncarnation(priorHud)) {
+        throw new Error('failed to replace the exact initial leader-owned HUD pane');
+      }
     }
 
     // Enable mouse scrolling so agent output panes can be scrolled with the
@@ -2411,13 +2474,7 @@ export function createTeamSession(
       }),
       leaderPaneId,
       hudPaneId,
-      hudPaneIncarnation: hudPaneId
-        ? (() => {
-          const authority = rollbackPaneAuthorities.get(hudPaneId);
-          if (!authority) throw new Error(`missing HUD pane incarnation: ${hudPaneId}`);
-          return { paneId: authority.paneId, panePid: authority.panePid };
-        })()
-        : null,
+      hudPaneIncarnation,
       resizeHookName,
       resizeHookTarget,
       teamPaneOwnerId,
@@ -2506,7 +2563,7 @@ export function restoreStandaloneHudPane(
     );
     if (!hasFreshExistingHudAuthority()) return null;
     if (nativeWindows) {
-      runTmux(buildHudResizeArgs(existingHudPaneId));
+      if (!resizeTeamPaneIncarnation(existingHudPaneIncarnation, HUD_TMUX_TEAM_HEIGHT_LINES)) return null;
     } else {
       if (!hasFreshExistingHudAuthority()) return null;
       runTmux(buildScheduleDelayedHudResizeArgs(existingHudPaneId, {
@@ -2573,8 +2630,7 @@ export function restoreStandaloneHudPane(
   const paneId = paneAuthority.paneId;
 
   if (nativeWindows) {
-    if (!hasFreshNewHudAuthority()) return rollbackAndFail();
-    runTmux(buildHudResizeArgs(paneId));
+    if (!hasFreshNewHudAuthority() || !resizeTeamPaneIncarnation(paneAuthority, HUD_TMUX_TEAM_HEIGHT_LINES)) return rollbackAndFail();
   } else {
     if (!hasFreshNewHudAuthority()) return rollbackAndFail();
     runTmux(buildScheduleDelayedHudResizeArgs(paneId, {

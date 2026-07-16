@@ -1320,7 +1320,9 @@ export function verifyHudWatchPaneAuthority(paneId: string, execTmuxSync: TmuxEx
 export function rollbackHudWatchPaneAuthority(paneId: string, execTmuxSync: TmuxExecSync = defaultExecTmuxSync): boolean {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
   if (!canonicalPaneId || !hasHudSplitAuthority(canonicalPaneId, execTmuxSync)) return false;
-  const killed = killTmuxPane(canonicalPaneId, execTmuxSync);
+  const authority = hudSplitAuthorities.get(canonicalPaneId);
+  if (!authority || !hasHudSplitAuthority(canonicalPaneId, execTmuxSync)) return false;
+  const killed = killTmuxPaneIfCurrent(canonicalPaneId, authority.panePid, execTmuxSync);
   if (killed) hudSplitAuthorities.delete(canonicalPaneId);
   return killed;
 }
@@ -1396,6 +1398,56 @@ export function createHudWatchPane(
     if (paneId) rollbackHudWatchPaneAuthority(paneId, execTmuxSync);
     return null;
   }
+}
+
+/** Executes a pane mutation only while the exact target incarnation remains live. */
+function mutateTmuxPaneIfCurrent(
+  paneId: string,
+  expectedPanePid: string,
+  mutation: string,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId || !/^[1-9][0-9]*$/.test(expectedPanePid)) return false;
+  const marker = `__omx_hud_mutation_${randomUUID()}`;
+  try {
+    const output = execTmuxSync([
+      'if-shell', '-F', '-t', canonicalPaneId,
+      buildHudHookIncarnationCondition(canonicalPaneId, expectedPanePid),
+      `${mutation} \\; display-message -p ${marker}`,
+      `display-message -p __omx_hud_mutation_failed_${marker}`,
+    ]);
+    return parseExactTmuxAuthorityScalar(output) === marker;
+  } catch {
+    return false;
+  }
+}
+
+/** Kills a pane only while its exact live incarnation remains the target. */
+export function killTmuxPaneIfCurrent(
+  paneId: string,
+  expectedPanePid: string,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  return canonicalPaneId
+    ? mutateTmuxPaneIfCurrent(canonicalPaneId, expectedPanePid, `kill-pane -t ${canonicalPaneId}`, execTmuxSync)
+    : false;
+}
+
+/** Resizes a pane only while its exact live incarnation remains the target. */
+export function resizeTmuxPaneIfCurrent(
+  paneId: string,
+  expectedPanePid: string,
+  heightLines: number,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId) return false;
+  const height = Number.isFinite(heightLines) && heightLines > 0
+    ? Math.floor(heightLines)
+    : HUD_TMUX_HEIGHT_LINES;
+  return mutateTmuxPaneIfCurrent(canonicalPaneId, expectedPanePid, `resize-pane -t ${canonicalPaneId} -y ${height}`, execTmuxSync);
 }
 
 export function killTmuxPane(
