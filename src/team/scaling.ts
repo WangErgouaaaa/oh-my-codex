@@ -186,13 +186,15 @@ function readGlobalTmuxPaneIdSnapshot(): Set<string> | null {
   const lines = parseExactTmuxAuthorityLines(result.stdout || '');
   if (!lines) return null;
   const paneIds = new Set<string>();
+  const seenPaneIds = new Set<string>();
   for (const line of lines) {
     const match = /^(\S+) ([01]) ([0-9]+)$/.exec(line);
     const paneId = parseCanonicalTmuxPaneId(match?.[1]);
-    if (!match || !paneId || paneId !== match[1] || !Number.isSafeInteger(Number(match[3]))) return null;
+    if (!match || !paneId || paneId !== match[1] || !Number.isSafeInteger(Number(match[3])) || seenPaneIds.has(paneId)) return null;
+    seenPaneIds.add(paneId);
     // remain-on-exit panes are not live authority. Their PID may legitimately be 0.
     if (match[2] === '1') continue;
-    if (!/^[1-9][0-9]*$/.test(match[3]!) || paneIds.has(paneId)) return null;
+    if (!/^[1-9][0-9]*$/.test(match[3]!)) return null;
     paneIds.add(paneId);
   }
   return paneIds;
@@ -284,6 +286,7 @@ function isFreshOwnedTeamPane(
 type VerifiedScaleSplitPane = {
   paneId: string;
   panePid: string;
+  sessionId: string;
   sessionName: string;
   sessionId: string;
   ownerId: string;
@@ -338,6 +341,12 @@ function readTmuxOptionExactly(option: string): string | null {
   return parseExactTmuxAuthorityScalar(result.stdout || '');
 }
 
+function readScaleSessionId(paneId: string): string | null {
+  const result = spawnSync('tmux', ['display-message', '-p', '-t', paneId, '#{session_id}'], { encoding: 'utf-8' });
+  if (result.status !== 0 || result.error) return null;
+  const sessionId = parseExactTmuxAuthorityScalar(result.stdout || '');
+  return sessionId && /^\$[0-9]+$/.test(sessionId) ? sessionId : null;
+}
 function readScalePaneIncarnation(paneId: string): { paneDead: boolean; panePid: string; sessionId: string } | null {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
   if (!canonicalPaneId || canonicalPaneId !== paneId) return null;
@@ -345,16 +354,15 @@ function readScalePaneIncarnation(paneId: string): { paneDead: boolean; panePid:
   if (result.status !== 0 || result.error) return null;
   const lines = parseExactTmuxAuthorityLines(result.stdout || '');
   if (!lines) return null;
-  const seenLive = new Set<string>();
+  const seenPaneIds = new Set<string>();
   let incarnation: { paneDead: boolean; panePid: string; sessionId: string } | null = null;
   for (const line of lines) {
     const match = /^(\S+) ([01]) ([0-9]+)$/.exec(line);
     const observedPaneId = parseCanonicalTmuxPaneId(match?.[1]);
-    if (!match || !observedPaneId || observedPaneId !== match[1] || !Number.isSafeInteger(Number(match[3]))) return null;
-    // A canonical dead row is not a live authority record; PID 0 is expected.
+    if (!match || !observedPaneId || observedPaneId !== match[1] || !Number.isSafeInteger(Number(match[3])) || seenPaneIds.has(observedPaneId)) return null;
+    seenPaneIds.add(observedPaneId);
     if (match[2] === '1') continue;
-    if (!/^[1-9][0-9]*$/.test(match[3]!) || seenLive.has(observedPaneId)) return null;
-    seenLive.add(observedPaneId);
+    if (!/^[1-9][0-9]*$/.test(match[3]!)) return null;
     if (observedPaneId === canonicalPaneId) {
       const sessionId = readScaleSessionId(canonicalPaneId);
       if (!sessionId) return null;
@@ -414,7 +422,7 @@ function buildScaleSplitRollbackCondition(authority: VerifiedScaleSplitPane): st
   const ownerCondition = authority.ownerTagged
     ? `#{==:#{@omx_team_pane_owner_id},${authority.ownerId}}`
     : '1';
-  return `#{&&:#{==:#{pane_id},${authority.paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${authority.panePid}},#{&&:#{==:#{session_id},${authority.sessionId}},#{&&:${ownerCondition},#{&&:#{==:${authority.ownerOption},${authority.ownerProof}},#{m:*${authority.operationMarker}*,#{pane_start_command}}}}}}}}`;
+  return `#{&&:#{==:#{pane_id},${authority.paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${authority.panePid}},#{&&:#{==:#{session_id},${authority.sessionId}},#{&&:${ownerCondition},#{&&:#{==:#{${authority.ownerOption}},${authority.ownerProof}},#{m:*${authority.operationMarker}*,#{pane_start_command}}}}}}}}`;
 }
 
 function killScaleSplitPaneAtomically(authority: VerifiedScaleSplitPane): boolean {

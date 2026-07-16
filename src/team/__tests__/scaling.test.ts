@@ -239,7 +239,7 @@ async function writeSuccessfulScaleUpTmuxStub(
       '  set-option)',
       '    case "${2:-}" in',
       '      -g) printf "%s" "${4:-}" > "$0.option-${3:-}" ;;',
-      '      -p) : > "$0.owner-tagged" ;;',
+      '      -p) if [ "${3:-}" = "-t" ] && [ "${5:-}" = "@omx_team_pane_owner_id" ]; then printf "%s" "${6:-}" > "$0.pane-owner-${4:-}"; : > "$0.owner-tagged"; fi ;;',
       '    esac',
       '    ;;',
       '  show-options)',
@@ -307,6 +307,7 @@ function tmuxAuthorityListPanesCase(
   return [
     '  set-option)',
     '    if [ "${2:-}" = "-g" ] && [ -n "${3:-}" ]; then printf "%s" "${4:-}" > "$0.global-option-${3:-}"; fi',
+    '    if [ "${2:-}" = "-p" ] && [ "${3:-}" = "-t" ] && [ "${5:-}" = "@omx_team_pane_owner_id" ]; then printf "%s" "${6:-}" > "$0.pane-owner-${4:-}"; : > "$0.owner-tagged"; fi',
     '    ;;',
     '  show-options)',
     '    if [ "${2:-}" = "-g" ] && [ "${3:-}" = "-v" ]; then cat "$0.global-option-${4:-}"; printf "\\n"; else exit 1; fi',
@@ -314,12 +315,12 @@ function tmuxAuthorityListPanesCase(
     '    ;;',
     '  list-panes)',
     '    case "${2:-}" in',
-    `      -a) case "\${4:-}" in '#{pane_id}\t#{pane_start_command}') if [ "${options.recycleOperationMarker === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf '%s\\tbash\\n' '%31'; elif [ -f "$0.created-pane-commands" ]; then printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\\tbash\\n' "$pane"; done; while IFS="$(printf '\\t')" read -r pane command; do printf '%s\\t%s\\n' "$pane" "$command"; done < "$0.created-pane-commands"; fi ;; '#{pane_id} #{pane_dead} #{pane_pid}') if [ "${options.malformedLivenessBatch === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf '%s 0 42424\\n%%4294967296 0 42424\\n' '${paneIds[0]}'; else ${createdLiveness} printf "${staticLivenessFormat}"; if [ -f "$0.created-pane-pids" ]; then while IFS="$(printf '\\t')" read -r pane pid; do if [ "${deadAfterInitialLive ? '$probe_count' : '0'}" -ge 5 ]; then printf '%s 1 %s\\n' "$pane" "$pid"; else ${options.recyclePidAtLivenessProbe ? `if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe} ]; then pid=$((pid + 1)); fi;` : ''} printf '%s 0 %s\\n' "$pane" "$pid"; fi; done < "$0.created-pane-pids"; fi; fi ;; '#{pane_id} #{pane_dead}') printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s 0\\n' "$pane"; done; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do printf '%s 0\\n' "$pane"; done < "$0.created-panes"; fi ;; *) if [ "${options.malformedFirstPostSplitSnapshot === true ? '1' : '0'}" = 1 ] && [ -f "$0.created-panes" ] && [ ! -f "$0.malformed-post-snapshot" ]; then : > "$0.malformed-post-snapshot"; printf 'malformed\\n'; else printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; fi ;; esac ;;`,
+    `      -a) case "\${4:-}" in '#{pane_id}\t#{pane_start_command}') if [ "${options.recycleOperationMarker === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf '%s\tbash\n' '%31'; elif [ -f "$0.created-pane-commands" ]; then printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\tbash\n' "$pane"; done; while IFS="$(printf '\t')" read -r pane command; do printf '%s\t%s\n' "$pane" "$command"; done < "$0.created-pane-commands"; fi ;; '#{pane_id} #{pane_dead} #{pane_pid}') if [ "${options.malformedLivenessBatch === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf "${staticLivenessFormat}%s 1 0\n" '${paneIds[0]}'; else ${createdLiveness} printf "${staticLivenessFormat}"; if [ -f "$0.created-pane-pids" ]; then while IFS="$(printf '\t')" read -r pane pid; do if [ "${deadAfterInitialLive ? '$probe_count' : '0'}" -ge 5 ]; then printf '%s 1 %s\n' "$pane" "$pid"; else ${options.recyclePidAtLivenessProbe ? `if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe} ]; then pid=$((pid + 1)); fi;` : ''} printf '%s 0 %s\n' "$pane" "$pid"; fi; done < "$0.created-pane-pids"; fi; fi ;; '#{pane_id} #{pane_dead}') printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s 0\n' "$pane"; done; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do printf '%s 0\n' "$pane"; done < "$0.created-panes"; fi ;; *) if [ "${options.malformedFirstPostSplitSnapshot === true ? '1' : '0'}" = 1 ] && [ -f "$0.created-panes" ] && [ ! -f "$0.malformed-post-snapshot" ]; then : > "$0.malformed-post-snapshot"; printf 'malformed\n'; else printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; fi ;; esac ;;`,
 
     '      -t)',
     '        session="${3:-}"',
     '        owner="team:${session#omx-team-}"',
-    `        case "\${5:-}" in '#{pane_id}') printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi ;; '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}') { printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; } | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\\tbash\\tbash\\n' "$pane"; done ;; '#{pane_dead} #{pane_pid}') printf '0 42424\\n' ;; *) printf "${ownedPaneFormat}" ${ownerArgs}; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do printf '%s\\t%s\\n' "$pane" "$owner"; done < "$0.created-panes"; fi ;; esac`,
+    `        case "\${5:-}" in '#{pane_id}') printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi ;; '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}') { printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; } | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\tbash\tbash\n' "$pane"; done ;; '#{pane_dead} #{pane_pid}') printf '0 42424\n' ;; *) printf "${ownedPaneFormat}" ${ownerArgs}; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do owner_value=''; if [ -f "$0.pane-owner-$pane" ]; then IFS= read -r owner_value < "$0.pane-owner-$pane"; fi; printf '%s\t%s\n' "$pane" "$owner_value"; done < "$0.created-panes"; fi ;; esac`,
     '        ;;',
     `      *) echo "${fallbackOutput}" ;;`,
     '    esac',
@@ -887,7 +888,7 @@ esac
         assert.deepEqual(result, { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' }, testCase.name);
         assert.deepEqual(await readScaleUpTaskPayloads(teamName, cwd), [], testCase.name);
         const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
-        assert.ok(commands.includes('list-panes -a -F #{pane_id}'), testCase.name);
+        assert.ok(commands.includes('list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'), testCase.name);
         assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-')), testCase.name);
         assert.equal(commands.some((command) => /^(split-window|set-option|send-keys|kill-pane)\b/.test(command)), false, testCase.name);
       }
@@ -1007,9 +1008,8 @@ esac
         assert.equal(commands.some((command) => /^kill-pane\b/.test(command)), false, testCase.name);
         assert.equal(
           commands.some((command) => command !== '-V'
-            && command !== 'list-panes -a -F #{pane_id}'
-            && command !== 'list-panes -a -F #{pane_id}\t#{pane_start_command}'
             && command !== 'list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'
+            && command !== 'list-panes -a -F #{pane_id}\t#{pane_start_command}'
             && !command.startsWith('list-panes -t omx-team-')
             && !command.startsWith('set-option -g @omx_scale_split_owner_nonce_')
             && !command.startsWith('show-options -g -v @omx_scale_split_owner_nonce_')
@@ -1589,7 +1589,7 @@ printf '%s\\n' "$@" > '${capturePath}'
       );
       assert.equal(result.ok, true);
       const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
-      assert.ok(commands.filter((command) => command === 'list-panes -a -F #{pane_id}').length >= 4);
+      assert.ok(commands.filter((command) => command === 'list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}').length >= 4);
       assert.ok(commands.some((command) => command === 'list-panes -a -F #{pane_id}\t#{pane_start_command}'));
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -1626,7 +1626,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     }
   });
 
-  it('rejects an atomic liveness batch containing an overflow non-target pane ID', async () => {
+  it('rejects an atomic liveness batch with a duplicate dead authority row', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-malformed-liveness-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-malformed-liveness-bin-'));
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
@@ -1689,7 +1689,8 @@ printf '%s\\n' "$@" > '${capturePath}'
         assert.equal(config?.workers.length, 1, testCase.phase);
         const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
         assert.equal(commands.some((command) => command.startsWith('kill-pane -t %31')), false, commands.join('\n'));
-        assert.equal(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{==:#{pane_id},%31}') && command.includes('#{==:#{pane_dead},0}') && command.includes('#{==:#{pane_pid},1000000031}') && command.includes('send-keys -t %31') && command.includes('display-message -p "__omx_send_authority_rejected__"')), testCase.expectDispatch, commands.join('\n'));
+        assert.equal(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{==:#{pane_id},%31}') && command.includes('#{==:#{pane_dead},0}') && command.includes('#{==:#{pane_pid},1000000031}') && command.includes('#{==:#{session_id},$1}') && command.includes('send-keys -t %31') && command.includes('display-message -p "__omx_send_authority_rejected__"')), testCase.expectDispatch, commands.join('\n'));
+        assert.ok(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{m:*') && command.includes('kill-pane -t %31 \\; display-message -p __OMX_PANE_MUTATION_')), commands.join('\n'));
         assert.equal(
           existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'workers', 'worker-2', 'identity.json')),
           false,
@@ -3162,7 +3163,7 @@ esac
         assert.deepEqual(result, { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' }, testCase.name);
         assert.equal((await readTeamConfig(teamName, cwd))?.workers.length, 2, testCase.name);
         const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
-        assert.ok(commands.includes('list-panes -a -F #{pane_id}'), testCase.name);
+        assert.ok(commands.includes('list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'), testCase.name);
         assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-')), testCase.name);
         assert.equal(commands.some((command) => /^(kill-pane|send-keys|set-option)\b/.test(command)), false, testCase.name);
       }

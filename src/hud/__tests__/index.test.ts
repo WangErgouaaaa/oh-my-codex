@@ -684,7 +684,7 @@ if [[ "$1" == "list-panes" ]]; then
   printf '%s\n' "%3	node	exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch"
   exit 0
 fi
-if [[ "$*" =~ (__omx_hud_mutation_[0-9a-f-]+) ]]; then
+if [[ "$1" == "if-shell" && "$*" =~ (__omx_hud_mutation_[0-9a-f-]+) ]]; then
   printf '%s\n' "\${BASH_REMATCH[1]}"
   exit 0
 fi
@@ -735,7 +735,7 @@ exit 0
       await rm(tmp, { recursive: true, force: true });
     }
   });
-  it('fails closed when an enumerated HUD pane is dead before an existing-pane mutation', async () => {
+  it('fails closed when an enumerated HUD pane is dead or duplicated before an existing-pane mutation', async () => {
     const tmp = await mkdtemp(join(tmpdir(), 'omx-hud-tmux-dead-pane-test-'));
     const logPath = join(tmp, 'tmux.log');
     const fakeBin = join(tmp, 'bin');
@@ -744,7 +744,7 @@ exit 0
     await writeFile(tmuxPath, `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
 if [[ "$1" == "list-panes" ]]; then
-  if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then printf '%%1 0 101\n%%2 1 0\n%%3 1 0\n'; exit 0; fi
+  if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then printf '%%1 0 101\n%%2 1 0\n%%3 1 0\n%%3 1 0\n'; exit 0; fi
   if [[ "$*" == *'#{pane_id} #{pane_dead}'* ]]; then printf '%%1 0\n%%2 0\n%%3 0\n'; exit 0; fi
   if [[ "$*" == *'-F #{pane_id}' ]]; then printf '%%1\n%%2\n%%3\n'; exit 0; fi
   printf '%%1\tzsh\tzsh\n'
@@ -807,7 +807,7 @@ if [[ "$1" == "list-panes" ]]; then
   printf '%s\\n' "%2	node	exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch"
   exit 0
 fi
-if [[ "$*" =~ (__omx_hud_mutation_[0-9a-f-]+) ]]; then
+if [[ "$1" == "if-shell" && "$*" =~ (__omx_hud_mutation_[0-9a-f-]+) ]]; then
   printf '%s\n' "\${BASH_REMATCH[1]}"
   exit 0
 fi

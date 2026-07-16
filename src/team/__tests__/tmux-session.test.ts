@@ -6007,7 +6007,12 @@ exit 0
 
             const tmuxLog = await readFile(logPath, 'utf-8');
             const workerRollbackCalls = tmuxLog.match(/kill-pane -t %2/g) ?? [];
-            assert.equal(workerRollbackCalls.length, scenario.name === 'duplicate worker' ? 0 : 1, scenario.name);
+            assert.equal(workerRollbackCalls.length, 1, `${scenario.name}: the exact operation-created worker is reclaimed`);
+            assert.match(tmuxLog, /if-shell -F -t %2 #\{&&:#\{==:#\{pane_id\},%2\}/);
+            assert.doesNotMatch(tmuxLog, /if-shell -F -t %1 /);
+            if (scenario.preExistingPaneId) {
+              assert.doesNotMatch(tmuxLog, new RegExp(`if-shell -F -t ${scenario.preExistingPaneId} `));
+            }
             assert.doesNotMatch(tmuxLog, /kill-pane -t %1/);
             if (scenario.preExistingPaneId) {
               assert.doesNotMatch(tmuxLog, new RegExp(`kill-pane -t ${scenario.preExistingPaneId}`));
@@ -6216,31 +6221,29 @@ esac
       name: string;
       probe: string;
       splitOutput?: string;
-      expectRollback?: boolean;
       recycleAfterRecovery?: boolean;
       unsafePaneId?: string;
     }> = [
-      { name: 'same-id respawn after recovery', probe: `printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"`, recycleAfterRecovery: true, expectRollback: false },
-      { name: 'replayed exact command with changed pid', probe: `count=0; if [ -f "$probe_state" ]; then count=$(cat "$probe_state"); fi; count=$((count + 1)); printf '%s' "$count" > "$probe_state"; if [ "$count" -lt 4 ]; then printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"; else printf "%%11 0 1000000011\\n%%44 0 2000000044\\n"; fi`, expectRollback: false },
-      { name: 'missing exact id', probe: `printf "%%11 0 1000000011\\n"`, expectRollback: false },
-      { name: 'similar id only', probe: `printf "%%11 0 1000000011\\n%%440 0 1000000440\\n"`, expectRollback: false },
-      { name: 'leading-zero observed id', probe: `printf "%%11 0 1000000011\\n%%044 0 1000000044\\n"`, expectRollback: false },
-      { name: '32-bit overflow observed id', probe: `printf "%%11 0 1000000011\\n%%4294967296 0 1000000044\\n"`, expectRollback: false },
-      { name: '64-bit overflow observed id', probe: `printf "%%11 0 1000000011\\n%%18446744073709551616 0 1000000044\\n"`, expectRollback: false },
-      { name: 'dead exact id', probe: `printf "%%11 0 1000000011\\n%%44 1 1000000044\\n"`, expectRollback: false },
-      { name: 'nonliteral status', probe: `printf "%%11 0 1000000011\\n%%44 false 1000000044\\n"`, expectRollback: false },
-      { name: 'missing status', probe: `printf "%%11 0 1000000011\\n%%44\\n"`, expectRollback: false },
-      { name: 'extra status token', probe: `printf "%%11 0 1000000011\\n%%44 0 1000000044 extra\\n"`, expectRollback: false },
-      { name: 'query failure', probe: 'exit 1', expectRollback: false },
+      { name: 'same-id respawn after recovery', probe: `printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"`, recycleAfterRecovery: true },
+      { name: 'replayed exact command with changed pid', probe: `count=0; if [ -f "$probe_state" ]; then count=$(cat "$probe_state"); fi; count=$((count + 1)); printf '%s' "$count" > "$probe_state"; if [ "$count" -lt 4 ]; then printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"; else printf "%%11 0 1000000011\\n%%44 0 2000000044\\n"; fi` },
+      { name: 'missing exact id', probe: `printf "%%11 0 1000000011\\n"` },
+      { name: 'similar id only', probe: `printf "%%11 0 1000000011\\n%%440 0 1000000440\\n"` },
+      { name: 'leading-zero observed id', probe: `printf "%%11 0 1000000011\\n%%044 0 1000000044\\n"` },
+      { name: '32-bit overflow observed id', probe: `printf "%%11 0 1000000011\\n%%4294967296 0 1000000044\\n"` },
+      { name: '64-bit overflow observed id', probe: `printf "%%11 0 1000000011\\n%%18446744073709551616 0 1000000044\\n"` },
+      { name: 'dead exact id', probe: `printf "%%11 0 1000000011\\n%%44 1 1000000044\\n"` },
+      { name: 'nonliteral status', probe: `printf "%%11 0 1000000011\\n%%44 false 1000000044\\n"` },
+      { name: 'missing status', probe: `printf "%%11 0 1000000011\\n%%44\\n"` },
+      { name: 'extra status token', probe: `printf "%%11 0 1000000011\\n%%44 0 1000000044 extra\\n"` },
+      { name: 'query failure', probe: 'exit 1' },
       {
         name: 'live then dead during stabilization',
         probe: `count=0; if [ -f "$probe_state" ]; then count=$(cat "$probe_state"); fi; count=$((count + 1)); printf '%s' "$count" > "$probe_state"; if [ "$count" -eq 1 ]; then printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"; else printf "%%11 0 1000000011\\n%%44 1 1000000044\\n"; fi`,
-        expectRollback: false,
       },
-      { name: 'extra split output', probe: ':', splitOutput: `printf "%%44\\nwarning\\n"`, expectRollback: false },
-      { name: 'leading-zero alias', probe: `printf "%%11 0 1000000011\\n%%1 0 1000000001\\n"`, splitOutput: `echo "%01"`, expectRollback: false },
-      { name: '32-bit usize overflow', probe: `printf "%%11 0 1000000011\\n"`, splitOutput: `echo "%4294967296"`, expectRollback: false },
-      { name: 'usize overflow', probe: `printf "%%11 0 1000000011\\n"`, splitOutput: `echo "%18446744073709551616"`, expectRollback: false },
+      { name: 'extra split output', probe: ':', splitOutput: `printf "%%44\\nwarning\\n"` },
+      { name: 'leading-zero alias', probe: `printf "%%11 0 1000000011\\n%%1 0 1000000001\\n"`, splitOutput: `echo "%01"` },
+      { name: '32-bit usize overflow', probe: `printf "%%11 0 1000000011\\n"`, splitOutput: `echo "%4294967296"` },
+      { name: 'usize overflow', probe: `printf "%%11 0 1000000011\\n"`, splitOutput: `echo "%18446744073709551616"` },
     ];
 
     try {
@@ -6335,9 +6338,12 @@ esac
             const tmuxLog = await readFile(logPath, 'utf-8');
             const candidatePaneId = '%44';
             const escapedCandidatePaneId = escapeRegExp(candidatePaneId);
-            const rollbackCalls = tmuxLog.match(new RegExp(`kill-pane -t ${escapedCandidatePaneId}`, 'g')) ?? [];
-            assert.equal(rollbackCalls.length, scenario.expectRollback === false ? 0 : 1, scenario.name);
+            const rollbackTransactions = tmuxLog.match(new RegExp(`if-shell -F -t ${escapedCandidatePaneId} `, 'g')) ?? [];
+            const directRollbackCalls = tmuxLog.match(new RegExp(`^kill-pane -t ${escapedCandidatePaneId}(?: |$)`, 'gm')) ?? [];
+            assert.equal(directRollbackCalls.length, 0, `${scenario.name}: no unguarded candidate kill runs`);
             if (scenario.recycleAfterRecovery) {
+              assert.equal(rollbackTransactions.length, 1, 'the stale candidate is considered only by the final guarded rollback transaction');
+              assert.match(tmuxLog, new RegExp(`if-shell -F -t ${escapedCandidatePaneId} #\\{&&:#\\{==:#\\{pane_id\\},${escapedCandidatePaneId}\\}`));
               const markerProbeCount = await readFile(join(dirname(logPath), 'marker-probe-count'), 'utf-8');
               assert.equal(Number(markerProbeCount), 4, 'candidate recovery reaches PID rejection before final authority and rollback probes');
             }
