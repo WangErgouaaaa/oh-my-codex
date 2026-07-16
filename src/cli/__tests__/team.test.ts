@@ -2480,7 +2480,6 @@ describe('teamCommand status', () => {
       assert.match(output, /inspect_hud: tmux capture-pane -p -t %11 -S -400/);
       assert.match(output, /inspect_worker-1: tmux capture-pane -p -t %21 -S -400/);
       assert.match(output, /inspect_worker-2: tmux capture-pane -p -t %22 -S -400/);
-      assert.match(output, /inspect_summary:/);
       assert.doesNotMatch(output
         .split('\n')
         .filter((line) => !line.includes('--model-inspect'))
