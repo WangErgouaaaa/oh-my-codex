@@ -163,11 +163,6 @@ function canonicalizePersistedTeamPaneIds(config: TeamConfig): PersistedTeamPane
   return { leaderPaneId, hudPaneId, paneIds, workerPaneIds };
 }
 
-function parseFreshTmuxPaneId(rawOutput: string | null | undefined): string | null {
-  const paneId = typeof rawOutput === 'string' ? parseExactTmuxAuthorityScalar(rawOutput) : null;
-  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
-  return canonicalPaneId === paneId ? canonicalPaneId : null;
-}
 
 function deriveSingleScaleSplitPaneId(
   before: ReadonlySet<string>,
