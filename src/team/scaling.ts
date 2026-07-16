@@ -30,7 +30,7 @@ import {
   isNativeWindows,
   type TeamWorkerCli,
 } from './tmux-session.js';
-import { execFileSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import {
   teamReadConfig as readTeamConfig,
   teamSaveConfig as saveTeamConfig,
@@ -180,18 +180,29 @@ function deriveSingleScaleSplitPaneId(
 
 
 function readGlobalTmuxPaneIdSnapshot(): Set<string> | null {
-  const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf-8' });
+  const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}'], { encoding: 'utf-8' });
   if (result.status !== 0 || result.error) return null;
 
   const lines = parseExactTmuxAuthorityLines(result.stdout || '');
   if (!lines) return null;
   const paneIds = new Set<string>();
   for (const line of lines) {
-    const paneId = parseCanonicalTmuxPaneId(line);
-    if (!paneId || paneId !== line || paneIds.has(paneId)) return null;
+    const match = /^(\S+) ([01]) ([0-9]+)$/.exec(line);
+    const paneId = parseCanonicalTmuxPaneId(match?.[1]);
+    if (!match || !paneId || paneId !== match[1] || !Number.isSafeInteger(Number(match[3]))) return null;
+    // remain-on-exit panes are not live authority. Their PID may legitimately be 0.
+    if (match[2] === '1') continue;
+    if (!/^[1-9][0-9]*$/.test(match[3]!) || paneIds.has(paneId)) return null;
     paneIds.add(paneId);
   }
   return paneIds;
+}
+
+function readScaleSessionId(paneId: string): string | null {
+  const result = spawnSync('tmux', ['display-message', '-p', '-t', paneId, '#{session_id}'], { encoding: 'utf-8' });
+  if (result.status !== 0 || result.error) return null;
+  const sessionId = parseExactTmuxAuthorityScalar(result.stdout || '');
+  return sessionId && /^\$[0-9]+$/.test(sessionId) ? sessionId : null;
 }
 
 type TeamPaneOwnerSnapshot = Map<string, string>;
@@ -199,6 +210,8 @@ type TeamPaneOwnerSnapshot = Map<string, string>;
 function readTeamPaneOwnerSnapshot(sessionName: string): TeamPaneOwnerSnapshot | null {
   const targetSessionName = sessionName.trim();
   if (!targetSessionName) return null;
+  const livePaneIds = readGlobalTmuxPaneIdSnapshot();
+  if (!livePaneIds) return null;
 
   const result = spawnSync(
     'tmux',
@@ -214,7 +227,10 @@ function readTeamPaneOwnerSnapshot(sessionName: string): TeamPaneOwnerSnapshot |
     const fields = line.split('\t');
     if (fields.length !== 2) return null;
     const paneId = parseCanonicalTmuxPaneId(fields[0]);
-    if (!paneId || paneId !== fields[0] || paneOwners.has(paneId)) return null;
+    if (!paneId || paneId !== fields[0]) return null;
+    // The session view can retain canonical remain-on-exit rows. They are not authority.
+    if (!livePaneIds.has(paneId)) continue;
+    if (paneOwners.has(paneId)) return null;
     paneOwners.set(paneId, fields[1]!);
   }
   return paneOwners;
@@ -269,6 +285,7 @@ type VerifiedScaleSplitPane = {
   paneId: string;
   panePid: string;
   sessionName: string;
+  sessionId: string;
   ownerId: string;
   ownerOption: string;
   ownerProof: string;
@@ -293,18 +310,22 @@ function hasScaleSplitOperationMarker(command: string, marker: string): boolean 
 }
 
 function findScaleSplitOperationMarkerPaneId(marker: string): string | null {
+  const livePaneIds = readGlobalTmuxPaneIdSnapshot();
+  if (!livePaneIds) return null;
   const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_start_command}'], { encoding: 'utf-8' });
   if (result.status !== 0 || result.error) return null;
   const lines = parseExactTmuxAuthorityLines(result.stdout || '');
   if (!lines) return null;
   let candidate: string | null = null;
-  const seen = new Set<string>();
+  const seenLive = new Set<string>();
   for (const line of lines) {
     const fields = line.split('\t');
     if (fields.length !== 2) return null;
     const paneId = parseCanonicalTmuxPaneId(fields[0]);
-    if (!paneId || paneId !== fields[0] || seen.has(paneId)) return null;
-    seen.add(paneId);
+    if (!paneId || paneId !== fields[0]) return null;
+    if (!livePaneIds.has(paneId)) continue;
+    if (seenLive.has(paneId)) return null;
+    seenLive.add(paneId);
     if (!hasScaleSplitOperationMarker(fields[1] ?? '', marker)) continue;
     if (candidate) return null;
     candidate = paneId;
@@ -317,21 +338,28 @@ function readTmuxOptionExactly(option: string): string | null {
   return parseExactTmuxAuthorityScalar(result.stdout || '');
 }
 
-function readScalePaneIncarnation(paneId: string): { paneDead: boolean; panePid: string } | null {
+function readScalePaneIncarnation(paneId: string): { paneDead: boolean; panePid: string; sessionId: string } | null {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
   if (!canonicalPaneId || canonicalPaneId !== paneId) return null;
   const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}'], { encoding: 'utf-8' });
   if (result.status !== 0 || result.error) return null;
   const lines = parseExactTmuxAuthorityLines(result.stdout || '');
   if (!lines) return null;
-  const seen = new Set<string>();
-  let incarnation: { paneDead: boolean; panePid: string } | null = null;
+  const seenLive = new Set<string>();
+  let incarnation: { paneDead: boolean; panePid: string; sessionId: string } | null = null;
   for (const line of lines) {
-    const match = /^(\S+) ([01]) ([1-9][0-9]*)$/.exec(line);
+    const match = /^(\S+) ([01]) ([0-9]+)$/.exec(line);
     const observedPaneId = parseCanonicalTmuxPaneId(match?.[1]);
-    if (!match || !observedPaneId || observedPaneId !== match[1] || seen.has(observedPaneId) || !Number.isSafeInteger(Number(match[3]))) return null;
-    seen.add(observedPaneId);
-    if (observedPaneId === canonicalPaneId) incarnation = { paneDead: match[2] === '1', panePid: match[3]! };
+    if (!match || !observedPaneId || observedPaneId !== match[1] || !Number.isSafeInteger(Number(match[3]))) return null;
+    // A canonical dead row is not a live authority record; PID 0 is expected.
+    if (match[2] === '1') continue;
+    if (!/^[1-9][0-9]*$/.test(match[3]!) || seenLive.has(observedPaneId)) return null;
+    seenLive.add(observedPaneId);
+    if (observedPaneId === canonicalPaneId) {
+      const sessionId = readScaleSessionId(canonicalPaneId);
+      if (!sessionId) return null;
+      incarnation = { paneDead: false, panePid: match[3]!, sessionId };
+    }
   }
   return incarnation;
 }
@@ -353,6 +381,7 @@ function hasScaleSplitRollbackAuthority(authority: VerifiedScaleSplitPane): bool
   const paneId = parseCanonicalTmuxPaneId(authority.paneId);
   const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
   const sessionPaneOwners = readTeamPaneOwnerSnapshot(authority.sessionName);
+  const incarnation = paneId ? readScalePaneIncarnation(paneId) : null;
   return Boolean(
     paneId
       && paneId === authority.paneId
@@ -360,7 +389,8 @@ function hasScaleSplitRollbackAuthority(authority: VerifiedScaleSplitPane): bool
       && globalPaneIds?.has(paneId)
       && sessionPaneOwners?.has(paneId)
       && isConsistentTeamPaneSnapshot(globalPaneIds, sessionPaneOwners)
-      && readScalePaneIncarnation(paneId)?.panePid === authority.panePid
+      && incarnation?.panePid === authority.panePid
+      && incarnation.sessionId === authority.sessionId
       && readTmuxOptionExactly(authority.ownerOption) === authority.ownerProof,
   );
 }
@@ -369,6 +399,35 @@ function revalidateScaleSplitAuthority(authority: VerifiedScaleSplitPane): boole
   if (!hasScaleSplitRollbackAuthority(authority) || !isScalePaneLiveInStrictGlobalProbe(authority.paneId, authority.panePid)) return false;
   const owners = readTeamPaneOwnerSnapshot(authority.sessionName);
   return Boolean(!authority.ownerTagged || owners?.get(authority.paneId) === authority.ownerId);
+}
+
+function buildScaleSplitRollbackCondition(authority: VerifiedScaleSplitPane): string | null {
+  if (
+    parseCanonicalTmuxPaneId(authority.paneId) !== authority.paneId
+    || !/^[1-9][0-9]*$/.test(authority.panePid)
+    || !/^\$[0-9]+$/.test(authority.sessionId)
+    || !/^team:[A-Za-z0-9_-]+$/.test(authority.ownerId)
+    || !/^@omx_scale_split_owner_nonce_[a-f0-9]{32}$/.test(authority.ownerOption)
+    || !/^(?:pending:)?(?:%[1-9][0-9]*:)?scale-split:[0-9a-f-]{36}$/.test(authority.ownerProof)
+    || !/^[0-9a-f-]{36}$/.test(authority.operationMarker)
+  ) return null;
+  const ownerCondition = authority.ownerTagged
+    ? `#{==:#{@omx_team_pane_owner_id},${authority.ownerId}}`
+    : '1';
+  return `#{&&:#{==:#{pane_id},${authority.paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${authority.panePid}},#{&&:#{==:#{session_id},${authority.sessionId}},#{&&:${ownerCondition},#{&&:#{==:${authority.ownerOption},${authority.ownerProof}},#{m:*${authority.operationMarker}*,#{pane_start_command}}}}}}}}`;
+}
+
+function killScaleSplitPaneAtomically(authority: VerifiedScaleSplitPane): boolean {
+  const condition = buildScaleSplitRollbackCondition(authority);
+  if (!condition) return false;
+  const receipt = `__OMX_PANE_MUTATION_${randomUUID().replaceAll('-', '')}__`;
+  const result = spawnSync('tmux', [
+    'if-shell', '-F', '-t', authority.paneId,
+    condition,
+    `kill-pane -t ${authority.paneId} \\; display-message -p ${receipt}`,
+    `display-message -p __omx_scale_split_rollback_rejected_${receipt}`,
+  ], { encoding: 'utf-8', windowsHide: true });
+  return result.status === 0 && !result.error && parseExactTmuxAuthorityScalar(result.stdout || '') === receipt;
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -726,14 +785,9 @@ export async function scaleUp(
           || !operationPaneIds.has(canonicalPaneId)
           || initialPaneIds.has(canonicalPaneId)
           || rollbackPaneIds.has(canonicalPaneId)
-          || !revalidateScaleSplitAuthority(authority)
         ) return;
         rollbackPaneIds.add(canonicalPaneId);
-        try {
-          execFileSync('tmux', ['kill-pane', '-t', canonicalPaneId], { stdio: 'pipe',
-            windowsHide: true,
-          });
-        } catch {}
+        killScaleSplitPaneAtomically(authority);
       };
 
       for (const w of addedWorkers) {
@@ -996,6 +1050,7 @@ export async function scaleUp(
         paneId,
         panePid: incarnation.panePid,
         sessionName,
+        sessionId: incarnation.sessionId,
         ownerId: teamPaneOwnerId,
         ownerOption,
         ownerProof: provisionalProof,

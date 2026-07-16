@@ -28,6 +28,7 @@ import {
   getWorkerPanePid,
   isTeamPaneIncarnationLive,
   readTeamPaneIncarnation,
+  readTeamPaneSessionId,
   readPaneLivenessOutcome,
 
   paneHasOmxInstanceTag,
@@ -3317,10 +3318,16 @@ export async function startTeam(
         if (!rollbackOwnerId) {
           rollbackErrors.push('splitPaneRollback: missing team pane ownership authority');
         } else {
+          const createdPaneSessionIds = new Map<string, string>();
+          for (const paneId of [...createdWorkerPaneIds, ...(config?.hud_pane_id ? [config.hud_pane_id] : [])]) {
+            const sessionId = readTeamPaneSessionId(paneId);
+            if (sessionId) createdPaneSessionIds.set(paneId, sessionId);
+          }
           const authority = {
             sessionName,
             expectedOwnerId: rollbackOwnerId,
             expectedPanePids: createdPanePids,
+            expectedPaneSessionIds: createdPaneSessionIds,
           };
           const workerRollback = await teardownWorkerPanes(createdWorkerPaneIds, {
             leaderPaneId: createdLeaderPaneId,
@@ -4020,10 +4027,17 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
           : []
       )),
     );
-    const bindFreshShutdownPanePid = (paneId: string | null | undefined): void => {
-      if (!paneId || shutdownPanePids.has(paneId)) return;
-      const incarnation = readTeamPaneIncarnation(paneId);
-      if (incarnation) shutdownPanePids.set(paneId, incarnation.panePid);
+    const shutdownPaneSessionIds = new Map<string, string>();
+    const bindFreshShutdownPaneAuthority = (paneId: string | null | undefined): void => {
+      if (!paneId) return;
+      if (!shutdownPanePids.has(paneId)) {
+        const incarnation = readTeamPaneIncarnation(paneId);
+        if (incarnation) shutdownPanePids.set(paneId, incarnation.panePid);
+      }
+      if (!shutdownPaneSessionIds.has(paneId)) {
+        const sessionId = readTeamPaneSessionId(paneId);
+        if (sessionId) shutdownPaneSessionIds.set(paneId, sessionId);
+      }
     };
     const ownerReadWarnings = new Set<string>();
     const warnOwnerReadError = (kind: string, paneId: string, error: string): void => {
@@ -4098,7 +4112,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     let restoredHudPaneId: string | null = null;
     const hudWasLive = Boolean(effectiveHudPaneId && !isAuthoritativelyAbsentPane(effectiveHudPaneId, sanitized));
     if (hudWasLive && effectiveHudPaneId) {
-      bindFreshShutdownPanePid(effectiveHudPaneId);
+      bindFreshShutdownPaneAuthority(effectiveHudPaneId);
       await assertFreshShutdownAuthority(sanitized, cwd, shutdownAuthority);
       const hudTeardownSummary = await teardownWorkerPanes([effectiveHudPaneId], {
         leaderPaneId: effectiveLeaderPaneId,
@@ -4106,6 +4120,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
           sessionName,
           expectedOwnerId: tmuxPaneOwnerId,
           expectedPanePids: shutdownPanePids,
+          expectedPaneSessionIds: shutdownPaneSessionIds,
           revalidate: async () => {
             await assertFreshShutdownAuthority(sanitized, cwd, shutdownAuthority);
             return true;
@@ -4158,7 +4173,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     // torn down. Do not turn that absence into a failed destructive sink, but
     // retain live targets so genuine kill failures block state cleanup.
     shutdownPaneIds = shutdownPaneIds.filter((paneId) => !isAuthoritativelyAbsentPane(paneId, sanitized));
-    for (const paneId of shutdownPaneIds) bindFreshShutdownPanePid(paneId);
+    for (const paneId of shutdownPaneIds) bindFreshShutdownPaneAuthority(paneId);
     await assertFreshShutdownAuthority(sanitized, cwd, shutdownAuthority);
 
     const paneTeardownSummary = await teardownWorkerPanes(shutdownPaneIds, {
@@ -4168,6 +4183,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         sessionName,
         expectedOwnerId: tmuxPaneOwnerId,
         expectedPanePids: shutdownPanePids,
+        expectedPaneSessionIds: shutdownPaneSessionIds,
         revalidate: async () => {
           await assertFreshShutdownAuthority(sanitized, cwd, shutdownAuthority);
           return true;

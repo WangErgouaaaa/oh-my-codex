@@ -324,6 +324,9 @@ function tmuxAuthorityListPanesCase(
     `      *) echo "${fallbackOutput}" ;;`,
     '    esac',
     '    ;;',
+  '  display-message)',
+  "    case \"$*\" in *'#{session_id}') printf '$1\\n' ;; esac",
+  '    ;;',
   '  if-shell)',
     `    if [ "${options.recyclePidAtLivenessProbe === undefined ? '0' : '1'}" = 1 ] && [ -f "$0.liveness-probe-count" ]; then IFS= read -r liveness_probe_count < "$0.liveness-probe-count"; if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe ?? 0} ]; then case "\${5:-}" in *1000000031*) printf '%s\\n' '__omx_send_authority_rejected__'; exit 0 ;; esac; fi; fi`,
     `    success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"; case "$success" in ${options.atomicSendFailure === true ? '*send-keys*) exit 1 ;; ' : ''}*capture-pane*) printf '%s\\n' '›' ;; *display-message\\ -p\\ __OMX_PANE_MUTATION_[a-f0-9]*__*) printf '%s\\n' "$receipt" ;; esac`,
@@ -996,11 +999,12 @@ esac
         const config = await readTeamConfig(teamName, cwd);
         assert.equal(config?.workers.length, 1, testCase.name);
         const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
-        assert.ok(commands.some((command) => command === 'list-panes -a -F #{pane_id}'), testCase.name);
+        assert.ok(commands.some((command) => command === 'list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'), testCase.name);
         assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-')), testCase.name);
         assert.ok(commands.some((command) => command.startsWith('split-window -v -t %21 ')), testCase.name);
-        assert.ok(commands.includes('kill-pane -t %31'), testCase.name);
+        assert.ok(commands.some((command) => command.startsWith('if-shell -F -t %31 ')), testCase.name);
         assert.equal(commands.some((command) => command === 'kill-pane -t %11' || command === 'kill-pane -t %12' || command === 'kill-pane -t %21' || command === 'kill-pane -t %30'), false, testCase.name);
+        assert.equal(commands.some((command) => /^kill-pane\b/.test(command)), false, testCase.name);
         assert.equal(
           commands.some((command) => command !== '-V'
             && command !== 'list-panes -a -F #{pane_id}'
@@ -1010,7 +1014,7 @@ esac
             && !command.startsWith('set-option -g @omx_scale_split_owner_nonce_')
             && !command.startsWith('show-options -g -v @omx_scale_split_owner_nonce_')
             && !command.startsWith('split-window -v -t %21 ')
-            && command !== 'kill-pane -t %31'),
+            && !command.startsWith('if-shell -F -t %31 ')),
           false,
           testCase.name,
         );
@@ -1388,6 +1392,12 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    esac',
           '    ;;',
           '  show-options) cat "$0.option-${4:-}"; printf "\\n" ;;',
+          '  display-message)',
+          "    case \"$*\" in *'#{session_id}') printf '$1\\n' ;; esac",
+          '    ;;',
+          '  if-shell)',
+          "    success=\"${6:-}\"; receipt=\"${success##*display-message -p }\"; receipt=\"${receipt%% *}\"; case \"$receipt\" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\\n' \"$receipt\" ;; esac",
+          '    ;;',
 
           ...tmuxAuthorityListPanesCase(['%11', '%21']),
           '  kill-pane|send-keys|capture-pane)',
@@ -1424,7 +1434,103 @@ printf '%s\\n' "$@" > '${capturePath}'
       assert.ok(tmuxCommands.some((command) => (
         command === 'set-option -p -t %31 @omx_team_pane_owner_id team:scale-up-owner-tag-rollback'
       )));
-      assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %31'));
+      assert.ok(tmuxCommands.some((command) => command.startsWith('if-shell -F -t %31 ')));
+      assert.equal(tmuxCommands.some((command) => /^kill-pane\b/.test(command)), false);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+
+  it('uses a server-side rollback transaction that rejects final-boundary pane recycling and malformed receipts', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-atomic-rollback-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-atomic-rollback-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const unrelatedKillPath = join(fakeBinDir, 'unrelated-killed');
+    const previousPath = process.env.PATH;
+
+    try {
+      for (const receiptMode of ['exact', 'missing-lf', 'crlf', 'extra-line', 'recycled-at-transaction'] as const) {
+        await Promise.all([
+          rm(`${tmuxStubPath}.created-panes`, { force: true }),
+          rm(`${tmuxStubPath}.created-pane-pids`, { force: true }),
+          rm(`${tmuxStubPath}.created-pane-commands`, { force: true }),
+          rm(`${tmuxStubPath}.owner-tagged`, { force: true }),
+        ]);
+        await writeFile(
+          tmuxStubPath,
+          [
+            '#!/bin/sh',
+            'set -eu',
+            `printf '%s\\n' "$*" >> "${tmuxLogPath}"`,
+            'case "${1:-}" in',
+            '  -V) echo "tmux 3.2a" ;;',
+            '  split-window)',
+            '    echo "%31"',
+            tmuxCreatedPaneMarkerLine('%31'),
+            '    ;;',
+            '  set-option)',
+            '    case "${2:-}" in',
+            '      -g) printf "%s" "${4:-}" > "$0.option-${3:-}" ;;',
+            '      -p) echo "owner tag failed" >&2; exit 1 ;;',
+            '    esac',
+            '    ;;',
+            '  show-options) cat "$0.option-${4:-}"; printf "\\n" ;;',
+            "  display-message) case \"$*\" in *'#{session_id}') printf '$1\\n' ;; esac ;;",
+            ...tmuxAuthorityListPanesCase(['%11', '%21']),
+            '  if-shell)',
+            '    success="${6:-}"; receipt="${success##*display-message -p }"; receipt="${receipt%% *}"',
+            '    case "$success" in',
+            '      *"kill-pane -t %31"*)',
+            receiptMode === 'exact'
+              ? '        printf "%s\\n" "$receipt" ;;'
+              : receiptMode === 'missing-lf'
+                ? '        printf "%s" "$receipt" ;;'
+                : receiptMode === 'crlf'
+                  ? '        printf "%s\\r\\n" "$receipt" ;;'
+                  : receiptMode === 'extra-line'
+                    ? '        printf "%s\\nextra\\n" "$receipt" ;;'
+                    : '        printf "%s\\n" "__omx_scale_split_rollback_rejected_${receipt}" ;;',
+            '    esac',
+            `  kill-pane) : > "${unrelatedKillPath}" ;;`,
+            'esac',
+            'exit 0',
+            '',
+          ].join('\n'),
+        );
+        await chmod(tmuxStubPath, 0o755);
+        await writeFile(tmuxLogPath, '');
+        await rm(unrelatedKillPath, { force: true });
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+        const teamName = `scale-up-atomic-rollback-${receiptMode}`;
+        await initTeamState(teamName, 'task', 'executor', 1, cwd);
+        await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+        const result = await scaleUp(
+          teamName,
+          1,
+          'executor',
+          [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+          cwd,
+          { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+        );
+
+        assert.equal(result.ok, false, receiptMode);
+        assert.equal(existsSync(unrelatedKillPath), false, receiptMode);
+        const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+        const rollback = commands.find((command) => command.startsWith('if-shell -F -t %31 '));
+        assert.ok(rollback, receiptMode);
+        assert.match(rollback, /#\{==:#\{pane_id\},%31\}/, receiptMode);
+        assert.match(rollback, /#\{==:#\{pane_pid\},1000000031\}/, receiptMode);
+        assert.match(rollback, /#\{==:#\{session_id\},\$1\}/, receiptMode);
+        assert.match(rollback, /@omx_scale_split_owner_nonce_[a-f0-9]{32}/, receiptMode);
+        assert.match(rollback, /kill-pane -t %31 \\; display-message -p __OMX_PANE_MUTATION_[a-f0-9]{32}__/, receiptMode);
+        assert.equal(commands.some((command) => command === 'kill-pane -t %31'), false, receiptMode);
+      }
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

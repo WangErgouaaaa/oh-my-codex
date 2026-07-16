@@ -265,7 +265,7 @@ if [[ "$cmd" == "list-panes" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
   exit 0
 fi
 
@@ -326,7 +326,7 @@ case "$cmd" in
     fi
     ;;
   load-buffer) cp "$3" "$OMX_TEST_PAYLOAD_CAPTURE" ;;
-  if-shell) printf '__OMX_PANE_MUTATION_OK__\\n' ;;
+  if [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]]; then printf '%s\n' "\${BASH_REMATCH[1]}"; fi ;;
   delete-buffer) ;;
   *) exit 1 ;;
 esac
@@ -383,13 +383,18 @@ case "$cmd" in
   if-shell)
     printf '%s\\n' "$*" >> "$OMX_TEST_TMUX_COMMAND_LOG"
     if [[ "$*" == *"paste-buffer"* ]]; then
-      [[ "$*" == *"#{==:#{bracket_paste_flag},1}"* ]] || exit 1
-      if [[ "\${OMX_TEST_BRACKET_MODE:-1}" == "1" && "\${OMX_TEST_PID_REUSE:-0}" != "1" ]]; then
-        printf '__OMX_PANE_MUTATION_OK__\\n'
+      if [[ "$*" == *"-r -p"* ]]; then
+        [[ "$*" == *"#{==:#{bracket_paste_flag},1}"* ]] || exit 1
+        if [[ "\${OMX_TEST_BRACKET_MODE:-1}" == "1" && "\${OMX_TEST_PID_REUSE:-0}" != "1" ]]; then
+          [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
+          printf 'paste\\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+        fi
+      elif [[ "\${OMX_TEST_PID_REUSE:-0}" != "1" ]]; then
+        [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
         printf 'paste\\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
       fi
     else
-      printf '__OMX_PANE_MUTATION_OK__\\n'
+      [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
     fi
     ;;
   delete-buffer) ;;
@@ -412,12 +417,12 @@ esac
         assert.doesNotMatch(enabledCommands, /send-keys -t %42 C-m/);
 
         process.env.OMX_TEST_BRACKET_MODE = '0';
-        const disabled = await sdk.tmux.sendKeys({ text: 'bracket disabled', paneId: '%42', cooldownMs: 0, submit: false });
+        const disabled = await sdk.tmux.sendKeys({ text: `${multiline}\nsecond line`, paneId: '%42', cooldownMs: 0, submit: false });
         assert.equal(disabled.ok, false);
         assert.equal((await readFile(pasteExecutionPath, 'utf8')).trim(), 'paste');
 
         process.env.OMX_TEST_BRACKET_MODE = 'malformed';
-        const unavailable = await sdk.tmux.sendKeys({ text: 'bracket unavailable', paneId: '%42', cooldownMs: 0, submit: false });
+        const unavailable = await sdk.tmux.sendKeys({ text: `${multiline}\nthird line`, paneId: '%42', cooldownMs: 0, submit: false });
         assert.equal(unavailable.ok, false);
         assert.equal((await readFile(pasteExecutionPath, 'utf8')).trim(), 'paste');
 
@@ -429,9 +434,15 @@ esac
         assert.match(await readFile(commandLogPath, 'utf8'), /#{==:#{pane_pid},4242}/);
 
         delete process.env.OMX_TEST_PID_REUSE;
-        const singleLine = await sdk.tmux.sendKeys({ text: 'single line remains compatible', paneId: '%42', cooldownMs: 0 });
+        process.env.OMX_TEST_BRACKET_MODE = '0';
+        const singleLine = await sdk.tmux.sendKeys({ text: 'single line remains compatible', paneId: '%42', cooldownMs: 0, submit: false });
         assert.equal(singleLine.ok, true);
         assert.equal(await readFile(payloadCapturePath, 'utf8'), 'single line remains compatible [OMX_TMUX_INJECT]');
+        const singleLineCommand = (await readFile(commandLogPath, 'utf8')).trim().split('\n').at(-1) || '';
+        assert.doesNotMatch(singleLineCommand, /#{==:#{bracket_paste_flag},1}|-r -p|send-keys -t %42 C-m/);
+        process.env.OMX_TEST_BRACKET_MODE = 'malformed';
+        const unavailableSingleLine = await sdk.tmux.sendKeys({ text: 'single line with unavailable bracket mode', paneId: '%42', cooldownMs: 0, submit: false });
+        assert.equal(unavailableSingleLine.ok, true);
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;
@@ -440,6 +451,61 @@ esac
         delete process.env.OMX_TEST_PASTE_EXECUTIONS;
         delete process.env.OMX_TEST_BRACKET_MODE;
         delete process.env.OMX_TEST_PID_REUSE;
+        await rm(cwd, { recursive: true, force: true });
+        await rm(fakeBinDir, { recursive: true, force: true });
+      }
+    });
+    it('rejects malformed mutation receipts before downstream tmux sinks', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-receipt-'));
+      const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-sdk-receipt-bin-'));
+      const fakeTmuxPath = join(fakeBinDir, 'tmux');
+      const logPath = join(fakeBinDir, 'tmux.log');
+      const previousPath = process.env.PATH;
+      try {
+        await writeFile(fakeTmuxPath, `#!/usr/bin/env bash
+set -eu
+cmd="$1"
+shift || true
+printf '%s [%s]\n' "$cmd" "$*" >> "$OMX_TEST_TMUX_LOG"
+if [[ "$cmd" == "display-message" ]]; then printf 'devsess\n'; exit 0; fi
+if [[ "$cmd" == "list-panes" ]]; then
+  if [[ "$*" == *"#{pane_active}"* ]]; then printf '%%42\t0\t4242\t1\tcodex\n';
+  elif [[ "$*" == *"#{pane_dead}"* ]]; then printf '%%42\t0\t4242\n';
+  else printf '%%42\n'; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] || exit 1
+  receipt="\${BASH_REMATCH[1]}"
+  case "$OMX_TEST_RECEIPT_OUTPUT" in
+    wrong) printf '00000000000000000000000000000000\n' ;;
+    duplicate) printf '%s\n%s\n' "$receipt" "$receipt" ;;
+    extra) printf 'prefix%s\n' "$receipt" ;;
+    truncated) printf '%s' "$receipt" ;;
+    cr) printf '%s\r\n' "$receipt" ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
+exit 0
+`);
+        await import('node:fs/promises').then((fs) => fs.chmod(fakeTmuxPath, 0o755));
+        process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+        process.env.OMX_TEST_TMUX_LOG = logPath;
+        const sdk = createHookPluginSdk({ cwd, pluginName: 'strict-receipt', event: makeEvent(), sideEffectsEnabled: true });
+        for (const malformed of ['wrong', 'duplicate', 'extra', 'truncated', 'cr']) {
+          process.env.OMX_TEST_RECEIPT_OUTPUT = malformed;
+          const result = await sdk.tmux.sendKeys({ text: `receipt-${malformed}`, paneId: '%42', cooldownMs: 0, submit: false });
+          assert.equal(result.ok, false, malformed);
+          assert.equal(result.reason, 'target_missing', malformed);
+        }
+        const log = await readFile(logPath, 'utf8');
+        assert.doesNotMatch(log, /load-buffer|paste-buffer|send-keys/);
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        delete process.env.OMX_TEST_TMUX_LOG;
+        delete process.env.OMX_TEST_RECEIPT_OUTPUT;
         await rm(cwd, { recursive: true, force: true });
         await rm(fakeBinDir, { recursive: true, force: true });
       }
@@ -490,15 +556,23 @@ if [[ "$cmd" == "list-panes" ]]; then
       printf "%%42\t0\t4242\t1\tbash\n"
     else
       printf "%%42\t0\t4242\t1\tcodex --model gpt-5\n"
+      [[ "\${OMX_TEST_MIXED_DEAD:-}" == "1" ]] && printf "%%77\t1\t0\t0\tremain-on-exit\\n"
     fi
   elif [[ "$*" == *"#{pane_dead}"* ]]; then
     count=0
     [[ -f "$OMX_TEST_TMUX_COUNT" ]] && count="$(<"$OMX_TEST_TMUX_COUNT")"
     count=$((count + 1))
     printf '%s' "$count" > "$OMX_TEST_TMUX_COUNT"
-    pid=4242
-    if [[ "\${OMX_TEST_PID_RECYCLE:-}" == "1" && "$count" -gt 1 ]]; then pid=9999; fi
-    printf "%%42\t0\t%s\n" "$pid"
+    if [[ "\${OMX_TEST_DEAD_TARGET:-}" == "1" ]]; then
+      printf "%%42\t1\t0\\n"
+    else
+      pid=4242
+      if [[ "\${OMX_TEST_PID_RECYCLE:-}" == "1" && "$count" -gt 1 ]]; then pid=9999; fi
+      printf "%%42\t0\t%s\\n" "$pid"
+      [[ "\${OMX_TEST_MIXED_DEAD:-}" == "1" ]] && printf "%%77\t1\t0\\n"
+      [[ "\${OMX_TEST_EXTRA_ID:-}" == "1" ]] && printf "%%99\t0\t9999\\n"
+      if [[ "\${OMX_TEST_SESSION_DRIFT:-}" == "1" && "$(<"$OMX_TEST_DETAILED_COUNT")" -gt 1 ]]; then printf "%%99\t0\t9999\\n"; fi
+    fi
   elif [[ "$*" == *"#{pane_id}"* ]]; then
     if [[ "\${OMX_TEST_SESSION_DRIFT:-}" == "1" && "$(<"$OMX_TEST_DETAILED_COUNT")" -gt 1 ]]; then
       printf "%%42\n%%99\n"
@@ -512,7 +586,7 @@ fi
 if [[ "$cmd" == "if-shell" ]]; then
   printf '%s\n' "$*" >> "$OMX_TEST_TMUX_LOG"
   if [[ "\${OMX_TEST_PID_RECYCLE:-}" == "1" ]]; then exit 0; fi
-  printf '__OMX_PANE_MUTATION_OK__\n'
+  [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
   exit 0
 fi
 if [[ "$cmd" == "load-buffer" || "$cmd" == "delete-buffer" ]]; then
@@ -538,11 +612,16 @@ exit 1
         assert.equal(existsSync(logPath), false);
 
         delete process.env.OMX_TEST_BAD_DETAILED;
+        process.env.OMX_TEST_MIXED_DEAD = '1';
+        const mixedDead = await sdk.tmux.sendKeys({ text: 'mixed dead snapshot', sessionName: 'devsess', cooldownMs: 0, submit: false });
+        assert.equal(mixedDead.ok, true);
+        delete process.env.OMX_TEST_MIXED_DEAD;
+
         process.env.OMX_TEST_EXTRA_ID = '1';
         const mismatched = await sdk.tmux.sendKeys({ text: 'hello mismatch', sessionName: 'devsess', cooldownMs: 0 });
         assert.equal(mismatched.ok, false);
         assert.equal(mismatched.reason, 'target_missing');
-        assert.equal(existsSync(logPath), false);
+        assert.doesNotMatch(await readFile(logPath, 'utf8'), /hello mismatch \[OMX_TMUX_INJECT\]/);
 
         delete process.env.OMX_TEST_EXTRA_ID;
         process.env.OMX_TEST_PID_RECYCLE = '1';
@@ -575,6 +654,12 @@ exit 1
         assert.equal(lateTruncated.reason, 'target_missing');
         assert.doesNotMatch(await readFile(logPath, 'utf8'), /late truncated \[OMX_TMUX_INJECT\]/);
         delete process.env.OMX_TEST_LATE_BAD_DETAILED;
+        process.env.OMX_TEST_DEAD_TARGET = '1';
+        const deadTarget = await sdk.tmux.sendKeys({ text: 'dead target', paneId: '%42', cooldownMs: 0, submit: false });
+        assert.equal(deadTarget.ok, false);
+        assert.equal(deadTarget.reason, 'target_missing');
+        assert.doesNotMatch(await readFile(logPath, 'utf8'), /dead target \[OMX_TMUX_INJECT\]/);
+        delete process.env.OMX_TEST_DEAD_TARGET;
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;
@@ -584,6 +669,8 @@ exit 1
         delete process.env.OMX_TEST_BAD_DETAILED;
         delete process.env.OMX_TEST_PID_RECYCLE;
         delete process.env.OMX_TEST_DETAILED_COUNT;
+        delete process.env.OMX_TEST_MIXED_DEAD;
+        delete process.env.OMX_TEST_DEAD_TARGET;
         await rm(cwd, { recursive: true, force: true });
         await rm(fakeBinDir, { recursive: true, force: true });
       }

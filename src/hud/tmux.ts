@@ -1161,8 +1161,10 @@ interface HudSplitAuthority {
   proofValue: string;
   operationMarker: string;
   panePid: string;
+  sessionId: string;
   targetPaneId?: string;
 }
+
 
 const hudSplitAuthorities = new Map<string, HudSplitAuthority>();
 
@@ -1274,6 +1276,7 @@ function hasHudSplitAuthority(paneId: string, execTmuxSync: TmuxExecSync = defau
   return (
     findHudSplitOperationMarkerPaneId(authority.operationMarker, execTmuxSync) === paneId
     && readHudPaneIncarnation(paneId, execTmuxSync)?.panePid === authority.panePid
+    && readHudPaneSessionIncarnation(paneId, execTmuxSync) === authority.sessionId
     && readTmuxOptionExactly(execTmuxSync, authority.proofOption) === authority.proofValue
   );
 }
@@ -1282,20 +1285,23 @@ function readHudPaneIncarnation(paneId: string, execTmuxSync: TmuxExecSync): { p
   try {
     const lines = parseExactTmuxAuthorityLines(execTmuxSync(['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}']));
     if (!lines) return null;
-    const seen = new Set<string>();
+    const seenLive = new Set<string>();
     let incarnation: { paneDead: boolean; panePid: string } | null = null;
     for (const line of lines) {
-      const match = /^(%\S+) ([01]) ([1-9][0-9]*)$/.exec(line);
+      const match = /^(%\S+) ([01]) ([0-9]+)$/.exec(line);
       const observedPaneId = match ? parseCanonicalTmuxPaneId(match[1]) : null;
-      if (!match || !observedPaneId || observedPaneId !== match[1] || seen.has(observedPaneId)) return null;
-      seen.add(observedPaneId);
-      if (observedPaneId === paneId) incarnation = { paneDead: match[2] === '1', panePid: match[3]! };
+      if (!match || !observedPaneId || observedPaneId !== match[1]) return null;
+      if (match[2] === '1') continue;
+      if (!/^[1-9][0-9]*$/.test(match[3]) || seenLive.has(observedPaneId)) return null;
+      seenLive.add(observedPaneId);
+      if (observedPaneId === paneId) incarnation = { paneDead: false, panePid: match[3]! };
     }
     return incarnation;
   } catch {
     return null;
   }
 }
+
 
 function isPaneLiveInStrictGlobalProbe(paneId: string, expectedPid: string | undefined, execTmuxSync: TmuxExecSync): boolean {
   const incarnation = readHudPaneIncarnation(paneId, execTmuxSync);
@@ -1319,10 +1325,9 @@ export function verifyHudWatchPaneAuthority(paneId: string, execTmuxSync: TmuxEx
 /** Kills only a pane still bound to this process's exact split proof. */
 export function rollbackHudWatchPaneAuthority(paneId: string, execTmuxSync: TmuxExecSync = defaultExecTmuxSync): boolean {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
-  if (!canonicalPaneId || !hasHudSplitAuthority(canonicalPaneId, execTmuxSync)) return false;
-  const authority = hudSplitAuthorities.get(canonicalPaneId);
-  if (!authority || !hasHudSplitAuthority(canonicalPaneId, execTmuxSync)) return false;
-  const killed = killTmuxPaneIfCurrent(canonicalPaneId, authority.panePid, execTmuxSync);
+  const authority = canonicalPaneId ? hudSplitAuthorities.get(canonicalPaneId) : undefined;
+  if (!canonicalPaneId || !authority) return false;
+  const killed = mutateHudWatchPaneIfCurrent(canonicalPaneId, authority.panePid, `kill-pane -t ${canonicalPaneId}`, execTmuxSync);
   if (killed) hudSplitAuthorities.delete(canonicalPaneId);
   return killed;
 }
@@ -1369,26 +1374,30 @@ export function createHudWatchPane(
       execTmuxSync,
     );
     const incarnation = paneId ? readHudPaneIncarnation(paneId, execTmuxSync) : null;
-    if (!paneId || !incarnation) return null;
+    const sessionId = paneId ? readHudPaneSessionIncarnation(paneId, execTmuxSync) : null;
+    if (!paneId || !incarnation || !sessionId) return null;
 
     hudSplitAuthorities.set(paneId, {
       proofOption,
       proofValue: provisionalProof,
       operationMarker,
       panePid: incarnation.panePid,
+      sessionId,
       targetPaneId: canonicalTargetPaneId ?? undefined,
     });
+
     if (!hasHudSplitAuthority(paneId, execTmuxSync)) {
       rollbackHudWatchPaneAuthority(paneId, execTmuxSync);
       return null;
     }
     const proofValue = `${paneId}:split:${nonce}`;
     execTmuxSync(['set-option', '-g', proofOption, proofValue]);
+    hudSplitAuthorities.set(paneId, { proofOption, proofValue, operationMarker, panePid: incarnation.panePid, sessionId, targetPaneId: canonicalTargetPaneId ?? undefined });
     if (readTmuxOptionExactly(execTmuxSync, proofOption) !== proofValue) {
       rollbackHudWatchPaneAuthority(paneId, execTmuxSync);
       return null;
     }
-    hudSplitAuthorities.set(paneId, { proofOption, proofValue, operationMarker, panePid: incarnation.panePid, targetPaneId: canonicalTargetPaneId ?? undefined });
+
     if (!splitOutputMatchesPaneId(splitOutput, paneId) || !verifyHudWatchPaneAuthority(paneId, execTmuxSync)) {
       rollbackHudWatchPaneAuthority(paneId, execTmuxSync);
       return null;
@@ -1400,20 +1409,37 @@ export function createHudWatchPane(
   }
 }
 
-/** Executes a pane mutation only while the exact target incarnation remains live. */
-function mutateTmuxPaneIfCurrent(
+function readHudPaneSessionIncarnation(paneId: string, execTmuxSync: TmuxExecSync): string | null {
+  try {
+    const sessionId = parseExactTmuxAuthorityScalar(execTmuxSync(['display-message', '-p', '-t', paneId, '#{session_id}']));
+    return sessionId && /^[A-Za-z0-9_.:$-]+$/.test(sessionId) ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Executes a split-owned pane mutation only while its immutable owner proof and exact incarnation remain current. */
+export function mutateHudWatchPaneIfCurrent(
   paneId: string,
   expectedPanePid: string,
   mutation: string,
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): boolean {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
-  if (!canonicalPaneId || !/^[1-9][0-9]*$/.test(expectedPanePid)) return false;
+  const authority = canonicalPaneId ? hudSplitAuthorities.get(canonicalPaneId) : undefined;
+  if (
+    !canonicalPaneId
+    || !authority
+    || authority.panePid !== expectedPanePid
+    || !/^[1-9][0-9]*$/.test(expectedPanePid)
+    || !/^(?:kill-pane|resize-pane) -t %(?:0|[1-9][0-9]*)(?: -y [1-9][0-9]*)?$/.test(mutation)
+  ) return false;
   const marker = `__omx_hud_mutation_${randomUUID()}`;
+  const condition = `#{&&:#{==:#{pane_id},${canonicalPaneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${expectedPanePid}},#{&&:#{==:#{session_id},${authority.sessionId}},#{&&:#{==:#{${authority.proofOption}},${authority.proofValue}},#{m:*${authority.operationMarker}*,#{pane_start_command}}}}}}}`;
   try {
     const output = execTmuxSync([
       'if-shell', '-F', '-t', canonicalPaneId,
-      buildHudHookIncarnationCondition(canonicalPaneId, expectedPanePid),
+      condition,
       `${mutation} \\; display-message -p ${marker}`,
       `display-message -p __omx_hud_mutation_failed_${marker}`,
     ]);
@@ -1421,6 +1447,16 @@ function mutateTmuxPaneIfCurrent(
   } catch {
     return false;
   }
+}
+
+/** Executes a pane mutation only while a retained immutable HUD authority proves the exact target. */
+function mutateTmuxPaneIfCurrent(
+  paneId: string,
+  expectedPanePid: string,
+  mutation: string,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): boolean {
+  return mutateHudWatchPaneIfCurrent(paneId, expectedPanePid, mutation, execTmuxSync);
 }
 
 /** Kills a pane only while its exact live incarnation remains the target. */

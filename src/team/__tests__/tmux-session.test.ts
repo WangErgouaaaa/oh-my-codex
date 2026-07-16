@@ -7808,6 +7808,27 @@ exit 0
   });
 });
 
+describe('atomic teardown authority contract', () => {
+  it('binds worker teardown to immutable session identity and preserves selected owner proof at the sink', async () => {
+    const source = await readFile(new URL('../tmux-session.js', import.meta.url), 'utf-8');
+    const teardown = source.split('export async function teardownWorkerPanes')[1] ?? '';
+    assert.match(teardown, /expectedPaneSessionIds/);
+    assert.match(teardown, /#\{==:#\{session_id\},\$\{expectedSessionId\}\}/);
+    assert.match(teardown, /ownershipProof === 'owner-tag'/);
+    assert.match(teardown, /#\{==:#\{@omx_team_pane_owner_id\},\}/);
+  });
+
+  it('binds split rollback to its random global proof, exact incarnation, and operation marker at the sink', async () => {
+    const source = await readFile(new URL('../tmux-session.js', import.meta.url), 'utf-8');
+    const split = source.split('function splitAndAdoptPane')[1]?.split('function isHudWatchPane')[0] ?? '';
+    assert.match(split, /!sessionId \|\| !isSafeTmuxFormatOperand\(sessionId\)/);
+    assert.match(split, /rollbackOption/);
+    assert.match(split, /#\{==:#\{pane_pid\},\$\{authority\.panePid\}\}/);
+    assert.match(split, /#\{m:\*\$\{authority\.operationMarker\}\*,#\{pane_start_command\}\}/);
+    assert.match(split, /kill-pane -t \$\{authority\.paneId\} \\\\; display-message -p \$\{receipt\}/);
+  });
+});
+
 describe('leader mailbox-only boundary', () => {
   it('does not export direct leader pane injection helper', () => {
     assert.equal('sendToLeaderPane' in tmuxSessionModule, false);

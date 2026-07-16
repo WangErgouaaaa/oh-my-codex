@@ -5,7 +5,7 @@ import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { sleepSync } from '../../../utils/sleep.js';
 import { resolveCodexPane } from '../../../scripts/tmux-hook-engine.js';
-import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityLines } from '../../../hud/tmux.js';
+import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityLines, parseExactTmuxAuthorityScalar } from '../../../hud/tmux.js';
 import { spawnPlatformCommandSync } from '../../../utils/platform-command.js';
 import type {
   HookEventEnvelope,
@@ -68,12 +68,6 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
 
 
 
-function parseCanonicalPaneSnapshot(stdout: string): Set<string> | null {
-  const paneIds = parseExactTmuxAuthorityLines(stdout);
-  if (!paneIds || paneIds.some((paneId) => parseCanonicalTmuxPaneId(paneId) !== paneId)) return null;
-  const uniquePaneIds = new Set(paneIds);
-  return uniquePaneIds.size === paneIds.length ? uniquePaneIds : null;
-}
 
 interface SessionPaneRow {
   paneId: string;
@@ -108,30 +102,39 @@ function paneAuthorityFormat(target: TmuxTarget, requireBracketPaste = false): s
   return `#{&&:#{==:#{pane_id},${target.paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${target.pid}},#{&&:${sessionCondition},#{&&:#{m:*codex*,#{pane_start_command}},${bracketPasteCondition}}}}}}`;
 }
 
+function exactPaneMutationReceipt(receipt: string, stdout: string): boolean {
+  return parseExactTmuxAuthorityScalar(stdout) === receipt;
+}
+
 function runPaneMutationAtomically(target: TmuxTarget, command: string[], requireBracketPaste = false): boolean {
   const condition = paneAuthorityFormat(target, requireBracketPaste);
   const commandTokens = command.map(tmuxCommandToken);
-  if (!condition || commandTokens.some((token) => token === null)) return false;
-  const thenCommand = `${commandTokens.join(' ')} ; display-message -p __OMX_PANE_MUTATION_OK__`;
+  const receipt = randomUUID().replace(/-/g, '');
+  if (!condition || commandTokens.some((token) => token === null) || !/^[a-f0-9]{32}$/.test(receipt)) return false;
+  const thenCommand = `${commandTokens.join(' ')} ; display-message -p ${receipt}`;
   const result = runTmux(['if-shell', '-t', target.paneId, '-F', condition, thenCommand, '']);
-  return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+  return result.ok && exactPaneMutationReceipt(receipt, result.stdout);
 }
 
 function confirmPaneAuthorityAtomically(target: TmuxTarget): boolean {
   const condition = paneAuthorityFormat(target);
-  if (!condition) return false;
-  const result = runTmux(['if-shell', '-t', target.paneId, '-F', condition, 'display-message -p __OMX_PANE_MUTATION_OK__', '']);
-  return result.ok && result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+  const receipt = randomUUID().replace(/-/g, '');
+  if (!condition || !/^[a-f0-9]{32}$/.test(receipt)) return false;
+  const result = runTmux(['if-shell', '-t', target.paneId, '-F', condition, `display-message -p ${receipt}`, '']);
+  return result.ok && exactPaneMutationReceipt(receipt, result.stdout);
 }
 function pasteLiteralPanePayloadAtomically(target: TmuxTarget, payload: string): boolean {
   const tempDir = mkdtempSync(join(tmpdir(), 'omx-tmux-payload-'));
   const payloadPath = join(tempDir, 'payload');
   const bufferName = `omx_payload_${randomUUID().replace(/-/g, '')}`;
+  const multiline = /[\r\n]/.test(payload);
   try {
     writeFileSync(payloadPath, payload, { encoding: 'utf8', flag: 'wx' });
     const loaded = runTmux(['load-buffer', '-b', bufferName, payloadPath]);
     if (!loaded.ok) return false;
-    return runPaneMutationAtomically(target, ['paste-buffer', '-b', bufferName, '-t', target.paneId, '-d', '-r', '-p'], true);
+    const command = ['paste-buffer', '-b', bufferName, '-t', target.paneId, '-d'];
+    if (multiline) command.push('-r', '-p');
+    return runPaneMutationAtomically(target, command, multiline);
   } catch {
     return false;
   } finally {
@@ -160,14 +163,14 @@ function parseSessionPaneRows(stdout: string): SessionPaneRow[] | null {
       fields.length !== 5
       || parseCanonicalTmuxPaneId(fields[0]) !== fields[0]
       || (fields[1] !== '0' && fields[1] !== '1')
-      || !isStrictPanePid(fields[2])
       || (fields[3] !== '0' && fields[3] !== '1')
-      || paneIds.has(fields[0])
     ) return null;
+    if (fields[1] === '1') continue;
+    if (!isStrictPanePid(fields[2]) || paneIds.has(fields[0])) return null;
     paneIds.add(fields[0]);
     parsedRows.push({
       paneId: fields[0],
-      dead: fields[1] === '1',
+      dead: false,
       pid: Number(fields[2]),
       active: fields[3] === '1',
       startCommand: fields[4],
@@ -186,10 +189,10 @@ function parseStrictPaneSnapshot(stdout: string): Map<string, TmuxTarget> | null
       fields.length !== 3
       || parseCanonicalTmuxPaneId(fields[0]) !== fields[0]
       || (fields[1] !== '0' && fields[1] !== '1')
-      || !isStrictPanePid(fields[2])
-      || panes.has(fields[0])
     ) return null;
-    panes.set(fields[0], { paneId: fields[0], pid: Number(fields[2]), dead: fields[1] === '1' });
+    if (fields[1] === '1') continue;
+    if (!isStrictPanePid(fields[2]) || panes.has(fields[0])) return null;
+    panes.set(fields[0], { paneId: fields[0], pid: Number(fields[2]), dead: false });
   }
   return panes;
 }
@@ -215,9 +218,9 @@ function readSessionPaneSnapshot(sessionName: string): SessionPaneSnapshot | nul
   const rows = parseSessionPaneRows(paneList.stdout);
   if (!rows) return null;
 
-  const idSnapshot = runTmux(['list-panes', '-t', sessionName, '-F', '#{pane_id}']);
-  const paneIds = idSnapshot.ok ? parseCanonicalPaneSnapshot(idSnapshot.stdout) : null;
-  return paneIds && samePaneIds(rows, paneIds) ? { sessionName, rows } : null;
+  const idSnapshot = runTmux(['list-panes', '-t', sessionName, '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}']);
+  const paneIds = idSnapshot.ok ? parseStrictPaneSnapshot(idSnapshot.stdout) : null;
+  return paneIds && samePaneIds(rows, new Set(paneIds.keys())) ? { sessionName, rows } : null;
 }
 
 function strictPaneSnapshot(target: string | undefined): TmuxTarget | null {

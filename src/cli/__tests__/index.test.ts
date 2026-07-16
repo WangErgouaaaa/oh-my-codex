@@ -6,6 +6,7 @@ import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
+import { spawnSync } from "node:child_process";
 import TOML from "@iarna/toml";
 import {
   HELP,
@@ -3407,7 +3408,8 @@ describe("tmux HUD pane helpers", () => {
     assert.equal(parseStrictTmuxPaneIncarnations("%1 0 101\n%02 1 0\n"), null);
     assert.equal(parseStrictTmuxPaneIncarnations("%1 0 101\n%2 2 202\n"), null);
     assert.equal(parseStrictTmuxPaneIncarnations("%1 0 101\n%2 1 0\n%1 0 101\n"), null);
-    assert.deepEqual(parseStrictTmuxPaneIncarnations("%1 0 101\n%2 1 0\n%2 1 0\n"), new Map([["%1", "101"]]));
+    assert.equal(parseStrictTmuxPaneIncarnations("%1 0 101\n%2 1 0\n%2 1 999\n%3 0 303\n"), null);
+    assert.equal(parseStrictTmuxPaneIncarnations("%1 0 101\n%2 1 0\n%2 0 202\n%3 0 303\n"), null);
   });
   it("createHudWatchPane splits from the emitting pane target when provided", () => {
     const calls: string[][] = [];
@@ -3442,6 +3444,7 @@ describe("tmux HUD pane helpers", () => {
           return "";
         }
         if (args[0] === "show-options") return `${options.get(args[3]!) ?? ""}\n`;
+        if (args[0] === "display-message" && args.at(-1) === "#{session_id}") return "$1\n";
         throw new Error(`unexpected tmux command: ${args.join(" ")}`);
       },
     );
@@ -4114,9 +4117,9 @@ exit 0
     );
     assert.match(source, /const globalPaneIdsBefore = readGlobalTmuxPaneIdSnapshot\(\);/);
     assert.match(source, /const \[keeperHudPaneId, \.\.\.duplicateHudPaneIds\] = staleHudPaneIds;/);
-    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateInsideTmuxHudPane\(paneId, globalPanePidsBefore\.get\(paneId\), currentPaneId, \{ kind: "kill" \}\);\s*\}/);
+    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateHudWatchPaneIfCurrent\(paneId, globalPanePidsBefore\.get\(paneId\) \?\? '', `kill-pane -t \$\{paneId\}`\);\s*\}/);
     assert.match(source, /if \(keeperHudPaneId\) \{\s*hudPaneId = keeperHudPaneId;/);
-    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateInsideTmuxHudPane\(hudPaneId, hudPanePid, currentPaneId, \{ kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES \}\);\s*\}/);
+    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateHudWatchPaneIfCurrent\(hudPaneId, hudPanePid \?\? '', `resize-pane -t \$\{hudPaneId\} -y \$\{HUD_TMUX_HEIGHT_LINES\}`\);\s*\}/);
     assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*registerInsideTmuxHudResizeHook/);
     assert.match(source, /return matchesOwner\(\) && matchesLiveIncarnation\(\) && matchesOwner\(\) && matchesLiveIncarnation\(\);/);
     assert.doesNotMatch(
@@ -4389,16 +4392,57 @@ exit 1
     assert.equal(steps[1]?.args.at(-1), hudCmd);
   });
 
-  it("buildDetachedWindowsBootstrapScript targets the resolved tmux-compatible command", () => {
+  it("buildDetachedWindowsBootstrapScript targets the captured leader pane atomically", () => {
     const script = buildDetachedWindowsBootstrapScript(
-      "omx-demo",
+      "%42",
+      "1234",
       "powershell.exe -NoLogo -NoExit -EncodedCommand abc",
       2500,
       "C:\\Program Files\\psmux\\psmux.exe",
     );
     assert.match(script, /const tmuxCommand = "C:\\\\Program Files\\\\psmux\\\\psmux\.exe";/);
-    assert.match(script, /execFileSync\(tmuxCommand, \['send-keys'/);
-    assert.doesNotMatch(script, /execFileSync\('tmux'/);
+    assert.match(script, /const tmuxArgs = \["if-shell","-F","-t","%42"/);
+    assert.match(script, /#\{==:#\{pane_id\},%42\}/);
+    assert.match(script, /#\{==:#\{pane_pid\},1234\}/);
+    assert.match(script, /send-keys -t %42 -l --/);
+    assert.match(script, /send-keys -t %42 C-m/);
+    assert.match(script, /display-message -p -t %42 [a-f0-9]{32}/);
+    assert.match(script, /stdout !== `\$\{receipt\}\\n`/);
+    assert.doesNotMatch(script, /omx-demo:0\.0|execFileSync\(tmuxCommand, \['send-keys'/);
+    assert.equal(buildDetachedWindowsBootstrapScript("%42", "0", "codex"), "");
+  });
+
+  it("buildDetachedWindowsBootstrapScript rejects a recycled leader without touching an unrelated pane", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-windows-bootstrap-recycled-"));
+    try {
+      const tmuxPath = join(wd, "tmux");
+      const logPath = join(wd, "tmux.log");
+      await writeFile(
+        tmuxPath,
+        `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+exit 0
+`,
+      );
+      await chmod(tmuxPath, 0o755);
+      const script = buildDetachedWindowsBootstrapScript(
+        "%42",
+        "1234",
+        "powershell.exe -NoLogo -NoExit -EncodedCommand abc",
+        1,
+        tmuxPath,
+      );
+      const result = spawnSync(process.execPath, ["-e", script], { encoding: "utf-8" });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const tmuxLog = await readFile(logPath, "utf-8");
+      assert.match(tmuxLog, /^if-shell -F -t %42 /);
+      assert.match(tmuxLog, /#\{==:#\{pane_pid\},1234\}/);
+      assert.match(tmuxLog, /send-keys -t %42 -l --/);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %99| -t %99/);
+      assert.equal(tmuxLog.trim().split("\n").length, 1, "payload and Enter must share one transaction");
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 
   it("buildDetachedSessionBootstrapSteps kills detached tmux session on normal shell exit", () => {
