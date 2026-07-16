@@ -65,13 +65,19 @@ if [[ "\$cmd" == "show-option" ]]; then
   exit 0
 fi
 
-if [[ "\$cmd" == "if-shell" ]]; then
-  if [[ "\$*" == *'send-keys'* && "\${OMX_FAIL_SEND_KEYS:-0}" == "1" ]]; then
+if [[ "$cmd" == "if-shell" ]]; then
+  success="\${5:-}"
+  if [[ "$success" == *'send-keys'* && "\${OMX_FAIL_SEND_KEYS:-0}" == "1" ]]; then
     exit 1
   fi
-  if [[ "\$*" == *'capture-pane'* ]]; then
+  if [[ "$success" == *'capture-pane'* ]]; then
     printf '› \n'
   fi
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  case "$receipt" in
+    __OMX_SEND_AUTHORITY_[a-f0-9]*__|__OMX_PANE_MUTATION_[a-f0-9]*__) printf '%s\n' "$receipt" ;;
+  esac
   exit 0
 fi
 
