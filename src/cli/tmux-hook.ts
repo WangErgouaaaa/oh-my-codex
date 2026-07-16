@@ -6,7 +6,7 @@ import { omxRoot } from '../utils/paths.js';
 import { getPackageRoot } from '../utils/package.js';
 import { resolveCodexPane } from '../scripts/tmux-hook-engine.js';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
-import { parseCanonicalTmuxPaneId } from '../hud/tmux.js';
+import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityLines, parseExactTmuxAuthorityScalar } from '../hud/tmux.js';
 
 type TmuxTargetType = 'session' | 'pane';
 
@@ -222,13 +222,13 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
   if (result.status !== 0) {
     return { ok: false, stderr: (result.stderr || '').trim() || `tmux exited ${result.status}` };
   }
-  return { ok: true, stdout: (result.stdout || '').replace(/\r?\n$/, '') };
+  return { ok: true, stdout: result.stdout || '' };
 }
 
 function resolveValidateTarget(config: TmuxHookConfig): { ok: true; target: string } | { ok: false; reason: string } {
   if (config.target.type === 'pane') {
     const paneCheck = runTmux(['display-message', '-p', '-t', config.target.value, '#{pane_id}']);
-    const observedPane = paneCheck.ok ? parseCanonicalTmuxPaneId(paneCheck.stdout) : null;
+    const observedPane = paneCheck.ok ? parseCanonicalTmuxPaneId(parseExactTmuxAuthorityScalar(paneCheck.stdout)) : null;
     if (!observedPane || observedPane !== config.target.value) {
       return { ok: false, reason: paneCheck.ok ? 'pane not found' : paneCheck.stderr };
     }
@@ -237,12 +237,12 @@ function resolveValidateTarget(config: TmuxHookConfig): { ok: true; target: stri
 
   const paneList = runTmux(['list-panes', '-t', config.target.value, '-F', '#{pane_id}\t#{pane_active}']);
   if (!paneList.ok) return { ok: false, reason: paneList.stderr };
-  if (paneList.stdout === '') return { ok: false, reason: 'session has no panes' };
+  const paneLines = parseExactTmuxAuthorityLines(paneList.stdout);
+  if (!paneLines) return { ok: false, reason: 'session has no panes' };
   const paneIds = new Set<string>();
   let activePaneId: string | null = null;
   let firstPaneId: string | null = null;
-  for (const rawLine of paneList.stdout.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+  for (const line of paneLines) {
     const parts = line.split('\t');
     const paneId = parseCanonicalTmuxPaneId(parts[0]);
     if (parts.length !== 2 || !paneId || paneId !== parts[0] || paneIds.has(paneId) || (parts[1] !== '0' && parts[1] !== '1')) {
@@ -260,12 +260,13 @@ function resolveValidateTarget(config: TmuxHookConfig): { ok: true; target: stri
 
 function detectActivePaneFromList(): InitialTargetDetection | null {
   const paneList = runTmux(['list-panes', '-a', '-F', '#{pane_id}\t#{pane_active}\t#{session_name}']);
-  if (!paneList.ok || paneList.stdout === '') return null;
+  if (!paneList.ok) return null;
+  const paneLines = parseExactTmuxAuthorityLines(paneList.stdout);
+  if (!paneLines) return null;
   const paneIds = new Set<string>();
   let selected: [string, string] | null = null;
   let first: [string, string] | null = null;
-  for (const rawLine of paneList.stdout.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+  for (const line of paneLines) {
     const parts = line.split('\t');
     const paneId = parseCanonicalTmuxPaneId(parts[0]);
     if (parts.length !== 3 || !paneId || paneId !== parts[0] || paneIds.has(paneId) || !parts[2] || (parts[1] !== '0' && parts[1] !== '1')) return null;
@@ -291,27 +292,25 @@ function detectInitialTarget(): InitialTargetDetection | null {
     const canonicalPane = resolveCodexPane();
     if (canonicalPane === '') return null;
     const pane = runTmux(['display-message', '-p', '-t', canonicalPane, '#{pane_id}']);
-    const observedPane = pane.ok ? parseCanonicalTmuxPaneId(pane.stdout) : null;
+    const observedPane = pane.ok ? parseCanonicalTmuxPaneId(parseExactTmuxAuthorityScalar(pane.stdout)) : null;
     if (observedPane !== canonicalPane) return null;
     const session = runTmux(['display-message', '-p', '-t', canonicalPane, '#S']);
-    return { target: { type: 'pane', value: observedPane }, sessionName: session.ok && session.stdout !== '' ? session.stdout : undefined };
+    return { target: { type: 'pane', value: observedPane }, sessionName: session.ok ? parseExactTmuxAuthorityScalar(session.stdout) ?? undefined : undefined };
   }
 
   const currentClientPane = runTmux(['display-message', '-p', '#{pane_id}']);
-  const observedCurrentPane = currentClientPane.ok ? parseCanonicalTmuxPaneId(currentClientPane.stdout) : null;
+  const observedCurrentPane = currentClientPane.ok ? parseCanonicalTmuxPaneId(parseExactTmuxAuthorityScalar(currentClientPane.stdout)) : null;
   if (observedCurrentPane) {
     const session = runTmux(['display-message', '-p', '#S']);
-    return { target: { type: 'pane', value: observedCurrentPane }, sessionName: session.ok && session.stdout !== '' ? session.stdout : undefined };
+    return { target: { type: 'pane', value: observedCurrentPane }, sessionName: session.ok ? parseExactTmuxAuthorityScalar(session.stdout) ?? undefined : undefined };
   }
 
   const activePane = detectActivePaneFromList();
   if (activePane) return activePane;
 
   const sessions = runTmux(['list-sessions', '-F', '#{session_name}']);
-  if (sessions.ok && sessions.stdout !== '') {
-    const rows = sessions.stdout.split('\n').map(line => line.endsWith('\r') ? line.slice(0, -1) : line);
-    if (rows.length === 1 && rows[0] !== '') return { target: { type: 'session', value: rows[0] }, sessionName: rows[0] };
-  }
+  const sessionRows = sessions.ok ? parseExactTmuxAuthorityLines(sessions.stdout) : null;
+  if (sessionRows?.length === 1) return { target: { type: 'session', value: sessionRows[0]! }, sessionName: sessionRows[0]! };
 
   return null;
 }

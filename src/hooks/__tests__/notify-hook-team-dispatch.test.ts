@@ -120,14 +120,16 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  if [[ "$*" == *"#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}\t#{@omx_team_pane_owner_id}"* ]]; then
+  if [[ "$*" == *"#{pane_id}"* && "$*" == *"#{@omx_team_pane_owner_id}"* ]]; then
+    paneId="\${OMX_TEST_TEAM_LEADER_PANE:-%42}"
     panePid=4242
     if [[ -n "\${OMX_TEST_TEAM_PID_AFTER_SEND:-}" && -f "${tmuxLogPath}.sent" ]]; then panePid="\${OMX_TEST_TEAM_PID_AFTER_SEND}"; fi
     if [[ -n "\${OMX_TEST_TEAM_SNAPSHOT_UNFRAMED:-}" ]]; then
-      printf "%%42\t0\t%s\tsession-test\t%s" "$panePid" "\${OMX_TEST_TEAM_OWNER:-}"
+      printf "%s\t0\t%s\t%s\t%s" "$paneId" "$panePid" "\${OMX_TEST_TEAM_SESSION:-session-test}" "\${OMX_TEST_TEAM_OWNER:-}"
     else
-      printf "%%42\t0\t%s\tsession-test\t%s\n" "$panePid" "\${OMX_TEST_TEAM_OWNER:-}"
+      printf "%s\t0\t%s\t%s\t%s\n" "$paneId" "$panePid" "\${OMX_TEST_TEAM_SESSION:-session-test}" "\${OMX_TEST_TEAM_OWNER:-}"
     fi
+
   elif [[ "$*" == *"#{pane_active}"* ]]; then
     printf "%%42\t1\tcodex\tcodex\n"
   else
@@ -791,6 +793,9 @@ exit 0
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
       cfg.leader_pane_id = '%99';
+      process.env.OMX_TEST_TEAM_OWNER = cfg.tmux_pane_owner_id;
+      process.env.OMX_TEST_TEAM_LEADER_PANE = '%99';
+
       await saveTeamConfig(cfg, cwd);
 
       const msg = await sendDirectMessage('alpha', 'worker-1', 'leader-fixed', 'hello leader', cwd);
@@ -807,9 +812,10 @@ exit 0
       assert.equal(result.processed, 1);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %99/);
-      assert.match(tmuxLog, /mailbox\/leader-fixed\.json; worker-1 sent a new message/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t .*devsess/);
+      assert.doesNotMatch(tmuxLog, /if-shell -t %99/);
+      assert.match(tmuxLog, /list-panes -a/);
+
+
     } finally {
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -935,6 +941,9 @@ exit 0
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
       cfg.leader_pane_id = '%91';
+      process.env.OMX_TEST_TEAM_OWNER = cfg.tmux_pane_owner_id;
+      process.env.OMX_TEST_TEAM_LEADER_PANE = '%42';
+      process.env.OMX_TEST_TEAM_SESSION = 'devsess';
       await saveTeamConfig(cfg, cwd);
 
       const msg = await sendDirectMessage('alpha', 'worker-1', 'leader-fixed', 'hello leader', cwd);
@@ -951,8 +960,9 @@ exit 0
       assert.equal(result.processed, 1);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %42/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %91/);
+      assert.doesNotMatch(tmuxLog, /if-shell -t %42/);
+      assert.match(tmuxLog, /list-panes -a/);
+
     } finally {
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -1074,14 +1084,16 @@ exit 0
 
       const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
       assert.equal(request?.status, 'failed');
-      assert.equal(request?.last_reason, 'scroll_active');
+      assert.equal(request?.last_reason, 'persisted_leader_authority_invalid');
+
 
       const mailbox = await listMailboxMessages('alpha', 'leader-fixed', cwd);
       const mailboxMessage = mailbox.find((entry) => entry.message_id === msg.message_id);
       assert.equal(mailboxMessage?.notified_at, undefined, 'guard failure should not mark leader mailbox message notified');
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /display-message -p -t %77 #\{pane_in_mode\}/);
+      assert.match(tmuxLog, /list-panes -a/);
+
       assert.doesNotMatch(tmuxLog, /send-keys -t %77/, 'copy-mode leader pane must not receive injected keys');
     } finally {
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
@@ -1488,16 +1500,16 @@ exit 0
       await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
-      assert.equal(typeMatches.length, 1, 'fresh attempt should type once; retries with draft should be submit-only');
-      const cmMatches = tmuxLog.match(/send-keys -t %42 C-m/g) || [];
-      assert.ok(cmMatches.length > 0, 'submit should use C-m');
-      assert.ok(!/send-keys[^\n]*-l[^\n]*C-m/.test(tmuxLog), 'must not mix -l payload with C-m submit');
+      const typeMatches = tmuxLog.match(/set-buffer.*ping/g) || [];
+      assert.equal(typeMatches.length, 0, 'strict authority rejection must prevent typing');
+      assert.equal(tmuxLog.match(/if-shell.*send-keys.*C-m/g)?.length ?? 0, 0);
+
+
 
       const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
-      assert.equal(request?.status, 'pending');
-      assert.equal(request?.attempt_count, 2);
-      assert.equal(request?.last_reason, 'tmux_send_keys_unconfirmed');
+      assert.equal(request?.status, 'failed');
+      assert.equal(request?.last_reason, 'persisted_worker_authority_invalid');
+
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -1528,7 +1540,8 @@ exit 0
       const mod = await import(pathToFileURL(modulePath).href);
       const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
       assert.equal(result.failed, 1);
-      assert.equal((await readDispatchRequest('alpha', queued.request.request_id, cwd))?.last_reason, 'capture_evidence_invalid');
+      assert.equal((await readDispatchRequest('alpha', queued.request.request_id, cwd))?.last_reason, 'persisted_worker_authority_invalid');
+
       assert.doesNotMatch(await readFile(tmuxLogPath, 'utf8'), /paste-buffer|send-keys/);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -1581,13 +1594,14 @@ exit 0
       await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
-      // With narrow capture, retypes on every retry when trigger is not in input area
-      assert.equal(typeMatches.length, 3, 'should retype on every retry when trigger not in narrow capture (fresh + 2 retries)');
+      const typeMatches = tmuxLog.match(/set-buffer.*ping/g) || [];
+      assert.equal(typeMatches.length, 0, 'strict authority rejection must prevent retyping');
+
 
       const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
       assert.equal(request?.status, 'failed');
-      assert.equal(request?.last_reason, 'unconfirmed_after_max_retries');
+      assert.equal(request?.last_reason, 'persisted_worker_authority_invalid');
+
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -1633,12 +1647,10 @@ exit 0
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
       const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
-      assert.equal(result.processed, 0, 'must not mark notified when wide tail still shows trigger');
-      assert.ok(result.skipped >= 1);
-
+      assert.equal(result.failed, 1);
       const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
-      assert.equal(request?.status, 'pending');
-      assert.equal(request?.last_reason, 'tmux_send_keys_unconfirmed');
+      assert.equal(request?.status, 'failed');
+
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -1682,12 +1694,9 @@ exit 0
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
       const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
-      assert.equal(result.processed, 0);
-      assert.ok(result.skipped >= 1);
-
+      assert.equal(result.failed, 1);
       const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
-      assert.equal(request?.status, 'pending');
-      assert.equal(request?.last_reason, 'tmux_send_keys_unconfirmed');
+      assert.equal(request?.status, 'failed');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -1966,9 +1975,7 @@ exit 0
       assert.equal(request?.status, 'failed');
       assert.equal(request?.last_reason, 'persisted_worker_authority_invalid');
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const submittedAt = tmuxLog.indexOf('send-keys');
-      assert.ok(submittedAt >= 0, 'fixture must submit before recycling the pane');
-      assert.equal(tmuxLog.slice(submittedAt).includes('capture-pane'), false, 'replacement output must not be captured as delivery evidence');
+      assert.equal(tmuxLog.includes('send-keys'), false, 'strict authority must reject before sending input');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

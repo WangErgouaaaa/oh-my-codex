@@ -414,21 +414,6 @@ async function initTempGitRepo(prefix: string): Promise<string> {
   execFileSync("git", ["config", "user.name", "Test User"], { cwd, stdio: "ignore" });
   return cwd;
 }
-}
-
-async function initTempGitRepo(prefix: string): Promise<string> {
-	const cwd = await mkdtemp(join(tmpdir(), prefix));
-	execFileSync("git", ["init"], { cwd, stdio: "ignore" });
-	execFileSync("git", ["config", "user.email", "test@example.com"], {
-		cwd,
-		stdio: "ignore",
-	});
-	execFileSync("git", ["config", "user.name", "Test User"], {
-		cwd,
-		stdio: "ignore",
-	});
-	return cwd;
-}
 
 async function writeActiveAutopilotSession(
 	cwd: string,

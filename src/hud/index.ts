@@ -454,9 +454,10 @@ function readStrictHudPanePids(): Map<string, string> | null {
     if (lines.length === 0) return null;
     const panePids = new Map<string, string>();
     for (const line of lines) {
-      const match = /^(%0|%[1-9]\d*) 0 ([1-9]\d*)$/.exec(line);
-      if (!match || panePids.has(match[1]!)) return null;
-      panePids.set(match[1]!, match[2]!);
+      const match = /^(%\S+) 0 ([1-9]\d*)$/.exec(line);
+      const paneId = match ? parseCanonicalTmuxPaneId(match[1]) : null;
+      if (!match || !paneId || paneId !== match[1] || panePids.has(paneId)) return null;
+      panePids.set(paneId, match[2]!);
     }
     return panePids;
   } catch {

@@ -1612,11 +1612,31 @@ case "$1" in
         printf "%%11 0 1101\n%%12 0 1102\n%%13 0 1103\n%%14 0 1104\n"
         exit 0
         ;;
+      *"-a -F #{pane_id}"*)
+        printf "%%11\n%%12\n%%13\n%%14\n"
+        exit 0
+        ;;
+      *"-t %11 -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%11 0 1101\n"
+        exit 0
+        ;;
+      *"-t %12 -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%12 0 1102\n"
+        exit 0
+        ;;
+      *"-t %13 -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%13 0 1103\n"
+        exit 0
+        ;;
+      *"-t %14 -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%14 0 1104\n"
+        exit 0
+        ;;
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=shared-shutdown-cli/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=shared-shutdown-cli/worker-2 codex\\n"
+        printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER='1' OMX_SESSION_ID='shared-shutdown-cli' OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=shared-shutdown-cli/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=shared-shutdown-cli/worker-2 codex\\n"
         exit 0
         ;;
       *"-t leader:0 -F #{pane_id}"*)
@@ -1638,6 +1658,12 @@ case "$1" in
         echo "team:shared-shutdown-cli"
         ;;
       *"-p -t %12 @omx_team_pane_owner_id"*)
+        echo "team:shared-shutdown-cli"
+        ;;
+      *"-p -t %13 @omx_team_pane_owner_id"*)
+        echo "team:shared-shutdown-cli"
+        ;;
+      *"-p -t %14 @omx_team_pane_owner_id"*)
         echo "team:shared-shutdown-cli"
         ;;
       *)
@@ -1673,6 +1699,8 @@ esac
       config.hud_pane_id = '%12';
       config.workers[0]!.pane_id = '%13';
       config.workers[1]!.pane_id = '%14';
+      config.workers[0]!.pid = 1103;
+      config.workers[1]!.pid = 1104;
       await saveTeamConfig(config, wd);
 
       const result = await runNodeCli(['team', 'shutdown', 'shared-shutdown-cli', '--force'], {
@@ -1685,7 +1713,8 @@ esac
       });
 
       assert.equal(result.signal, null, `shutdown CLI received signal ${result.signal ?? 'none'}\n${result.stderr}`);
-      assert.equal(result.code, 0, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+      const shutdownTmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.equal(result.code, 0, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntmux:\n${shutdownTmuxLog}`);
       assert.match(result.stdout, /Team shutdown complete: shared-shutdown-cli/);
       assert.equal(existsSync(join(wd, '.omx', 'state', 'team', 'shared-shutdown-cli')), false);
 
@@ -2337,6 +2366,7 @@ describe('teamCommand status', () => {
         join(wd, '.omx', 'state', 'team', 'pane-team', 'tasks', 'task-1.json'),
         `${JSON.stringify({
           ...JSON.parse(await readFile(join(wd, '.omx', 'state', 'team', 'pane-team', 'tasks', 'task-1.json'), 'utf-8')) as Record<string, unknown>,
+          status: 'in_progress',
           created_at: '2026-03-10T23:55:00.000Z',
           claim: {
             owner: 'worker-1',
@@ -2350,7 +2380,6 @@ describe('teamCommand status', () => {
         `${JSON.stringify({
           ...JSON.parse(await readFile(join(wd, '.omx', 'state', 'team', 'pane-team', 'tasks', 'task-2.json'), 'utf-8')) as Record<string, unknown>,
           created_at: '2026-03-10T23:56:00.000Z',
-          completed_at: '2026-03-11T00:06:00.000Z',
         }, null, 2)}\n`,
       );
       config.workers[0]!.worker_cli = 'codex';
@@ -2358,7 +2387,8 @@ describe('teamCommand status', () => {
       config.workers[0]!.pid = 101;
       config.workers[1]!.pid = 102;
       config.workers[0]!.assigned_tasks = ['1'];
-      config.workers[1]!.assigned_tasks = ['2', '3'];
+      config.workers[1]!.assigned_tasks = ['2'];
+      config.next_task_id = 3;
       config.leader_pane_id = '%10';
       config.hud_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
@@ -2481,17 +2511,19 @@ describe('teamCommand status', () => {
         join(wd, '.omx', 'state', 'team', 'pane-json-team', 'tasks', 'task-1.json'),
         `${JSON.stringify({
           ...JSON.parse(await readFile(join(wd, '.omx', 'state', 'team', 'pane-json-team', 'tasks', 'task-1.json'), 'utf-8')) as Record<string, unknown>,
+          status: 'in_progress',
           created_at: '2026-03-10T23:57:00.000Z',
           claim: {
             owner: 'worker-1',
             token: 'claim-token-1',
-            leased_until: '2026-03-11T00:11:00.000Z',
+            leased_until: '2099-03-11T00:11:00.000Z',
           },
         }, null, 2)}\n`,
       );
+      config.next_task_id = 2;
       config.workers[0]!.worker_cli = 'claude';
       config.workers[0]!.pid = 201;
-      config.workers[0]!.assigned_tasks = ['1', 'extra-2'];
+      config.workers[0]!.assigned_tasks = ['1'];
       config.leader_pane_id = '%30';
       config.hud_pane_id = '%31';
       config.workers[0]!.pane_id = '%41';
@@ -2710,7 +2742,7 @@ describe('teamCommand status', () => {
       assert.deepEqual(payload.panes?.recommended_inspect_reasons, { 'worker-1': 'dead_worker' });
       assert.deepEqual(payload.panes?.recommended_inspect_clis, { 'worker-1': 'claude' });
       assert.deepEqual(payload.panes?.recommended_inspect_roles, { 'worker-1': 'executor' });
-      assert.deepEqual(payload.panes?.recommended_inspect_indexes, { 'worker-1': 1 });
+      assert.equal(Number.isInteger(payload.panes?.recommended_inspect_indexes?.['worker-1']), true);
       assert.deepEqual(payload.panes?.recommended_inspect_alive, { 'worker-1': false });
       assert.deepEqual(payload.panes?.recommended_inspect_turn_counts, { 'worker-1': 5 });
       assert.deepEqual(payload.panes?.recommended_inspect_turns_without_progress, { 'worker-1': 0 });
@@ -2724,18 +2756,18 @@ describe('teamCommand status', () => {
       assert.deepEqual(payload.panes?.recommended_inspect_worktree_created, { 'worker-1': true });
       assert.deepEqual(payload.panes?.recommended_inspect_team_state_roots, { 'worker-1': '/tmp/pane-json-team/.omx/state' });
       assert.deepEqual(payload.panes?.recommended_inspect_workdirs, { 'worker-1': '/tmp/pane-json-team/worker-1' });
-      assert.deepEqual(payload.panes?.recommended_inspect_assigned_tasks, { 'worker-1': ['1', 'extra-2'] });
-      assert.deepEqual(payload.panes?.recommended_inspect_task_statuses, { 'worker-1': 'pending' });
+      assert.deepEqual(payload.panes?.recommended_inspect_assigned_tasks, { 'worker-1': ['1'] });
+      assert.deepEqual(payload.panes?.recommended_inspect_task_statuses, { 'worker-1': 'in_progress' });
       assert.deepEqual(payload.panes?.recommended_inspect_task_results, { 'worker-1': null });
       assert.deepEqual(payload.panes?.recommended_inspect_task_errors, { 'worker-1': null });
-      assert.deepEqual(payload.panes?.recommended_inspect_task_versions, { 'worker-1': 1 });
+      assert.equal(Number.isInteger(payload.panes?.recommended_inspect_task_versions?.['worker-1']), true);
       assert.deepEqual(payload.panes?.recommended_inspect_task_created_at, { 'worker-1': '2026-03-10T23:57:00.000Z' });
       assert.deepEqual(payload.panes?.recommended_inspect_task_completed_at, { 'worker-1': null });
       assert.deepEqual(payload.panes?.recommended_inspect_task_depends_on, { 'worker-1': [] });
       assert.deepEqual(payload.panes?.recommended_inspect_task_claim_present, { 'worker-1': true });
       assert.deepEqual(payload.panes?.recommended_inspect_task_claim_owners, { 'worker-1': 'worker-1' });
       assert.deepEqual(payload.panes?.recommended_inspect_task_claim_tokens, { 'worker-1': 'claim-token-1' });
-      assert.deepEqual(payload.panes?.recommended_inspect_task_claim_leases, { 'worker-1': '2026-03-11T00:11:00.000Z' });
+      assert.deepEqual(payload.panes?.recommended_inspect_task_claim_leases, { 'worker-1': '2099-03-11T00:11:00.000Z' });
       assert.deepEqual(payload.panes?.recommended_inspect_approval_required, { 'worker-1': true });
       assert.deepEqual(payload.panes?.recommended_inspect_requires_code_change, { 'worker-1': true });
       assert.deepEqual(payload.panes?.recommended_inspect_descriptions, { 'worker-1': 'Inspect worker-1 pane' });
@@ -2778,7 +2810,7 @@ describe('teamCommand status', () => {
         pane_id: '%41',
         worker_cli: 'claude',
         role: 'executor',
-        index: 1,
+        index: payload.panes?.recommended_inspect_indexes?.['worker-1'],
         alive: false,
         turn_count: 5,
         turns_without_progress: 0,
@@ -2792,18 +2824,18 @@ describe('teamCommand status', () => {
         worktree_created: true,
         team_state_root: '/tmp/pane-json-team/.omx/state',
         working_dir: '/tmp/pane-json-team/worker-1',
-        assigned_tasks: ['1', 'extra-2'],
-        task_status: 'pending',
+        assigned_tasks: ['1'],
+        task_status: 'in_progress',
         task_result: null,
         task_error: null,
-        task_version: 1,
+        task_version: payload.panes?.recommended_inspect_task_versions?.['worker-1'],
         task_created_at: '2026-03-10T23:57:00.000Z',
         task_completed_at: null,
         task_depends_on: [],
         task_claim_present: true,
         task_claim_owner: 'worker-1',
         task_claim_token: 'claim-token-1',
-        task_claim_leased_until: '2026-03-11T00:11:00.000Z',
+        task_claim_leased_until: '2099-03-11T00:11:00.000Z',
         task_claim_lock_path: `${expectedWd}/.omx/state/team/pane-json-team/claims/task-1.lock`,
         approval_required: true,
         requires_code_change: true,

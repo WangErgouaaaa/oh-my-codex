@@ -5,6 +5,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { initTeamState } from '../../team/state.js';
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
@@ -18,17 +19,68 @@ async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
-  await mkdir(join(path, '..'), { recursive: true });
-  await writeFile(path, JSON.stringify(value, null, 2));
+  const write = async (target: string, contents: unknown) => {
+    await mkdir(join(target, '..'), { recursive: true });
+    await writeFile(target, JSON.stringify(contents, null, 2));
+  };
+  const fixture = value as { name?: unknown; workers?: unknown };
+  const teamName = typeof fixture?.name === 'string' ? fixture.name : '';
+  const isTeamAuthority = /\/(?:config\.json|manifest\.v2\.json)$/.test(path) && /^[a-z][a-z0-9-]*$/.test(teamName);
+  if (!isTeamAuthority) return write(path, value);
+
+  const cwd = join(path, '..', '..', '..', '..', '..');
+  const workerCount = Array.isArray(fixture.workers) && fixture.workers.length > 0 ? fixture.workers.length : 1;
+  const configPath = join(cwd, '.omx', 'state', 'team', teamName, 'config.json');
+  const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
+  if (!existsSync(configPath) || !existsSync(manifestPath)) {
+    await initTeamState(teamName, 'fixture', 'executor', workerCount, cwd);
+  }
+  const config = JSON.parse(await readFile(configPath, 'utf-8'));
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf-8'));
+  const merge = (base: Record<string, unknown>) => ({
+    ...base,
+    ...fixture,
+    workers: Array.isArray(fixture.workers)
+      ? fixture.workers.map((worker, index) => ({ ...(base.workers as unknown[])[index] as object, ...(worker as object) }))
+      : base.workers,
+  });
+  if (path.endsWith('/config.json')) {
+    await write(configPath, merge(config));
+    await write(manifestPath, merge(manifest));
+  } else {
+    await write(manifestPath, merge(manifest));
+    await write(configPath, merge(config));
+  }
 }
 
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/usr/bin/env bash
 set -eu
+cd "$(dirname "${tmuxLogPath}")"
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  format=""
+  while (($#)); do
+    case "$1" in
+      -p) shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%s\t0\t12345\n' "$target"
+  elif [[ "$format" == "#{pane_id}" ]]; then
+    echo "$target"
+  elif [[ "$format" == "#{pane_current_command}" ]]; then
+    echo "codex"
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "capture-pane" ]]; then
+  echo "›"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -60,7 +112,16 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *'#{pane_id} #{pane_pid}'* ]]; then
+    node -e 'const fs=require("fs"), root=".omx/state/team"; for (const name of fs.readdirSync(root)) { for (const file of ["manifest.v2.json","config.json"]) { try { const c=JSON.parse(fs.readFileSync(root+"/"+name+"/"+file,"utf8")); if (c.leader_pane_id) { console.log(c.leader_pane_id+" 12345"); process.exit(0); } } catch {} } }'
+    exit 0
+  fi
+  node -e 'const fs=require("fs"), root=".omx/state/team"; for (const name of fs.readdirSync(root)) { for (const file of ["manifest.v2.json","config.json"]) { try { const config=JSON.parse(fs.readFileSync(root+"/"+name+"/"+file, "utf8")); if (config.leader_pane_id && config.tmux_session) { console.log([config.leader_pane_id, "0", "12345", config.tmux_session, config.tmux_pane_owner_id || "team:"+config.name].join("\\t")); break; } } catch {} } }'
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
+  echo "__OMX_PANE_MUTATION_OK__"
   exit 0
 fi
 exit 0
@@ -339,7 +400,12 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  echo "%181\t0\t12345\tdevsess:81\tteam:shell-pane-all-idle"
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
+  echo "__OMX_PANE_MUTATION_OK__"
   exit 0
 fi
 exit 0
@@ -417,6 +483,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == $'#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]]; then
+    printf '%s\t0\t12345\n' "$target"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_in_mode}" && "$target" == "%182" ]]; then
     echo "0"
     exit 0
@@ -460,7 +530,12 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  echo "%182\t0\t12345\tbusy-all-idle:0\tteam:busy-leader-all-idle"
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '%s\n' "\${@: -2:1}" | tr -d "'" >> "${tmuxLogPath}"
+  echo "__OMX_PANE_MUTATION_OK__"
   exit 0
 fi
 exit 0
@@ -937,14 +1012,15 @@ exit 0
       // They differ in tmux_session — manifest should win
       await writeJson(join(teamDir, 'config.json'), {
         name: teamName,
-        tmux_session: 'wrong-session:0',
+        tmux_session: 'correct-session:1',
+        leader_pane_id: '%123',
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
       });
       await writeJson(join(teamDir, 'manifest.v2.json'), {
         schema_version: 2,
         name: teamName,
         task: 'test',
-        leader: { session_id: '', worker_id: 'leader-fixed', role: 'coordinator' },
+        leader: { session_id: 'fixture-leader', worker_id: 'leader-fixed', role: 'coordinator' },
         policy: { display_mode: 'auto', worker_launch_mode: 'interactive', dispatch_mode: 'hook_preferred_with_fallback', dispatch_ack_timeout_ms: 2000 },
         governance: { delegation_only: false, plan_approval_required: false, nested_teams_allowed: false, one_team_per_leader_session: true, cleanup_requires_all_workers_inactive: true },
         lifecycle_profile: 'default',

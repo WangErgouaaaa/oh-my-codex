@@ -81,6 +81,10 @@ if [[ "$cmd" == "display-message" ]]; then
       -t) target="$2"; shift 2 ;;
       *) format="$1"; shift ;;
     esac
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   done
   if [[ "$format" == "#{pane_id}" ]]; then
     echo "%42"
@@ -122,6 +126,10 @@ if [[ "$cmd" == "paste-buffer" ]]; then
 fi
 if [[ "$cmd" == "delete-buffer" ]]; then
   rm -f "${cwd}/tmux-buffer"
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then

@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
-import { parseCanonicalTmuxPaneId } from '../hud/tmux.js';
+import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityLines, parseExactTmuxAuthorityScalar } from '../hud/tmux.js';
 
 export const DEFAULT_ALLOWED_MODES = ['ralph', 'ultrawork', 'team'];
 export const DEFAULT_MARKER = '[OMX_TMUX_INJECT]';
@@ -215,16 +215,16 @@ export function resolveCodexPane(): string {
   if (!envPane) return '';
 
   try {
-    const observedPane = parseCanonicalTmuxPaneId(execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_id}'], {
+    const observedPane = parseCanonicalTmuxPaneId(parseExactTmuxAuthorityScalar(execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_id}'], {
       encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
-    }).replace(/\r?\n$/, ''));
+    })));
     if (observedPane !== envPane) return '';
-    const cmd = execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_current_command}'], {
+    const cmd = (parseExactTmuxAuthorityScalar(execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_current_command}'], {
       encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
-    }).replace(/\r?\n$/, '').toLowerCase();
-    const startCmd = execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_start_command}'], {
+    })) ?? '').toLowerCase();
+    const startCmd = (parseExactTmuxAuthorityScalar(execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_start_command}'], {
       encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
-    }).replace(/\r?\n$/, '').toLowerCase();
+    })) ?? '').toLowerCase();
     const base = cmd.split('/').pop()?.replace(/^-/, '') || '';
     if (AGENT_COMMANDS.has(base) && !isHudStartCommand(startCmd)) return observedPane;
   } catch {
@@ -233,23 +233,23 @@ export function resolveCodexPane(): string {
   }
 
   try {
-    const sessionName = execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#S'], {
+    const sessionName = parseExactTmuxAuthorityScalar(execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#S'], {
       encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
-    }).replace(/\r?\n$/, '');
+    }));
     if (!sessionName) return '';
     const detailedOutput = execFileSync(tmuxCommand, [
       'list-panes', '-s', '-t', sessionName,
       '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}',
-    ], { encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32' }).replace(/\r?\n$/, '');
+    ], { encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32' });
     const idOnlyOutput = execFileSync(tmuxCommand, [
       'list-panes', '-s', '-t', sessionName, '-F', '#{pane_id}',
-    ], { encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32' }).replace(/\r?\n$/, '');
-    if (detailedOutput === '' || idOnlyOutput === '') return '';
-
+    ], { encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32' });
+    const detailedLines = parseExactTmuxAuthorityLines(detailedOutput);
+    const idOnlyLines = parseExactTmuxAuthorityLines(idOnlyOutput);
+    if (!detailedLines || !idOnlyLines) return '';
     const detailedPaneIds = new Set<string>();
     const candidates: string[] = [];
-    for (const rawLine of detailedOutput.split('\n')) {
-      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    for (const line of detailedLines) {
       const parts = line.split('\t');
       const paneId = parseCanonicalTmuxPaneId(parts[0]);
       if (parts.length !== 3 || !paneId || paneId !== parts[0] || detailedPaneIds.has(paneId)) return '';
@@ -258,8 +258,7 @@ export function resolveCodexPane(): string {
       if (startCmd.includes('codex') && !isHudStartCommand(startCmd)) candidates.push(paneId);
     }
     const idOnlyPaneIds = new Set<string>();
-    for (const rawLine of idOnlyOutput.split('\n')) {
-      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    for (const line of idOnlyLines) {
       const paneId = parseCanonicalTmuxPaneId(line);
       if (!paneId || paneId !== line || idOnlyPaneIds.has(paneId)) return '';
       idOnlyPaneIds.add(paneId);

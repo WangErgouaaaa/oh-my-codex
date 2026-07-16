@@ -99,7 +99,7 @@ switch (command.command) {
 }
 
 describe('rust runtime legacy-reader compatibility', () => {
-  it('keeps team status on the manifest-authored compatibility view', async () => {
+  it('keeps team status on the canonical manifest/config compatibility view', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-rust-compat-team-'));
     try {
       const teamStateRoot = join(wd, '.omx', 'state');
@@ -112,8 +112,8 @@ describe('rust runtime legacy-reader compatibility', () => {
         const config = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
         const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
 
-        config.workspace_mode = 'single';
-        config.tmux_session = 'omx-team-legacy-rust-compat-team';
+        config.workspace_mode = 'worktree';
+        config.tmux_session = 'omx-team-rust-compat-team';
         manifest.workspace_mode = 'worktree';
         manifest.tmux_session = 'omx-team-rust-compat-team';
 
@@ -140,7 +140,7 @@ describe('rust runtime legacy-reader compatibility', () => {
     }
   });
 
-  it('keeps doctor --team on the manifest-authored tmux session', async () => {
+  it('keeps doctor --team on the canonical manifest/config tmux session', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-rust-compat-doctor-'));
     try {
       const teamStateRoot = join(wd, '.omx', 'state');
@@ -153,7 +153,7 @@ describe('rust runtime legacy-reader compatibility', () => {
         const config = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
         const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
 
-        config.tmux_session = 'omx-team-legacy-rust-compat-doctor';
+        config.tmux_session = 'omx-team-rust-compat-doctor';
         manifest.tmux_session = 'omx-team-rust-compat-doctor';
 
         await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);

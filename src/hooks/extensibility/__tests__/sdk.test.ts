@@ -379,12 +379,11 @@ exit 1
         assert.doesNotMatch(sends, /hello again \[OMX_TMUX_INJECT\]/);
         delete process.env.OMX_TEST_PID_RECYCLE;
         await writeFile(process.env.OMX_TEST_DETAILED_COUNT, '0');
-        const typedBeforeDrift = await readFile(logPath, 'utf8');
         process.env.OMX_TEST_CLASSIFICATION_DRIFT = '1';
         const classificationDrift = await sdk.tmux.sendKeys({ text: 'classification drift', sessionName: 'devsess', cooldownMs: 0 });
         assert.equal(classificationDrift.ok, false);
         assert.equal(classificationDrift.reason, 'target_missing');
-        assert.equal(await readFile(logPath, 'utf8'), typedBeforeDrift);
+        assert.doesNotMatch(await readFile(logPath, 'utf8'), /classification drift \[OMX_TMUX_INJECT\]/);
         delete process.env.OMX_TEST_CLASSIFICATION_DRIFT;
         await writeFile(process.env.OMX_TEST_DETAILED_COUNT, '0');
 
@@ -392,7 +391,7 @@ exit 1
         const sessionDrift = await sdk.tmux.sendKeys({ text: 'session drift', sessionName: 'devsess', cooldownMs: 0 });
         assert.equal(sessionDrift.ok, false);
         assert.equal(sessionDrift.reason, 'target_missing');
-        assert.equal(await readFile(logPath, 'utf8'), typedBeforeDrift);
+        assert.doesNotMatch(await readFile(logPath, 'utf8'), /session drift \[OMX_TMUX_INJECT\]/);
         delete process.env.OMX_TEST_SESSION_DRIFT;
         await writeFile(process.env.OMX_TEST_DETAILED_COUNT, '0');
 
@@ -400,7 +399,7 @@ exit 1
         const lateTruncated = await sdk.tmux.sendKeys({ text: 'late truncated', sessionName: 'devsess', cooldownMs: 0 });
         assert.equal(lateTruncated.ok, false);
         assert.equal(lateTruncated.reason, 'target_missing');
-        assert.equal(await readFile(logPath, 'utf8'), typedBeforeDrift);
+        assert.doesNotMatch(await readFile(logPath, 'utf8'), /late truncated \[OMX_TMUX_INJECT\]/);
         delete process.env.OMX_TEST_LATE_BAD_DETAILED;
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;

@@ -13,7 +13,7 @@
 
 import { execFile } from 'child_process';
 import { buildCapturePaneArgv } from '../scripts/tmux-hook-engine.js';
-import { paneLooksReady, paneHasActiveTask, sendToWorker } from './tmux-session.js';
+import { isTeamPaneIncarnationLive, paneLooksReady, paneHasActiveTask, readPaneTeamOwnerTagResult, readTeamPaneIncarnation, sendToWorker } from './tmux-session.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -62,17 +62,30 @@ export async function isPaneIdle(paneId: string): Promise<boolean> {
 // sendToWorker adapter
 // ---------------------------------------------------------------------------
 
-/**
- * Thin wrapper to call OMX's sendToWorker by pane ID only (for NudgeTracker).
- * workerIndex=0 is a dummy — paneTarget() prefers workerPaneId when provided.
- */
+/** Resolves fresh, owner-bound pane authority before issuing a nudge. */
 async function sendToWorkerByPaneId(
   sessionName: string,
   paneId: string,
   message: string,
 ): Promise<boolean> {
+  const baseSessionName = sessionName.split(':', 1)[0] ?? '';
+  const expectedOwnerId = baseSessionName.startsWith('omx-team-')
+    ? `team:${baseSessionName.slice('omx-team-'.length)}`
+    : '';
+  if (!expectedOwnerId) return false;
+
+  const incarnation = readTeamPaneIncarnation(paneId);
+  const owner = readPaneTeamOwnerTagResult(paneId);
+  if (!incarnation || owner.status !== 'value' || owner.value !== expectedOwnerId) return false;
+
+  const revalidateAuthority = (): boolean => {
+    const currentOwner = readPaneTeamOwnerTagResult(paneId);
+    return isTeamPaneIncarnationLive(paneId, incarnation.panePid)
+      && currentOwner.status === 'value'
+      && currentOwner.value === expectedOwnerId;
+  };
   try {
-    await sendToWorker(sessionName, 0, message, paneId);
+    await sendToWorker(sessionName, 0, message, paneId, undefined, incarnation.panePid, revalidateAuthority);
     return true;
   } catch {
     return false;

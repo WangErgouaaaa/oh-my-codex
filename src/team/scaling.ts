@@ -94,7 +94,11 @@ import {
   readPersistedTeamUltragoalContext,
   renderLeaderOwnedUltragoalContextSection,
 } from './ultragoal-context.js';
-import { parseCanonicalTmuxPaneId } from '../hud/tmux.js';
+import {
+  parseCanonicalTmuxPaneId,
+  parseExactTmuxAuthorityLines,
+  parseExactTmuxAuthorityScalar,
+} from '../hud/tmux.js';
 
 // ── Environment gate ──────────────────────────────────────────────────────────
 
@@ -160,12 +164,7 @@ function canonicalizePersistedTeamPaneIds(config: TeamConfig): PersistedTeamPane
 }
 
 function parseFreshTmuxPaneId(rawOutput: string | null | undefined): string | null {
-  if (typeof rawOutput !== 'string') return null;
-  const withoutTerminalNewline = rawOutput.endsWith('\n') ? rawOutput.slice(0, -1) : rawOutput;
-  const paneId = withoutTerminalNewline.endsWith('\r')
-    ? withoutTerminalNewline.slice(0, -1)
-    : withoutTerminalNewline;
-  if (!paneId || paneId.includes('\n')) return null;
+  const paneId = typeof rawOutput === 'string' ? parseExactTmuxAuthorityScalar(rawOutput) : null;
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
   return canonicalPaneId === paneId ? canonicalPaneId : null;
 }
@@ -184,15 +183,12 @@ function readGlobalTmuxPaneIdSnapshot(): Set<string> | null {
   const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf-8' });
   if (result.status !== 0 || result.error) return null;
 
-  const rawOutput = result.stdout || '';
-  const output = rawOutput.endsWith('\n') ? rawOutput.slice(0, -1) : rawOutput;
-  if (!output) return null;
-
+  const lines = parseExactTmuxAuthorityLines(result.stdout || '');
+  if (!lines) return null;
   const paneIds = new Set<string>();
-  for (const rawLine of output.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+  for (const line of lines) {
     const paneId = parseCanonicalTmuxPaneId(line);
-    if (!paneId || paneIds.has(paneId)) return null;
+    if (!paneId || paneId !== line || paneIds.has(paneId)) return null;
     paneIds.add(paneId);
   }
   return paneIds;
@@ -211,17 +207,14 @@ function readTeamPaneOwnerSnapshot(sessionName: string): TeamPaneOwnerSnapshot |
   );
   if (result.status !== 0 || result.error) return null;
 
-  const rawOutput = result.stdout || '';
-  const output = rawOutput.endsWith('\n') ? rawOutput.slice(0, -1) : rawOutput;
-  if (!output) return null;
-
+  const lines = parseExactTmuxAuthorityLines(result.stdout || '');
+  if (!lines) return null;
   const paneOwners: TeamPaneOwnerSnapshot = new Map();
-  for (const rawLine of output.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+  for (const line of lines) {
     const fields = line.split('\t');
     if (fields.length !== 2) return null;
     const paneId = parseCanonicalTmuxPaneId(fields[0]);
-    if (!paneId || paneOwners.has(paneId)) return null;
+    if (!paneId || paneId !== fields[0] || paneOwners.has(paneId)) return null;
     paneOwners.set(paneId, fields[1]!);
   }
   return paneOwners;
@@ -302,13 +295,12 @@ function hasScaleSplitOperationMarker(command: string, marker: string): boolean 
 function findScaleSplitOperationMarkerPaneId(marker: string): string | null {
   const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_start_command}'], { encoding: 'utf-8' });
   if (result.status !== 0 || result.error) return null;
-  const output = result.stdout || '';
-  if (output.includes('\r') && !output.endsWith('\r\n')) return null;
+  const lines = parseExactTmuxAuthorityLines(result.stdout || '');
+  if (!lines) return null;
   let candidate: string | null = null;
   const seen = new Set<string>();
-  for (const rawLine of output.replace(/\r?\n$/, '').split('\n')) {
-    if (!rawLine) continue;
-    const fields = rawLine.split('\t');
+  for (const line of lines) {
+    const fields = line.split('\t');
     if (fields.length !== 2) return null;
     const paneId = parseCanonicalTmuxPaneId(fields[0]);
     if (!paneId || paneId !== fields[0] || seen.has(paneId)) return null;
@@ -322,24 +314,24 @@ function findScaleSplitOperationMarkerPaneId(marker: string): string | null {
 function readTmuxOptionExactly(option: string): string | null {
   const result = spawnSync('tmux', ['show-options', '-g', '-v', option], { encoding: 'utf-8' });
   if (result.status !== 0 || result.error) return null;
-  const rawOutput = result.stdout || '';
-  if (!rawOutput.endsWith('\n') || rawOutput.includes('\r')) return null;
-  const output = rawOutput.slice(0, -1);
-  return output.includes('\n') || output === '' ? null : output;
+  return parseExactTmuxAuthorityScalar(result.stdout || '');
 }
 
 function readScalePaneIncarnation(paneId: string): { paneDead: boolean; panePid: string } | null {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId || canonicalPaneId !== paneId) return null;
   const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}'], { encoding: 'utf-8' });
   if (result.status !== 0 || result.error) return null;
-  const rawOutput = result.stdout || '';
-  if (!rawOutput.endsWith('\n') || rawOutput.includes('\r')) return null;
+  const lines = parseExactTmuxAuthorityLines(result.stdout || '');
+  if (!lines) return null;
   const seen = new Set<string>();
   let incarnation: { paneDead: boolean; panePid: string } | null = null;
-  for (const line of rawOutput.slice(0, -1).split('\n')) {
-    const match = /^(%0|%[1-9][0-9]*) ([01]) ([1-9][0-9]*)$/.exec(line);
-    if (!match || seen.has(match[1]!) || !Number.isSafeInteger(Number(match[3]))) return null;
-    seen.add(match[1]!);
-    if (match[1] === paneId) incarnation = { paneDead: match[2] === '1', panePid: match[3]! };
+  for (const line of lines) {
+    const match = /^(\S+) ([01]) ([1-9][0-9]*)$/.exec(line);
+    const observedPaneId = parseCanonicalTmuxPaneId(match?.[1]);
+    if (!match || !observedPaneId || observedPaneId !== match[1] || seen.has(observedPaneId) || !Number.isSafeInteger(Number(match[3]))) return null;
+    seen.add(observedPaneId);
+    if (observedPaneId === canonicalPaneId) incarnation = { paneDead: match[2] === '1', panePid: match[3]! };
   }
   return incarnation;
 }
@@ -1023,11 +1015,7 @@ export async function scaleUp(
         });
       }
       provisionalAuthority.ownerProof = boundProof;
-      if (
-        typeof result.stdout !== 'string'
-        || !/^(%0|%[1-9][0-9]*)\n$/.test(result.stdout)
-        || parseFreshTmuxPaneId(result.stdout) !== paneId
-      ) {
+      if (parseFreshTmuxPaneId(result.stdout) !== paneId) {
         return await rollbackScaleUp(`Failed to validate tmux split output for ${workerName}`, {
           paneId,
           workerName,

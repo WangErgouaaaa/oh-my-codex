@@ -68,6 +68,16 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "0"
     exit 0
   fi
+  if [[ "$fmt" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    case "$target" in
+      %10) printf '%%10\t0\t10010\n' ;;
+      %11) printf '%%11\t0\t10011\n' ;;
+      %12) printf '%%12\t0\t10012\n' ;;
+      %95) printf '%%95\t0\t10095\n' ;;
+      *) exit 1 ;;
+    esac
+    exit 0
+  fi
   if [[ "$fmt" == "#{pane_id}" ]]; then
     echo "\${target:-%42}"
     exit 0
@@ -85,16 +95,62 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$fmt" == "#S" ]]; then
-    echo "session-test"
+    team=""
+    for candidate in "$(dirname "${tmuxLogPath}")"/.omx/state/team/*; do
+      if [[ -d "$candidate" ]]; then
+        team="\${candidate##*/}"
+        break
+      fi
+    done
+    printf 'omx-team-%s\n' "$team"
     exit 0
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  if [[ "$*" == *'capture-pane'* ]]; then
+    printf '› ready\n'
+  else
+    printf '__OMX_PANE_MUTATION_OK__\n'
   fi
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
+if [[ "$cmd" == "show-option" ]]; then
+  printf 'team:delivery\n'
+  exit 0
+fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%10\t111\n%%11\t112\n%%12\t113\n%%95\t195\n'
+  if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_name}'*'#{@omx_team_pane_owner_id}'* ]]; then
+    team=""
+    for candidate in "$(dirname "${tmuxLogPath}")"/.omx/state/team/*; do
+      if [[ -d "$candidate" ]]; then
+        team="\${candidate##*/}"
+        break
+      fi
+    done
+    session="omx-team-\${team}"
+    owner="team:\${team}"
+    printf '%%10\t0\t10010\t%s\t%s\n%%11\t0\t10011\t%s\t%s\n%%12\t0\t10012\t%s\t%s\n%%95\t0\t10095\t%s\t%s\n' "$session" "$owner" "$session" "$owner" "$session" "$owner" "$session" "$owner"
+  elif [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+    printf '%%10 0 10010\n%%11 0 10011\n%%12 0 10012\n%%95 0 10095\n'
+  elif [[ "$*" == *'#{pane_id}'*'#{@omx_team_pane_owner_id}'* ]]; then
+    session=""
+    while [[ "$#" -gt 0 ]]; do
+      if [[ "$1" == "-t" ]]; then shift; session="$1"; fi
+      shift || true
+    done
+    owner="team:\${session#omx-team-}"
+    printf '%%10\t%s\n%%11\t%s\n%%12\t%s\n%%95\t%s\n' "$owner" "$owner" "$owner" "$owner"
+  elif [[ "$*" == *'#{pane_id}'*'#{pane_current_command}'* ]]; then
+    printf '%%10\tcodex\tcodex\n%%11\tcodex\tcodex\n%%12\tcodex\tcodex\n%%95\tcodex\tcodex\n'
+  elif [[ "$*" == *'#{pane_id} #{pane_pid}'* ]]; then
+    printf '%%10 10010\n%%11 10011\n%%12 10012\n%%95 10095\n'
+  else
+    printf '%%10\n%%11\n%%12\n%%95\n'
+  fi
   exit 0
 fi
 exit 0
@@ -253,10 +309,11 @@ async function configurePaneIds(teamName: string, cwd: string, leaderPaneId: str
   assert.ok(config, 'missing team config');
   if (!config) throw new Error('missing team config');
   config.leader_pane_id = leaderPaneId;
-  config.workers = config.workers.map((worker) => ({
-    ...worker,
-    pane_id: workerPaneIds[worker.name] ?? worker.pane_id,
-  }));
+  config.workers = config.workers.map((worker) => {
+    const paneId = workerPaneIds[worker.name] ?? worker.pane_id;
+    const panePid = paneId === '%10' ? 10010 : paneId === '%11' ? 10011 : paneId === '%12' ? 10012 : undefined;
+    return { ...worker, pane_id: paneId, ...(panePid ? { pid: panePid } : {}) };
+  });
   await saveTeamConfig(config, cwd);
 }
 
@@ -340,8 +397,8 @@ describe('team message delivery end-to-end smoke tests', () => {
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
         assert.match(tmuxLog, /set-buffer -b omx-pane-input-.* -- Team worker-leader-fallback:/);
         assert.match(tmuxLog, /show-buffer -b omx-pane-input-/);
-        assert.match(tmuxLog, /send-keys -t %95 C-u/);
-        assert.match(tmuxLog, /paste-buffer -t %95 -b omx-pane-input-.* -p -d/);
+        assert.match(tmuxLog, /'send-keys' '-t' '%95' 'C-u'/);
+        assert.match(tmuxLog, /'paste-buffer' '-t' '%95' '-b' 'omx-pane-input-.*' '-p' '-d'/);
         assert.match(tmuxLog, /msg\(s\) pending|msg\(s\) for leader/);
       });
     } finally {

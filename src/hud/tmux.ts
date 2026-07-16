@@ -522,15 +522,20 @@ function hasOmxCliToken(command: string): boolean {
   return /(?:^|[\s'"])(?:[^\s'"]*\/)?omx(?:\.js)?(?=$|[\s'"])/.test(command);
 }
 
+function hasPowerShellEnvironmentAssignmentPrefix(command: string): boolean {
+  return /^\s*(?:\$env:[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:'(?:''|[^'])*'|"(?:`.|[^"])*")\s*;\s*)+&(?:\s|$)/i.test(command);
+}
+
 function isLegacyFocusedHudWatchPane(pane: TmuxPaneSnapshot): boolean {
   // Migration-only heuristic for prompt-submit auto-HUD reconciliation: older
   // focused auto-HUD panes lacked owner metadata, so keep this deliberately
   // narrower than general HUD ownership/reaping.
+  const command = `${pane.startCommand} ${pane.currentCommand}`;
   if (
     !isHudWatchPane(pane)
-    || hasHudOwnerMetadataAttempt(`${pane.startCommand} ${pane.currentCommand}`)
+    || hasHudOwnerMetadataAttempt(command)
+    || hasPowerShellEnvironmentAssignmentPrefix(command)
   ) return false;
-  const command = `${pane.startCommand} ${pane.currentCommand}`;
   return hasOmxCliToken(command)
     && !/(?:^|[\s'"])--tmux(?:[\s'"]|$)/.test(command)
     && /(?:^|[\s'"])--preset=focused(?:[\s'"]|$)/.test(command);
@@ -645,6 +650,13 @@ export function reapDeadHudPanes(
 
     if (shouldReapDeletedCwdHudPane(pane, isLivePane) && killPane(pane.paneId)) {
       reaped.push(pane.paneId);
+      continue;
+    }
+
+    // Never let HUD-looking command text authorize a destructive pane mutation.
+    // Only metadata accepted by the strict owner parsers may do so.
+    if (!hasHudPaneOwnerMetadata(pane)) {
+      preserved.push(pane.paneId);
       continue;
     }
 
@@ -772,10 +784,9 @@ function readHudResizeHookPaneIncarnations(
     let leaderPanePid: string | null = null;
     let hudPanePid: string | null = null;
     for (const line of lines) {
-      const match = /^(%0|%[1-9][0-9]*) ([01]) ([1-9][0-9]*)$/.exec(line);
-      if (!match) return null;
-      const paneId = parseCanonicalTmuxPaneId(match[1]);
-      if (!paneId || paneId !== match[1] || seen.has(paneId)) return null;
+      const match = /^(%\S+) ([01]) ([1-9][0-9]*)$/.exec(line);
+      const paneId = match ? parseCanonicalTmuxPaneId(match[1]) : null;
+      if (!match || !paneId || paneId !== match[1] || seen.has(paneId)) return null;
       seen.add(paneId);
       if (match[2] === '1') continue;
       if (paneId === leaderPaneId) leaderPanePid = match[3]!;
@@ -1274,10 +1285,9 @@ function readHudPaneIncarnation(paneId: string, execTmuxSync: TmuxExecSync): { p
     const seen = new Set<string>();
     let incarnation: { paneDead: boolean; panePid: string } | null = null;
     for (const line of lines) {
-      const match = /^(%0|%[1-9][0-9]*) ([01]) ([1-9][0-9]*)$/.exec(line);
-      if (!match) return null;
-      const observedPaneId = parseCanonicalTmuxPaneId(match[1]);
-      if (!observedPaneId || observedPaneId !== match[1] || seen.has(observedPaneId)) return null;
+      const match = /^(%\S+) ([01]) ([1-9][0-9]*)$/.exec(line);
+      const observedPaneId = match ? parseCanonicalTmuxPaneId(match[1]) : null;
+      if (!match || !observedPaneId || observedPaneId !== match[1] || seen.has(observedPaneId)) return null;
       seen.add(observedPaneId);
       if (observedPaneId === paneId) incarnation = { paneDead: match[2] === '1', panePid: match[3]! };
     }

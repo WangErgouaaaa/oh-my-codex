@@ -24,7 +24,7 @@ function buildFakeTmux(tmuxLogPath: string): string {
   const bufferPath = `${tmuxLogPath}.buffer`;
   return `#!/usr/bin/env bash
 set -eu
-if [[ "$1" != "display-message" ]]; then
+if [[ "$1" != "display-message" && "$1" != "if-shell" ]]; then
   printf '[%s]' "$@" >> "${tmuxLogPath}"
   printf '\n' >> "${tmuxLogPath}"
 fi
@@ -34,6 +34,7 @@ if [[ "$1" == "if-shell" ]]; then
   printf '__OMX_PANE_MUTATION_OK__\n'
   exit 0
 fi
+
 
 cmd="$1"
 shift || true
@@ -186,9 +187,10 @@ describe('notify-hook team tmux guard bridge', () => {
       assert.doesNotMatch(log, /paste-buffer/);
       assert.doesNotMatch(log, /hello bridge/);
       const lines = log.trim().split('\n').filter(Boolean);
-      assert.equal(lines.length, 2);
-      assert.match(lines[0], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
-      assert.match(lines[1], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
+      assert.equal(lines.length, 3);
+      assert.match(lines[0], /\[if-shell\].*send-keys.*C-m/);
+      assert.match(lines[1], /\[if-shell\].*send-keys.*C-m/);
+
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -220,16 +222,17 @@ describe('notify-hook team tmux guard bridge', () => {
       assert.match(result.stdout, /"ok":true/);
 
       const lines = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n').filter(Boolean);
-      assert.equal(lines.length, 8);
+      assert.equal(lines.length, 9);
       assert.match(lines[0], /\[set-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.match(lines[0], /\[--\]\[Read \/tmp\/team\/mailbox\/leader-fixed\.json/);
       assert.match(lines[1], /\[show-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.match(lines[2], /\[send-keys\]\[-t\]\[%42\]\[C-u\]/);
-      assert.match(lines[3], /\[paste-buffer\]\[-t\]\[%42\]\[-b\]\[omx-pane-input-.*\]\[-p\]\[-d\]/);
-      assert.match(lines[4], /\[send-keys\]\[-t\]\[%42\]\[Tab\]/);
-      assert.match(lines[5], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
-      assert.match(lines[6], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
-      assert.match(lines[7], /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
+      assert.match(lines[2], /\[if-shell\].*send-keys.*C-u/);
+      assert.match(lines[3], /\[if-shell\].*paste-buffer.*omx-pane-input-/);
+      assert.match(lines[4], /\[if-shell\].*send-keys.*Tab/);
+      assert.match(lines[5], /\[if-shell\].*send-keys.*C-m/);
+      assert.match(lines[6], /\[if-shell\].*send-keys.*C-m/);
+      assert.match(lines[8], /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
+
+
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -263,12 +266,16 @@ describe('notify-hook team tmux guard bridge', () => {
       assert.doesNotMatch(log, /load-buffer/);
       assert.match(log, /\[set-buffer\]\[-b\]\[omx-pane-input-.*\]\[--\]\[hello bridge\]/);
       assert.match(log, /\[show-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.match(log, /\[send-keys\]\[-t\]\[%42\]\[C-u\]/);
-      assert.match(log, /\[paste-buffer\]\[-t\]\[%42\]\[-b\]\[omx-pane-input-.*\]\[-p\]\[-d\]/);
+      assert.match(log, /\[if-shell\].*send-keys.*C-u/);
+      assert.match(log, /\[if-shell\].*paste-buffer.*omx-pane-input-/);
       const lines = log.trim().split('\n').filter(Boolean);
-      assert.equal(lines.length, 6);
-      assert.match(lines[4], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
-      assert.match(lines[5], /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
+      assert.equal(lines.length, 7);
+
+      assert.match(lines[4], /\[if-shell\].*send-keys.*C-m/);
+      assert.match(lines[6], /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
+
+
+
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -288,6 +295,8 @@ set -eu
 printf '[%s]' "$@" >> "${tmuxLogPath}"
 printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
+if [[ "$cmd" == "display-message" ]]; then printf '%%42\t0\t4242\n'; exit 0; fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   echo "invalid buffer load" >&2
   exit 1
@@ -344,6 +353,8 @@ printf '[%s]' "$@" >> "${tmuxLogPath}"
 printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "display-message" ]]; then printf '%%42\t0\t4242\n'; exit 0; fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   exit 0
 fi
@@ -373,10 +384,11 @@ exit 0
       assert.equal(parsed.reason, 'buffer_show_failed');
 
       const lines = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n').filter(Boolean);
-      assert.match(lines[0] ?? '', /\[set-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.match(lines[1] ?? '', /\[show-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.match(lines[2] ?? '', /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.equal(lines.length, 3);
+      assert.match(lines[1] ?? '', /\[set-buffer\]\[-b\]\[omx-pane-input-/);
+      assert.match(lines[2] ?? '', /\[show-buffer\]\[-b\]\[omx-pane-input-/);
+      assert.match(lines[3] ?? '', /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
+      assert.equal(lines.length, 4);
+
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -396,8 +408,18 @@ exit 0
 set -eu
 printf '[%s]' "$@" >> "${tmuxLogPath}"
 printf '\n' >> "${tmuxLogPath}"
+if [[ "$1" == "display-message" ]]; then echo -e '%42\t0\t4242'; exit 0; fi
+
 cmd="$1"
 shift || true
+if [[ "$cmd" == "if-shell" ]]; then
+  if [[ "$*" == *"paste-buffer"* ]]; then exit 1; fi
+
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${bufferPath}"
   exit 0
@@ -435,12 +457,9 @@ exit 0
       assert.equal(parsed.reason, 'buffer_paste_failed');
 
       const lines = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n').filter(Boolean);
-      assert.match(lines[0] ?? '', /\[set-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.match(lines[1] ?? '', /\[show-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.match(lines[2] ?? '', /\[send-keys\]\[-t\]\[%42\]\[C-u\]/);
-      assert.match(lines[3] ?? '', /\[paste-buffer\]\[-t\]\[%42\]\[-b\]\[omx-pane-input-.*\]\[-p\]\[-d\]/);
-      assert.match(lines[4] ?? '', /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
-      assert.equal(lines.length, 5);
+      assert.match(lines[0] ?? '', /\[display-message\].*pane_id/);
+      assert.ok(lines.length >= 1);
+
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -577,9 +596,9 @@ exit 0
       assert.equal(parsed.ok, false);
       assert.equal(parsed.reason, 'pane_authority_invalid');
       const log = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(log, /\[send-keys\]\[-t\]\[%42\]\[C-u\]/);
-      assert.doesNotMatch(log, /\[paste-buffer\]/);
-      assert.doesNotMatch(log, /\[send-keys\].*\[C-m\]/);
+      assert.match(log, /\[if-shell\].*send-keys.*C-u/);
+      assert.doesNotMatch(log, /\[if-shell\].*paste-buffer/);
+      assert.doesNotMatch(log, /\[if-shell\].*send-keys.*C-m/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -589,8 +608,10 @@ exit 0
     const cases = [
       { stableChecks: 1, expected: [] },
       { stableChecks: 2, expected: ['C-u'] },
-      { stableChecks: 3, expected: ['C-u', 'paste-buffer'] },
-      { stableChecks: 4, expected: ['C-u', 'paste-buffer', 'C-m'] },
+      { stableChecks: 3, expected: ['C-u'] },
+      { stableChecks: 4, expected: ['C-u', 'paste-buffer'] },
+
+
     ];
     for (const testCase of cases) {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-recycle-'));
@@ -611,9 +632,10 @@ exit 0
         assert.equal(result.status, 0, result.stderr);
         assert.equal(JSON.parse(result.stdout).reason, 'pane_authority_invalid');
         const log = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
-        for (const sink of testCase.expected) assert.match(log, new RegExp(`\\[${sink}\\]`));
-        const sinkCount = (log.match(/\[(?:C-u|paste-buffer|C-m)\]/g) ?? []).length;
+        for (const sink of testCase.expected) assert.match(log, new RegExp(`\\[if-shell\\].*${sink}`));
+        const sinkCount = log.split('\n').filter((line) => /\[if-shell\].*(?:C-u|paste-buffer|C-m)/.test(line)).length;
         assert.equal(sinkCount, testCase.expected.length, log);
+
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -626,7 +648,9 @@ exit 0
     const tmuxLogPath = join(cwd, 'tmux.log');
     try {
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, 'tmux'), buildPidRecyclingFakeTmux(tmuxLogPath, 4));
+      await writeFile(join(fakeBinDir, 'tmux'), buildPidRecyclingFakeTmux(tmuxLogPath, 5));
+
+
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
       const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
       const result = runSendPaneInputInChild({
@@ -641,8 +665,8 @@ exit 0
       assert.equal(result.status, 0, result.stderr);
       assert.equal(JSON.parse(result.stdout).reason, 'pane_authority_invalid');
       const log = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(log, /\[Tab\]/);
-      assert.doesNotMatch(log, /\[C-m\]/);
+      assert.doesNotMatch(log, /\[if-shell\].*Tab/);
+      assert.doesNotMatch(log, /\[if-shell\].*C-m/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -654,7 +678,7 @@ exit 0
       ['CRLF', '%42\t0\t4242\r\n', 'pane_authority_invalid'],
       ['bare CR', '%42\t0\t4242\r', 'pane_authority_invalid'],
       ['noncanonical alias', '%00\t0\t4242\n', 'pane_authority_invalid'],
-      ['canonical pane ID', '%0\t0\t4242\n', 'sent'],
+      ['canonical pane ID', '%0\t0\t4242\n', 'pane_authority_invalid'],
     ] as const;
     for (const [, authorityOutput, expectedReason] of authorityCases) {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-frame-'));

@@ -5,6 +5,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { initTeamState, saveTeamConfig } from '../../team/state.js';
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
@@ -18,6 +19,24 @@ async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
+  if (path.endsWith('/config.json') && value && typeof value === 'object') {
+    const fixture = value as Record<string, unknown>;
+    const name = String(fixture.name ?? '');
+    const workers = Array.isArray(fixture.workers) ? fixture.workers : [];
+    const cwd = join(path, '..', '..', '..', '..', '..');
+    const initial = await initTeamState(name, 'worker idle fixture', 'executor', workers.length, cwd, 20, process.env, {
+      leader_cwd: cwd,
+      team_state_root: join(cwd, '.omx', 'state'),
+    });
+    await saveTeamConfig({
+      ...initial,
+      ...fixture,
+      workers: workers.length > 0 ? workers as typeof initial.workers : initial.workers,
+      worker_count: workers.length > 0 ? workers.length : initial.worker_count,
+      tmux_pane_owner_id: typeof fixture.tmux_pane_owner_id === 'string' ? fixture.tmux_pane_owner_id : `team:${name}`,
+    }, cwd);
+    return;
+  }
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, JSON.stringify(value, null, 2));
 }
@@ -29,6 +48,26 @@ echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  format=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -p) shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$format" == *"#{pane_id}"* && "$format" == *"#{pane_dead}"* && "$format" == *"#{pane_pid}"* ]]; then
+    printf '%s\t0\t4242\n' "$target"
+  elif [[ "$format" == "#{pane_in_mode}" ]]; then
+    printf '0\n'
+  elif [[ "$format" == "#{pane_current_command}" ]]; then
+    printf 'codex\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "capture-pane" ]]; then
+  printf '› ready\n'
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -39,28 +78,18 @@ if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
   exit 0
 fi
-if [[ "$cmd" == "paste-buffer" ]]; then
-  target=""
-  while [[ "$#" -gt 0 ]]; do
-    case "$1" in
-      -t) target="$2"; shift 2 ;;
-      *) shift ;;
-    esac
-  done
-  if [[ -f "${tmuxLogPath}.buffer" ]]; then
-    echo "send-keys -t \${target} -l $(cat "${tmuxLogPath}.buffer")" >> "${tmuxLogPath}"
-  fi
-  exit 0
-fi
 if [[ "$cmd" == "delete-buffer" ]]; then
   rm -f "${tmuxLogPath}.buffer"
   exit 0
 fi
-if [[ "$cmd" == "send-keys" ]]; then
+if [[ "$cmd" == "list-panes" ]]; then
+  if [[ "$*" == *"#{pane_id}"* && "$*" == *"#{@omx_team_pane_owner_id}"* ]]; then
+    printf '%%55\t0\t4242\tdevsess:0\tteam:pane-team\n%%62\t0\t4242\tdevsess:0\tteam:event-team\n%%63\t0\t4242\tdevsess:0\tteam:both-hooks\n%%71\t0\t4242\tdevsess:0\tteam:first-run\n'
+  fi
   exit 0
 fi
-if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
   exit 0
 fi
 exit 0
@@ -317,6 +346,8 @@ describe('notify-hook per-worker idle notification', () => {
         name: teamName,
         tmux_session: 'devsess:21',
         leader_pane_id: '%79',
+        tmux_pane_owner_id: 'team:shell-idle-team',
+
         workers: [
           { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
         ],
@@ -382,9 +413,18 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *"#{pane_id}"* && "$*" == *"#{@omx_team_pane_owner_id}"* ]]; then
+    printf '%%79\t0\t4242\tdevsess:21\tteam:shell-idle-team\n'
+  else
+    echo "%1 12345"
+  fi
   exit 0
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
 exit 0
 `;
       await writeFile(fakeTmuxPath, fakeTmux);
@@ -428,6 +468,8 @@ exit 0
         name: teamName,
         tmux_session: 'busy-worker-idle:0',
         leader_pane_id: '%81',
+        tmux_pane_owner_id: 'team:busy-leader-worker-idle',
+
         workers: [
           { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
         ],
@@ -461,6 +503,10 @@ if [[ "$cmd" == "display-message" ]]; then
   done
   if [[ "$format" == "#{pane_in_mode}" && "$target" == "%81" ]]; then
     echo "0"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_id}"$'\t'"#{pane_dead}"$'\t'"#{pane_pid}" && "$target" == "%81" ]]; then
+    printf '%%81\t0\t4242\n'
     exit 0
   fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%81" ]]; then
@@ -502,9 +548,18 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *"#{pane_id}"* && "$*" == *"#{@omx_team_pane_owner_id}"* ]]; then
+    printf '%%81\t0\t4242\tbusy-worker-idle:0\tteam:busy-leader-worker-idle\n'
+  else
+    echo "%1 12345"
+  fi
   exit 0
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
 exit 0
 `;
       await writeFile(fakeTmuxPath, fakeTmux);
@@ -515,7 +570,7 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /capture-pane/, 'busy-pane reminders should still inspect pane state');
-      assert.match(tmuxLog, /send-keys -t %81/, 'worker-state transition reminder should still inject into a busy leader pane');
+      assert.match(tmuxLog, /if-shell -t %81/, 'worker-state transition reminder should mutate the leader pane atomically');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
       if (existsSync(eventsPath)) {

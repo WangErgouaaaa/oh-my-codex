@@ -143,6 +143,17 @@ function skipUnsupportedInstalledCodex(t: { skip: (message?: string) => void }, 
   return false;
 }
 
+function isUnavailableInstalledCodexBoundary(error: unknown): boolean {
+  return error instanceof CodexExecutableNotFoundError
+    || (error instanceof Error && /^Unsupported installed Codex version for the .+ boundary:/.test(error.message));
+}
+
+function installedCodexBoundarySkipReason(error: unknown): string {
+  if (error instanceof CodexExecutableNotFoundError) {
+    return 'codex executable is absent; installed-Codex boundary is unavailable';
+  }
+  return 'installed Codex version is unsupported; installed-Codex boundary is unavailable';
+}
 
 test('Linux installed-Codex hooks/list preserves full foreign metadata through uninstall (no macOS claim)', async (t) => {
   if (process.platform !== 'linux') {

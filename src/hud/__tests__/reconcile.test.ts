@@ -1285,6 +1285,25 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.deepEqual(created, []);
   });
 
+  it('does not resize or reap a focused HUD with an unrelated PowerShell environment prefix', async () => {
+    const killed: string[] = [];
+    const resized: string[] = [];
+    const result = await reconcileHudForPromptSubmit('/repo', {
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-a', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      listCurrentWindowPanes: () => [
+        { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneDead: false, panePid: '101' },
+        { paneId: '%2', currentCommand: 'node', startCommand: "$env:PATH = 'C:\\Tools'; & node omx.js hud --watch --preset=focused", paneDead: false, panePid: '202' },
+      ],
+      createHudWatchPane: () => '%3',
+      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      resizeTmuxPane: (paneId) => { resized.push(paneId); return true; },
+      resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+    });
+    assert.equal(result.status, 'recreated');
+    assert.deepEqual(killed, []);
+    assert.deepEqual(resized, ['%3']);
+  });
+
   it('treats an extra legacy focused pane as stale when an owned HUD already exists', async () => {
     const killed: string[] = [];
     const resized: Array<{ paneId: string; heightLines: number }> = [];

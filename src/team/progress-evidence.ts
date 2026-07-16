@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { omxStateDir } from '../utils/paths.js';
+import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { readBranchGitActivityMsForPath } from './leader-activity.js';
 
 function safeString(value: unknown): string {
@@ -32,7 +34,7 @@ async function statMsIfExists(path: string): Promise<number> {
 }
 
 async function readTeamWorktreePaths(cwd: string, teamName: string): Promise<string[]> {
-  const teamRoot = join(cwd, '.omx', 'state', 'team', teamName);
+  const teamRoot = join(resolveCanonicalTeamStateRoot(cwd), 'team', teamName);
   const manifestPath = join(teamRoot, 'manifest.v2.json');
   const configPath = join(teamRoot, 'config.json');
   const sourcePath = existsSync(manifestPath) ? manifestPath : configPath;
@@ -52,7 +54,7 @@ async function readTeamWorktreePaths(cwd: string, teamName: string): Promise<str
 }
 
 async function readTeamNudgeProgressMs(cwd: string, teamName: string): Promise<number> {
-  const nudgeState = await readJsonIfExists(join(cwd, '.omx', 'state', 'team-leader-nudge.json'));
+  const nudgeState = await readJsonIfExists(join(omxStateDir(cwd), 'team-leader-nudge.json'));
   const progressByTeam = nudgeState?.progress_by_team;
   if (!progressByTeam || typeof progressByTeam !== 'object') return Number.NaN;
   const teamProgress = (progressByTeam as Record<string, unknown>)[teamName];
@@ -61,7 +63,7 @@ async function readTeamNudgeProgressMs(cwd: string, teamName: string): Promise<n
 }
 
 async function readCurrentTaskBaselineMs(worktreePath: string): Promise<number> {
-  return await statMsIfExists(join(worktreePath, '.omx', 'state', 'current-task-baseline.json'));
+  return await statMsIfExists(join(omxStateDir(worktreePath), 'current-task-baseline.json'));
 }
 
 export async function readLatestTeamProgressEvidenceMs(

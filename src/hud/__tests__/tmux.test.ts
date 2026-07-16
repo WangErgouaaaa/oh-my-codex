@@ -655,17 +655,16 @@ describe('HUD pane ownership helpers', () => {
     assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
   });
 
-  it('does not treat unrelated PowerShell environment prefixes as OMX owner metadata', () => {
+  it('leaves unrelated PowerShell environment prefixes unowned and outside legacy HUD reconciliation', () => {
     const panes = parseTmuxPaneSnapshot(
       [
         '%1\tcodex\tcodex',
         `%2\tnode\t$env:PATH = 'C:\\Tools'; & node omx.js hud --watch --preset=focused`,
       ].join('\n'),
     );
-
     assert.deepEqual(readHudPaneOwner(panes[1]!), { sessionId: undefined, leaderPaneId: undefined });
     assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
-    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), ['%2']);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
   });
 
   it('rejects empty, malformed, and near-miss PowerShell owner assignments', () => {
@@ -993,6 +992,19 @@ describe('dead HUD pane reaper', () => {
     assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
   });
 
+  it('preserves a deleted-cwd HUD with an unrelated PowerShell prefix', () => {
+    const panes = parseTmuxPaneSnapshot([
+      '%1\tcodex\tcodex',
+      `%2\tnode\t0\t0\t80\t3\t2\t80\t24\t$env:PATH = 'C:\\Tools'; & node omx.js hud --watch --preset=focused\t/tmp/stale (deleted)\t0\t200`,
+    ].join('\n'));
+    const result = reapDeadHudPanes(panes, {
+      killPane: () => {
+        throw new Error('unowned PowerShell prefix must not authorize reaping');
+      },
+    });
+    assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
+  });
+
   it('kills untagged HUD panes whose tmux cwd has been deleted', () => {
     const deletedPath = join(tmpdir(), `omx-doctor-native-hook-dist-${process.pid}-${Date.now()} (deleted)`);
     rmSync(deletedPath, { recursive: true, force: true });
@@ -1130,7 +1142,7 @@ describe('dead HUD pane reaper', () => {
 
     assert.deepEqual(killed, []);
     assert.deepEqual(result, { reaped: [], preserved: ['%2', '%3', '%4', '%5', '%6', '%7'] });
-    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), ['%2']);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
   });
 
   it('preserves HUD panes in an existing cwd whose name ends with the deleted marker text', () => {

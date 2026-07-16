@@ -214,6 +214,14 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "%777"
     exit 0
   fi
+  if [[ "$target" == "%777" && "$format" == "#{pane_current_command}" ]]; then
+    echo "node"
+    exit 0
+  fi
+  if [[ "$target" == "%777" && "$format" == "#{pane_start_command}" ]]; then
+    echo "codex"
+    exit 0
+  fi
   if [[ "$target" == "%777" && "$format" == "#S" ]]; then
     echo "maintainer-default"
     exit 0

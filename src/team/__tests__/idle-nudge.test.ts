@@ -51,6 +51,30 @@ if [[ "\$cmd" == "capture-pane" ]]; then
   exit 0
 fi
 
+if [[ "\$cmd" == "list-panes" ]]; then
+  if [[ "\$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+    printf '%%1 0 10001\n%%2 0 10002\n'
+  else
+    printf '%%1\n%%2\n'
+  fi
+  exit 0
+fi
+
+if [[ "\$cmd" == "show-option" ]]; then
+  printf 'team:a\n'
+  exit 0
+fi
+
+if [[ "\$cmd" == "if-shell" ]]; then
+  if [[ "\$*" == *'send-keys'* && "\${OMX_FAIL_SEND_KEYS:-0}" == "1" ]]; then
+    exit 1
+  fi
+  if [[ "\$*" == *'capture-pane'* ]]; then
+    printf '› \n'
+  fi
+  exit 0
+fi
+
 if [[ "\$cmd" == "send-keys" ]]; then
   if [[ "\${OMX_FAIL_SEND_KEYS:-0}" == "1" ]]; then
     exit 1
@@ -58,10 +82,6 @@ if [[ "\$cmd" == "send-keys" ]]; then
   exit 0
 fi
 
-if [[ "\$cmd" == "list-panes" ]]; then
-  printf '0 12345\\n'
-  exit 0
-fi
 
 exit 0
 `;

@@ -61,8 +61,35 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "%777"
     exit 0
   fi
+  if [[ "$target" == "%777" && "$format" == "#{pane_current_command}" ]]; then
+    echo "node"
+    exit 0
+  fi
+  if [[ "$target" == "%777" && "$format" == "#{pane_start_command}" ]]; then
+    echo "codex"
+    exit 0
+  fi
   if [[ "$target" == "%777" && "$format" == "#S" ]]; then
     echo "maintainer-default"
+    exit 0
+  fi
+
+fi
+if [[ "$cmd" == "list-panes" ]]; then
+  target=""
+  format=""
+  while (($#)); do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$target" == "maintainer-default" && "$format" == "#{pane_id}\t#{pane_current_command}\t#{pane_start_command}" ]]; then
+    printf '%%777\tnode\tcodex\n'
+    exit 0
+  fi
+  if [[ "$target" == "maintainer-default" && "$format" == "#{pane_id}" ]]; then
+    echo "%777"
     exit 0
   fi
 fi

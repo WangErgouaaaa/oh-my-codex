@@ -411,6 +411,7 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "list-panes" ]]; then
+  allArgs="$*"
   target=""
   while (($#)); do
     case "$1" in
@@ -419,7 +420,8 @@ if [[ "$cmd" == "list-panes" ]]; then
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
-    echo "%42 1"
+    if [[ "$allArgs" == *"#{pane_active}"* ]]; then printf '%%42\t1\tcodex\tcodex\n'; else printf '%%42\n'; fi
+
     exit 0
   fi
   echo "can't find session: $target" >&2
@@ -435,6 +437,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then
     echo "%42"
     exit 0
@@ -466,6 +472,11 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "bad display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${cwd}/tmux-buffer"
   exit 0
@@ -569,6 +580,7 @@ if [[ "$cmd" == "list-sessions" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  allArgs="$*"
   target=""
   while (($#)); do
     case "$1" in
@@ -577,9 +589,11 @@ if [[ "$cmd" == "list-panes" ]]; then
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
-    printf "%%99\t1\tcodex\tcodex\n"
+    if [[ "$allArgs" == *"#{pane_active}"* ]]; then printf "%%99\t1\tcodex\tcodex\n"; else printf "%%99\n"; fi
+
     exit 0
   fi
+
   exit 1
 fi
 if [[ "$cmd" == "show-option" ]]; then
@@ -610,6 +624,7 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%99" ]]; then printf '%%99\t0\t4242\n'; exit 0; fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%99" ]]; then echo "%99"; exit 0; fi
   if [[ "$format" == "#{pane_current_path}" && "$target" == "%99" ]]; then echo "${cwd}"; exit 0; fi
   if [[ "$format" == "#{pane_start_command}" && "$target" == "%99" ]]; then echo "codex"; exit 0; fi
@@ -620,6 +635,11 @@ if [[ "$cmd" == "display-message" ]]; then
   if [[ "$format" == "#S" && "$target" == "%42" ]]; then echo "${wrongSessionName}"; exit 0; fi
   exit 1
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${cwd}/tmux-buffer"
   exit 0
@@ -822,6 +842,7 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "list-panes" ]]; then
+  allArgs="$*"
   target=""
   while (($#)); do
     case "$1" in
@@ -830,7 +851,8 @@ if [[ "$cmd" == "list-panes" ]]; then
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
-    echo "%42 1"
+    if [[ "$allArgs" == *"#{pane_active}"* ]]; then printf "%%42\t1\tcodex\tcodex\n"; else printf "%%42\n"; fi
+
     exit 0
   fi
   echo "can't find session: $target" >&2
@@ -1060,6 +1082,7 @@ set -eu
 cmd="$1"
 shift || true
 if [[ "$cmd" == "list-panes" ]]; then
+  allArgs="$*"
   all=false
   target=""
   while (($#)); do
@@ -1075,7 +1098,8 @@ if [[ "$cmd" == "list-panes" ]]; then
     exit 0
   fi
   if [[ "$target" == "${managedSessionName}" ]]; then
-    echo "%42 1"
+    if [[ "$allArgs" == *"#{pane_active}"* ]]; then printf '%%42\t1\tcodex\tcodex\n'; else printf '%%42\n'; fi
+
     exit 0
   fi
   echo "can't find session: $target" >&2
@@ -1091,6 +1115,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%42" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then
     echo "%42"
     exit 0
@@ -1106,6 +1134,11 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "bad display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${cwd}/tmux-buffer"
   exit 0
@@ -1205,6 +1238,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%99" ]]; then
+    printf '%%99\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "node"
     exit 0
@@ -1240,6 +1277,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  allArgs="$*"
   target=""
   while (($#)); do
     case "$1" in
@@ -1248,11 +1286,16 @@ if [[ "$cmd" == "list-panes" ]]; then
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
-    printf "%%77\t1\tnode\tnode dist/cli/omx.js hud --watch\n%%99\t0\tcodex\tcodex\n"
+    if [[ "$allArgs" == *"#{pane_active}"* ]]; then printf "%%77\t1\tnode\tnode dist/cli/omx.js hud --watch\n%%99\t0\tcodex\tcodex\n"; else printf "%%77\n%%99\n"; fi
     exit 0
   fi
   exit 1
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${cwd}/tmux-buffer"
   exit 0
@@ -1362,6 +1405,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%99" ]]; then
+    printf '%%99\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%99" ]]; then
     echo "%99"
     exit 0
@@ -1381,6 +1428,11 @@ if [[ "$cmd" == "list-panes" ]]; then
   echo "can't find session" >&2
   exit 1
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${cwd}/tmux-buffer"
   exit 0
@@ -1925,6 +1977,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" && "$target" == "%99" ]]; then
+    printf '%%99\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_id}" && "$target" == "%99" ]]; then
     echo "%99"
     exit 0
@@ -1947,6 +2003,10 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   echo "bad display target: $target / $format" >&2
   exit 1
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   echo "can't find session" >&2

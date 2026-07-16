@@ -5,6 +5,7 @@ import { dirname } from 'path';
 import { spawnSync } from 'child_process';
 import { sleepSync } from '../../../utils/sleep.js';
 import { resolveCodexPane } from '../../../scripts/tmux-hook-engine.js';
+import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityLines } from '../../../hud/tmux.js';
 import { resolveTmuxBinaryForPlatform } from '../../../utils/platform-command.js';
 import type {
   HookEventEnvelope,
@@ -66,20 +67,12 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
   return { ok: true, stdout: result.stdout || '' };
 }
 
-function isCanonicalPaneId(value: string): boolean {
-  if (!/^%(?:0|[1-9]\d*)$/.test(value)) return false;
-  try {
-    return BigInt(value.slice(1)) <= BigInt(Number.MAX_SAFE_INTEGER);
-  } catch {
-    return false;
-  }
-}
+
 
 
 function parseCanonicalPaneSnapshot(stdout: string): Set<string> | null {
-  if (!stdout.endsWith('\n')) return null;
-  const paneIds = stdout.slice(0, -1).split('\n');
-  if (paneIds.length === 0 || paneIds.some((paneId) => !isCanonicalPaneId(paneId))) return null;
+  const paneIds = parseExactTmuxAuthorityLines(stdout);
+  if (!paneIds || paneIds.some((paneId) => parseCanonicalTmuxPaneId(paneId) !== paneId)) return null;
   const uniquePaneIds = new Set(paneIds);
   return uniquePaneIds.size === paneIds.length ? uniquePaneIds : null;
 }
@@ -109,6 +102,7 @@ function tmuxCommandQuote(value: string): string {
 }
 
 function paneAuthorityFormat(target: TmuxTarget): string | null {
+  if (parseCanonicalTmuxPaneId(target.paneId) !== target.paneId) return null;
   const sessionName = target.sessionSnapshot?.sessionName;
   if (sessionName && /[,#{}\r\n]/.test(sessionName)) return null;
   const sessionCondition = sessionName ? `#{==:#{session_name},${sessionName}}` : '1';
@@ -140,16 +134,15 @@ function isStrictPanePid(value: string): boolean {
 }
 
 function parseSessionPaneRows(stdout: string): SessionPaneRow[] | null {
-  if (!stdout.endsWith('\n')) return null;
-  const rows = stdout.slice(0, -1).split('\n');
-  if (rows.length === 0) return null;
+  const rows = parseExactTmuxAuthorityLines(stdout);
+  if (!rows) return null;
   const paneIds = new Set<string>();
   const parsedRows: SessionPaneRow[] = [];
   for (const row of rows) {
     const fields = row.split('\t');
     if (
       fields.length !== 5
-      || !isCanonicalPaneId(fields[0])
+      || parseCanonicalTmuxPaneId(fields[0]) !== fields[0]
       || (fields[1] !== '0' && fields[1] !== '1')
       || !isStrictPanePid(fields[2])
       || (fields[3] !== '0' && fields[3] !== '1')
@@ -168,15 +161,14 @@ function parseSessionPaneRows(stdout: string): SessionPaneRow[] | null {
 }
 
 function parseStrictPaneSnapshot(stdout: string): Map<string, TmuxTarget> | null {
-  if (!stdout.endsWith('\n')) return null;
-  const rows = stdout.slice(0, -1).split('\n');
-  if (rows.length === 0) return null;
+  const rows = parseExactTmuxAuthorityLines(stdout);
+  if (!rows) return null;
   const panes = new Map<string, TmuxTarget>();
   for (const row of rows) {
     const fields = row.split('\t');
     if (
       fields.length !== 3
-      || !isCanonicalPaneId(fields[0])
+      || parseCanonicalTmuxPaneId(fields[0]) !== fields[0]
       || (fields[1] !== '0' && fields[1] !== '1')
       || !isStrictPanePid(fields[2])
       || panes.has(fields[0])
@@ -243,7 +235,8 @@ function resolvePaneIdTarget(paneId: string): TargetResolution {
   const sessionName = resolvePaneSessionName(paneId);
   const sessionSnapshot = sessionName ? readSessionPaneSnapshot(sessionName) : null;
   const resolved = sessionSnapshot?.rows.find((row) => row.paneId === paneId && !row.dead);
-  return resolved
+  const authoritativePane = resolved ? strictPaneSnapshot(paneId) : null;
+  return resolved && authoritativePane?.pid === resolved.pid
     ? {
       result: { ok: true, reason: 'ok', target: paneId, paneId },
       target: { paneId, pid: resolved.pid, dead: false, sessionSnapshot: sessionSnapshot! },
@@ -262,7 +255,8 @@ function resolveSessionPaneTarget(sessionName: string): TargetResolution {
     || canonicalRows[0]
     || nonHudRows.find((row) => row.active)
     || nonHudRows[0];
-  if (!resolved) return missingTarget();
+  const authoritativePane = resolved ? strictPaneSnapshot(resolved.paneId) : null;
+  if (!resolved || authoritativePane?.pid !== resolved.pid) return missingTarget('pane_snapshot_mismatch');
   return {
     result: { ok: true, reason: 'ok', target: resolved.paneId, paneId: resolved.paneId },
     target: {
@@ -277,7 +271,7 @@ function resolveSessionPaneTarget(sessionName: string): TargetResolution {
 function resolveTmuxTarget(options: HookPluginSendKeysOptions): TargetResolution {
   const paneId = typeof options.paneId === 'string' ? options.paneId : '';
   if (paneId) {
-    if (!isCanonicalPaneId(paneId)) return missingTarget('invalid_pane_id');
+    if (parseCanonicalTmuxPaneId(paneId) !== paneId) return missingTarget('invalid_pane_id');
     return resolvePaneIdTarget(paneId);
   }
 
@@ -285,7 +279,7 @@ function resolveTmuxTarget(options: HookPluginSendKeysOptions): TargetResolution
   if (sessionName) return resolveSessionPaneTarget(sessionName);
 
   const envPane = String(resolveCodexPane() || '');
-  if (!isCanonicalPaneId(envPane)) return missingTarget();
+  if (parseCanonicalTmuxPaneId(envPane) !== envPane) return missingTarget();
   return resolvePaneIdTarget(envPane);
 }
 

@@ -102,8 +102,14 @@ function escapeRegex(value: string): string {
   return value.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
 }
 
+function atomicPaneMutationPattern(targetPane: string, prompt: string): RegExp {
+  return new RegExp(
+    `set-buffer -b [^\\n]+ -- ${escapeRegex(prompt)}[\\s\\S]*?if-shell -t ${escapeRegex(targetPane)} -F .*'paste-buffer'.*'${escapeRegex(targetPane)}'.*__OMX_PANE_MUTATION_OK__`,
+  );
+}
+
 function defaultAutoNudgePattern(targetPane: string): RegExp {
-  return new RegExp(`send-keys -t ${escapeRegex(targetPane)} -l ${escapeRegex(DEFAULT_AUTO_NUDGE_RESPONSE)} \\[OMX_TMUX_INJECT\\]`);
+  return atomicPaneMutationPattern(targetPane, `${DEFAULT_AUTO_NUDGE_RESPONSE} [OMX_TMUX_INJECT]`);
 }
 
 /**
@@ -116,20 +122,33 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="\$1"
 shift || true
-if [[ "$cmd" == "display-message" ]]; then
+if [[ "\$cmd" == "display-message" ]]; then
   target=""
-  while [[ "$#" -gt 0 ]]; do
-    case "$1" in
-      -t) target="$2"; shift 2 ;;
-      *) shift ;;
+  format=""
+  while [[ "\$#" -gt 0 ]]; do
+    case "\$1" in
+      -p) shift ;;
+      -t) target="\$2"; shift 2 ;;
+      *) format="\$1"; shift ;;
     esac
   done
-  printf '%s\t0\t4242\n' "$target"
+  case "\$format" in
+    '#{pane_id}\t#{pane_dead}\t#{pane_pid}') printf '%s\\t0\\t4242\\n' "\$target" ;;
+    '#{pane_id}') printf '%s\\n' "\$target" ;;
+    '#{pane_in_mode}') printf '%s\\n' "${paneInMode}" ;;
+    '#{pane_current_command}') printf 'node\\n' ;;
+    '#{pane_start_command}') printf 'codex --model gpt-5\\n' ;;
+    '#{pane_current_path}') printf '%s\\n' "\${PWD}" ;;
+    '#S') printf '%s\\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}" ;;
+  esac
   exit 0
 fi
 if [[ "\$cmd" == "capture-pane" ]]; then
   if [[ -n "\${OMX_TEST_CAPTURE_FILE:-}" && -f "\${OMX_TEST_CAPTURE_FILE}" ]]; then
     cat "\${OMX_TEST_CAPTURE_FILE}"
+    if [[ "$(tail -c 1 "\${OMX_TEST_CAPTURE_FILE}")" != $'\n' ]]; then printf '\n'; fi
+  else
+    printf '› ready\\n'
   fi
   exit 0
 fi
@@ -141,16 +160,10 @@ if [[ "\$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
   exit 0
 fi
-if [[ "\$cmd" == "paste-buffer" ]]; then
-  target=""
-  while [[ "\$#" -gt 0 ]]; do
-    case "\$1" in
-      -t) target="\$2"; shift 2 ;;
-      *) shift ;;
-    esac
-  done
-  if [[ -f "${tmuxLogPath}.buffer" ]]; then
-    echo "send-keys -t \${target} -l $(cat "${tmuxLogPath}.buffer")" >> "${tmuxLogPath}"
+if [[ "\$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "\$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\\n'
   fi
   exit 0
 fi
@@ -158,50 +171,23 @@ if [[ "\$cmd" == "delete-buffer" ]]; then
   rm -f "${tmuxLogPath}.buffer"
   exit 0
 fi
-if [[ "\$cmd" == "send-keys" ]]; then
-  exit 0
-fi
-if [[ "\$cmd" == "display-message" ]]; then
+if [[ "\$cmd" == "list-panes" ]]; then
   target=""
   format=""
   while [[ "\$#" -gt 0 ]]; do
     case "\$1" in
-      -p) shift ;;
       -t) target="\$2"; shift 2 ;;
-      *) format="\$1"; shift ;;
-    esac
-  done
-  if [[ "\$format" == "#{pane_in_mode}" ]]; then
-    echo "${paneInMode}"
-    exit 0
-  fi
-  if [[ "\$format" == "#{pane_current_command}" && "\$target" == "%99" ]]; then
-    echo "node"
-    exit 0
-  fi
-  if [[ "\$format" == "#{pane_start_command}" && "\$target" == "%99" ]]; then
-    echo "codex --model gpt-5"
-    exit 0
-  fi
-  if [[ "\$format" == "#S" ]]; then
-    echo "${'${OMX_TEST_TMUX_SESSION_NAME:-devsess}'}"
-    exit 0
-  fi
-  exit 0
-fi
-if [[ "\$cmd" == "list-panes" ]]; then
-  target=""
-  while [[ "\$#" -gt 0 ]]; do
-    case "\$1" in
-      -t) target="\$2"; shift 2 ;;
+      -F) format="\$2"; shift 2 ;;
       *) shift ;;
     esac
   done
-  if [[ -n "\$target" && "\$target" == "${'${OMX_TEST_TMUX_SESSION_NAME:-devsess}'}" ]]; then
-    printf '%%99\t1\tnode\tcodex --model gpt-5\n'
-    exit 0
+  if [[ -n "\$target" && "\$target" == "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}" ]]; then
+    if [[ "\$format" == '#{pane_id}' ]]; then
+      printf '%%99\\n'
+    else
+      printf '%%99\\t1\\tnode\\tcodex --model gpt-5\\n'
+    fi
   fi
-  echo "%1 12345"
   exit 0
 fi
 exit 0
@@ -335,8 +321,8 @@ describe('notify-hook auto-nudge', () => {
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, defaultAutoNudgePattern('%99'), 'should send nudge response with injection marker');
       // Codex CLI needs C-m sent twice with a delay for reliable submission
-      const cmMatches = tmuxLog.match(/send-keys -t %99 C-m/g);
-      assert.ok(cmMatches && cmMatches.length >= 2, `should send C-m twice, got ${cmMatches?.length ?? 0}`);
+      const cmMatches = tmuxLog.match(/if-shell -t %99 -F .*'send-keys'.*'%99'.*'C-m'.*__OMX_PANE_MUTATION_OK__/g);
+      assert.ok(cmMatches && cmMatches.length >= 2, `should submit C-m twice through atomic receipts, got ${cmMatches?.length ?? 0}`);
     });
   });
 
@@ -375,7 +361,7 @@ describe('notify-hook auto-nudge', () => {
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
-      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l/, 'planning-phase prompts should not be auto-nudged');
+      assert.doesNotMatch(tmuxLog, atomicPaneMutationPattern('%99', `${DEFAULT_AUTO_NUDGE_RESPONSE} [OMX_TMUX_INJECT]`), 'planning-phase prompts should not be auto-nudged');
 
       const skillState = JSON.parse(await readFile(join(stateDir, 'skill-active-state.json'), 'utf-8'));
       assert.equal(skillState.phase, 'planning');
@@ -711,6 +697,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "sh"
     exit 0
@@ -735,21 +729,27 @@ if [[ "$cmd" == "display-message" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
+  format=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
+      -F) format="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
+    if [[ "$format" == "#{pane_id}" ]]; then
+      printf "%%99\n%%100\n"
+    else
     printf "%%99\t0\tsh\tbash\n%%100\t1\tnode\tcodex --model gpt-5\n"
+    fi
     exit 0
   fi
   echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
-  printf "How can I help?\n› "
+  printf "How can I help?\n› \n"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -758,6 +758,13 @@ if [[ "$cmd" == "set-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -839,6 +846,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "codex"
     exit 0
@@ -859,21 +874,27 @@ if [[ "$cmd" == "display-message" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
+  format=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
+      -F) format="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
+    if [[ "$format" == "#{pane_id}" ]]; then
+      printf "%%99\n%%100\n"
+    else
     printf "%%99\t0\tcodex\tcodex\\n%%100\t1\tcodex\tcodex\\n"
+    fi
     exit 0
   fi
   echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
-  printf "How can I help?\\n› "
+  printf "How can I help?\\n› \n"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -882,6 +903,13 @@ if [[ "$cmd" == "set-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -964,6 +992,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "node"
     exit 0
@@ -984,21 +1020,27 @@ if [[ "$cmd" == "display-message" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
+  format=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
+      -F) format="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
+    if [[ "$format" == "#{pane_id}" ]]; then
+      printf "%%99\n%%100\n"
+    else
     printf "%%99\t0\tnode\tbash\\n%%100\t1\tnode\tcodex --model gpt-5\\n"
+    fi
     exit 0
   fi
   echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
-  printf "How can I help?\\n› "
+  printf "How can I help?\\n› \n"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -1007,6 +1049,13 @@ if [[ "$cmd" == "set-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1089,6 +1138,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "bash"
     exit 0
@@ -1109,21 +1166,27 @@ if [[ "$cmd" == "display-message" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
+  format=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
+      -F) format="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
+    if [[ "$format" == "#{pane_id}" ]]; then
+      printf "%%99\n%%100\n"
+    else
     printf "%%99\t1\tbash\tcodex --model gpt-5\\n%%100\t0\tnode\tcodex --model gpt-5\\n"
+    fi
     exit 0
   fi
   echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
-  printf "How can I help?\\n› "
+  printf "How can I help?\\n› \n"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -1132,6 +1195,13 @@ if [[ "$cmd" == "set-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1214,6 +1284,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "bash"
     exit 0
@@ -1230,21 +1308,27 @@ if [[ "$cmd" == "display-message" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
+  format=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -t) target="$2"; shift 2 ;;
+      -F) format="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
+    if [[ "$format" == "#{pane_id}" ]]; then
+      printf "%%99\n%%100\n"
+    else
     printf "%%99\t1\tbash\tcodex --model gpt-5\\n%%100\t0\tbash\tbash\\n"
+    fi
     exit 0
   fi
   echo "%1 12345"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
-  printf "How can I help?\\n› "
+  printf "How can I help?\\n› \n"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -1253,6 +1337,13 @@ if [[ "$cmd" == "set-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1361,7 +1452,7 @@ exit 0
       assert.equal(existsSync(join(localStateRoot, 'team', 'auto-nudge', 'workers', 'worker-1', 'heartbeat.json')), false, 'unvalidated worker cwd state root must not receive heartbeat state');
       if (existsSync(tmuxLogPath)) {
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.doesNotMatch(tmuxLog, /send-keys/, 'unvalidated worker state root must not inject auto-nudge input');
+        assert.doesNotMatch(tmuxLog, /if-shell -t %99 -F .*paste-buffer -t %99.*__OMX_PANE_MUTATION_OK__/, 'unvalidated worker state root must not inject auto-nudge input');
       }
     });
   });
@@ -1373,6 +1464,7 @@ exit 0
       const codexHome = join(cwd, 'codex-home');
       const fakeBinDir = join(cwd, 'fake-bin');
       const tmuxLogPath = join(cwd, 'tmux.log');
+      const managedSessionName = buildTmuxSessionName(cwd, 'sess-managed');
 
       await mkdir(logsDir, { recursive: true });
       await mkdir(workerStateRoot, { recursive: true });
@@ -1403,6 +1495,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "bash"
     exit 0
@@ -1418,7 +1518,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
-  printf "How can I help?\\n› "
+  printf "How can I help?\\n› \n"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -1427,6 +1527,13 @@ if [[ "$cmd" == "set-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1503,7 +1610,7 @@ exit 0
 
       if (existsSync(tmuxLogPath)) {
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.doesNotMatch(tmuxLog, new RegExp(`send-keys -t %99 -l ${escapeRegex(DEFAULT_AUTO_NUDGE_RESPONSE)}`), 'should NOT send nudge');
+        assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'), 'should NOT send nudge');
       }
     });
   });
@@ -1542,6 +1649,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "zsh"
     exit 0
@@ -1558,6 +1673,13 @@ if [[ "$cmd" == "set-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "paste-buffer" ]]; then
@@ -1634,6 +1756,14 @@ shift || true
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "sh"
     exit 0
@@ -1672,6 +1802,13 @@ if [[ "$cmd" == "show-buffer" ]]; then
   if [[ -f "${tmuxLogPath}.buffer" ]]; then cat "${tmuxLogPath}.buffer"; fi
   exit 0
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  command="\${@: -2:1}"
+  if [[ "$command" == *'__OMX_PANE_MUTATION_OK__'* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
+  exit 0
+fi
 if [[ "$cmd" == "paste-buffer" ]]; then
   target=""
   while [[ "$#" -gt 0 ]]; do
@@ -1694,14 +1831,20 @@ if [[ "$cmd" == "send-keys" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
+  format=""
   while (($#)); do
     case "$1" in
       -t) target="$2"; shift 2 ;;
+      -F) format="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
+    if [[ "$format" == "#{pane_id}" ]]; then
+      printf "%%99\n%%100\n"
+    else
     printf "%%99\t1\tsh\tbash\\n%%100\t0\tnode\tcodex --model gpt-5\\n"
+    fi
     exit 0
   fi
   echo "%1 12345"
@@ -1831,7 +1974,7 @@ exit 0
 
       if (existsSync(tmuxLogPath)) {
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l/, 'should NOT send nudge when disabled');
+        assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'), 'should NOT send nudge when disabled');
       }
     });
   });
@@ -2079,7 +2222,7 @@ exit 0
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /send-keys -t %99 -l continue now \[OMX_TMUX_INJECT\]/, 'should use custom response with marker');
+      assert.match(tmuxLog, atomicPaneMutationPattern('%99', 'continue now [OMX_TMUX_INJECT]'), 'should use custom response with atomic mutation receipt');
     });
   });
 
@@ -3329,7 +3472,7 @@ exit 0
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
         assert.doesNotMatch(tmuxLog, /Deep interview is active; auto-approval shortcuts are blocked until the interview finishes\. \[OMX_TMUX_INJECT\]/);
-        assert.equal(tmuxLog.includes(`send-keys -t %99 -l ${blockedResponse} [OMX_TMUX_INJECT]`), false);
+        assert.doesNotMatch(tmuxLog, atomicPaneMutationPattern('%99', `${blockedResponse} [OMX_TMUX_INJECT]`));
       });
     });
   }
@@ -3378,7 +3521,7 @@ exit 0
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Deep interview is active; auto-approval shortcuts are blocked until the interview finishes\. \[OMX_TMUX_INJECT\]/);
+      assert.doesNotMatch(tmuxLog, atomicPaneMutationPattern('%99', 'Deep interview is active; auto-approval shortcuts are blocked until the interview finishes. [OMX_TMUX_INJECT]'));
     });
   });
 
@@ -3427,7 +3570,7 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /Deep interview is active; auto-approval shortcuts are blocked until the interview finishes\. \[OMX_TMUX_INJECT\]/);
-      assert.equal(tmuxLog.includes(`send-keys -t %99 -l ${NEXT_I_SHOULD_RESPONSE} [OMX_TMUX_INJECT]`), false);
+      assert.doesNotMatch(tmuxLog, atomicPaneMutationPattern('%99', `${NEXT_I_SHOULD_RESPONSE} [OMX_TMUX_INJECT]`));
     });
   });
 
@@ -3485,8 +3628,8 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(
         tmuxLog,
-        new RegExp(`send-keys -t %99 -l ${customResponse} \\[OMX_TMUX_INJECT\\]`),
-        'should allow a non-blocked continuation response during deep interview',
+        atomicPaneMutationPattern('%99', `${customResponse} [OMX_TMUX_INJECT]`),
+        'should allow a non-blocked continuation response during deep interview with an atomic mutation receipt',
       );
     });
   });
@@ -3895,7 +4038,7 @@ exit 0
 
       if (existsSync(tmuxLogPath)) {
         const log1 = await readFile(tmuxLogPath, 'utf-8');
-        assert.doesNotMatch(log1, /send-keys -t %99 -l/, 'default pattern should not match with custom config');
+        assert.doesNotMatch(log1, defaultAutoNudgePattern('%99'), 'default pattern should not match with custom config');
       }
 
       // Clean tmux log for second run

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { omxStateDir } from '../../utils/paths.js';
 import {
   resolveTeamApiOperation,
   buildLegacyTeamDeprecationHint,
@@ -14,6 +15,7 @@ import {
 import {
   initTeamState,
   createTask,
+  readTeamConfig,
   readTeamLeaderAttention,
   readTeamManifestV2,
   readTask,
@@ -30,6 +32,7 @@ import {
   updateWorkerHeartbeat,
   writeMonitorSnapshot,
   writeWorkerStatus,
+  saveTeamConfig,
 } from '../state.js';
 
 async function setupTeam(name: string): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
@@ -1937,13 +1940,23 @@ describe('executeTeamApiOperation: read-stall-state', () => {
     const { cwd, cleanup } = await setupTeam('stall-state-detached-progress');
     try {
       const workerWorktree = join(cwd, 'worktrees', 'worker-1');
-      await mkdir(join(workerWorktree, '.omx', 'state'), { recursive: true });
+      await mkdir(omxStateDir(workerWorktree), { recursive: true });
 
       const manifest = await readTeamManifestV2('stall-state-detached-progress', cwd);
+      const config = await readTeamConfig('stall-state-detached-progress', cwd);
       assert.ok(manifest);
+      assert.ok(config);
       await writeTeamManifestV2({
         ...manifest!,
         workers: (manifest!.workers ?? []).map((worker) => (
+          worker.name === 'worker-1'
+            ? { ...worker, worktree_path: workerWorktree }
+            : worker
+        )),
+      }, cwd);
+      await saveTeamConfig({
+        ...config!,
+        workers: config!.workers.map((worker) => (
           worker.name === 'worker-1'
             ? { ...worker, worktree_path: workerWorktree }
             : worker
@@ -1966,7 +1979,7 @@ describe('executeTeamApiOperation: read-stall-state', () => {
         work_remaining: false,
         stalled_for_ms: null,
       }, cwd);
-      await writeFile(join(workerWorktree, '.omx', 'state', 'current-task-baseline.json'), JSON.stringify({
+      await writeFile(join(omxStateDir(workerWorktree), 'current-task-baseline.json'), JSON.stringify({
         version: 1,
         tasks: [],
       }, null, 2));
