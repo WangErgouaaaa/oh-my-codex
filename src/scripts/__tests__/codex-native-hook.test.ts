@@ -10635,7 +10635,10 @@ case "$1" in
     if [[ -f "$optionPath" ]]; then printf '%s\n' "$(<"$optionPath")"; fi
     ;;
   display-message)
-    printf '200\t60\n'
+    if [[ "$*" == *'#{session_id}'* ]]; then printf '$1\n'; else printf '200\t60\n'; fi
+    ;;
+  if-shell)
+    if [[ "$*" =~ display-message\\ -p\\ (__omx_hud_mutation_[0-9a-f-]+) ]]; then printf '%s\n' "\${BASH_REMATCH[1]}"; fi
     ;;
   split-window)
     touch "$createdPath"
@@ -10809,7 +10812,10 @@ case "$1" in
     if [[ -f "$optionPath" ]]; then printf '%s\n' "$(<"$optionPath")"; fi
     ;;
   display-message)
-    printf '200\t60\n'
+    if [[ "$*" == *'#{session_id}'* ]]; then printf '$1\n'; else printf '200\t60\n'; fi
+    ;;
+  if-shell)
+    if [[ "$*" =~ display-message\\ -p\\ (__omx_hud_mutation_[0-9a-f-]+) ]]; then printf '%s\n' "\${BASH_REMATCH[1]}"; fi
     ;;
   resize-pane)
     ;;
