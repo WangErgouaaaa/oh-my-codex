@@ -1436,19 +1436,25 @@ function parseExactTmuxScalar(raw: string): string | null {
   return value && !value.includes("\n") ? value : null;
 }
 
+export function parseStrictTmuxPaneIncarnations(output: string): Map<string, string> | null {
+  const framed = parseExactTmuxFrame(output);
+  if (!framed) return null;
+  const incarnations = new Map<string, string>();
+  for (const line of framed.split('\n')) {
+    const match = /^(%0|%[1-9][0-9]*) ([01]) ([0-9]+)$/.exec(line);
+    const paneId = match?.[1] ? parseCanonicalTmuxPaneId(match[1]) : null;
+    if (!paneId || !match?.[2] || !match[3]) return null;
+    if (match[2] === '1') continue;
+    if (!/^[1-9][0-9]*$/.test(match[3]) || incarnations.has(paneId)) return null;
+    incarnations.set(paneId, match[3]);
+  }
+  return incarnations;
+}
+
 function readStrictTmuxPaneIncarnations(): Map<string, string> | null {
   try {
     const output = execTmuxFileSync(['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}'], { encoding: 'utf-8' });
-    const framed = parseExactTmuxFrame(output);
-    if (!framed) return null;
-    const incarnations = new Map<string, string>();
-    for (const line of framed.split('\n')) {
-      const match = /^(%0|%[1-9][0-9]*) 0 ([1-9][0-9]*)$/.exec(line);
-      const paneId = match?.[1] ? parseCanonicalTmuxPaneId(match[1]) : null;
-      if (!paneId || !match?.[2] || incarnations.has(paneId)) return null;
-      incarnations.set(paneId, match[2]);
-    }
-    return incarnations;
+    return parseStrictTmuxPaneIncarnations(output);
   } catch {
     return null;
   }

@@ -25,6 +25,7 @@ import {
   classifyCodexExecFailure,
   resolveSignalExitCode,
   parseTmuxPaneSnapshot,
+  parseStrictTmuxPaneIncarnations,
   findHudWatchPaneIds,
   buildHudPaneCleanupTargets,
   readTopLevelTomlString,
@@ -3399,6 +3400,12 @@ describe("tmux HUD pane helpers", () => {
     ]);
   });
 
+  it("parseStrictTmuxPaneIncarnations skips valid dead remain-on-exit panes", () => {
+    const incarnations = parseStrictTmuxPaneIncarnations("%1 0 101\n%2 1 0\n%3 0 303\n");
+    assert.deepEqual(incarnations, new Map([["%1", "101"], ["%3", "303"]]));
+    assert.equal(parseStrictTmuxPaneIncarnations("%1 0 101\n%02 1 0\n"), null);
+    assert.equal(parseStrictTmuxPaneIncarnations("%1 0 101\n%2 2 202\n"), null);
+  });
   it("createHudWatchPane splits from the emitting pane target when provided", () => {
     const calls: string[][] = [];
     const globalPaneIds = new Set(["%1"]);

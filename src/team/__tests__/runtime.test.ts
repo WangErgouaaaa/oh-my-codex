@@ -8467,7 +8467,7 @@ esac
     }
   });
 
-  it('shutdownTeam preserves persisted worker-looking panes without owner tags', async () => {
+  it('shutdownTeam tears down a live persisted legacy worker without an owner tag', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-unpersisted-legacy-worker-'));
     const teamName = 'team-unpersisted-legacy-worker';
     try {
@@ -8534,7 +8534,7 @@ esac
 `,
         },
         async ({ tmuxLogPath }) => {
-          await initTeamState(teamName, 'shutdown unpersisted legacy worker test', 'executor', 2, cwd);
+          await initTeamState(teamName, 'shutdown persisted legacy worker test', 'executor', 2, cwd);
           const config = await readTeamConfig(teamName, cwd);
           assert.ok(config);
           if (!config) return;
@@ -8549,7 +8549,7 @@ esac
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.match(tmuxLog, /kill-pane -t %12/);
-          assert.doesNotMatch(tmuxLog, /kill-pane -t %13/);
+          assert.match(tmuxLog, /kill-pane -t %13/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %14/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %99/);
         },

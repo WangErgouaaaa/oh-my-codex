@@ -457,6 +457,7 @@ function isAuthoritativelyAbsentPane(paneId: string, teamName: string): boolean 
 function filterSharedSessionShutdownWorkerPaneIdsByOwner(
   paneIds: string[],
   teamPaneOwnerId: string,
+  legacyPersistedPaneIds: ReadonlySet<string> = new Set(),
   onOwnerReadError?: (paneId: string, error: string) => void,
 ): string[] {
   const expectedOwnerId = teamPaneOwnerId.trim();
@@ -464,6 +465,7 @@ function filterSharedSessionShutdownWorkerPaneIdsByOwner(
   return paneIds.filter((paneId) => {
     const actualOwnerId = readPaneTeamOwnerTagResult(paneId);
     if (actualOwnerId.status === 'value') return actualOwnerId.value === expectedOwnerId;
+    if (actualOwnerId.status === 'missing') return legacyPersistedPaneIds.has(paneId);
     if (actualOwnerId.status === 'error') onOwnerReadError?.(paneId, actualOwnerId.error);
     return false;
   });
@@ -4046,10 +4048,16 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         onOwnerReadError: (hudPaneId, error) => warnOwnerReadError('HUD pane', hudPaneId, error),
       })) ?? null)
       : hudPaneId;
+    const persistedWorkerPaneIds = new Set(
+      config.workers
+        .map((worker) => worker.pane_id)
+        .filter((paneId): paneId is string => typeof paneId === 'string'),
+    );
     const shutdownCandidatePaneIds = sharedSessionTopology
       ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
         sharedSessionTopology.teamWorkerPaneIds,
         tmuxPaneOwnerId,
+        persistedWorkerPaneIds,
         (paneId, error) => warnOwnerReadError('worker pane', paneId, error),
       )
       : listPaneIds(sessionName);
@@ -4137,6 +4145,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         ? filterSharedSessionShutdownWorkerPaneIdsByOwner(
           resolveSharedSessionShutdownTopology(sessionName, effectiveLeaderPaneId, sanitized).teamWorkerPaneIds,
           tmuxPaneOwnerId,
+          persistedWorkerPaneIds,
           (paneId, error) => warnOwnerReadError('worker pane', paneId, error),
         )
         : listPaneIds(sessionName),
@@ -4163,6 +4172,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
           await assertFreshShutdownAuthority(sanitized, cwd, shutdownAuthority);
           return true;
         },
+        verifyOwnership: (paneId) => persistedWorkerPaneIds.has(paneId),
       },
     });
     if (paneTeardownSummary.kill.failed > 0 || paneTeardownSummary.kill.succeeded !== paneTeardownSummary.kill.attempted) {
