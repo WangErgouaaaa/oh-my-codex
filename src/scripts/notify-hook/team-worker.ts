@@ -7,11 +7,14 @@ import { readFile, writeFile, mkdir, appendFile, rename, stat, readdir } from 'f
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { resolveWorkerNotifyTeamStateRootPath } from '../../team/state-root.js';
+import { migrateV1ToV2, readTeamStateOutcome } from '../../team/state.js';
 import { asNumber, safeString, isTerminalPhase } from './utils.js';
 import { readJsonIfExists } from './state-io.js';
 import { logTmuxHookEvent } from './log.js';
 import { evaluatePaneInjectionReadiness, sendPaneInput } from './team-tmux-guard.js';
 import { resolvePaneTarget } from './tmux-injection.js';
+import { runProcess } from './process-runner.js';
+import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
 import {
   classifyLeaderActionState,
   resolveAllWorkersIdleIntent,
@@ -198,33 +201,21 @@ export async function readWorkerStatusState(stateDir, teamName, workerName) {
   }
 }
 
-export async function readTeamWorkersForIdleCheck(stateDir, teamName) {
-  // Try manifest.v2.json first (preferred), then config.json. Some older or
-  // synthetic team states have a partial manifest plus the usable worker pane
-  // metadata in config.json, so fall through when a candidate is incomplete.
-  const manifestPath = join(stateDir, 'team', teamName, 'manifest.v2.json');
-  const configPath = join(stateDir, 'team', teamName, 'config.json');
-  const candidatePaths = [manifestPath, configPath].filter((path) => existsSync(path));
-  let fallback = null;
-
-  for (const srcPath of candidatePaths) {
-    try {
-      const raw = await readFile(srcPath, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') continue;
-      const workers = parsed.workers;
-      if (!Array.isArray(workers) || workers.length === 0) continue;
-      const tmuxSession = safeString(parsed.tmux_session || '').trim();
-      const leaderPaneId = safeString(parsed.leader_pane_id || '').trim();
-      const result = { workers, tmuxSession, leaderPaneId };
-      if (leaderPaneId) return result;
-      if (!fallback) fallback = result;
-    } catch {
-      // Try the next state source.
-    }
+export async function readTeamWorkersForIdleCheck(stateDir, teamName, cwd = process.cwd()) {
+  let outcome = await readTeamStateOutcome(teamName, cwd);
+  // Config-only v1 state is the sole supported migration. A malformed,
+  // divergent, or incomplete dual-file state is not authority for injection.
+  if (outcome.status === 'invalid' && outcome.source === 'manifest' && outcome.reason === 'incomplete') {
+    await migrateV1ToV2(teamName, cwd);
+    outcome = await readTeamStateOutcome(teamName, cwd);
   }
-
-  return fallback;
+  if (outcome.status !== 'valid') return null;
+  const config = outcome.config;
+  const workers = Array.isArray(config?.workers) ? config.workers : [];
+  const tmuxSession = safeString(config?.tmux_session);
+  const leaderPaneId = safeString(config?.leader_pane_id);
+  if (workers.length === 0 || !tmuxSession) return null;
+  return { workers, tmuxSession, leaderPaneId, config, stateDir };
 }
 
 
@@ -278,6 +269,32 @@ async function checkLeaderPaneReadyForWorkerStateReminder(paneTarget) {
     requireReady: false,
     requireIdle: false,
   });
+}
+
+async function captureLeaderPaneAuthority(teamName, cwd, expected = null) {
+  const outcome = await readTeamStateOutcome(teamName, cwd);
+  if (outcome.status !== 'valid') return null;
+  const config = outcome.config;
+  const paneId = parseCanonicalTmuxPaneId(config?.leader_pane_id);
+  const tmuxSession = safeString(config?.tmux_session);
+  const ownerId = safeString(config?.tmux_pane_owner_id);
+  if (!paneId || paneId !== config?.leader_pane_id || !tmuxSession || !ownerId) return null;
+  try {
+    const result = await runProcess('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}\t#{@omx_team_pane_owner_id}'], 2000);
+    const raw = safeString(result.stdout);
+    if (!raw.endsWith('\n') || raw.includes('\r')) return null;
+    const lines = raw.slice(0, -1).split('\n');
+    const rows = lines.map((line) => line.split('\t'));
+    const paneIds = new Set();
+    if (rows.some((row) => row.length !== 5 || parseCanonicalTmuxPaneId(row[0]) !== row[0] || (row[1] !== '0' && row[1] !== '1') || !/^[1-9][0-9]*$/.test(row[2]) || !row[3] || !row[4] || paneIds.has(row[0]) || !paneIds.add(row[0]))) return null;
+    const row = rows.find(([id]) => id === paneId);
+    if (!row) return null;
+    const [, dead, pid, session, owner] = row;
+    if (dead !== '0' || !/^[1-9][0-9]*$/.test(pid) || session !== tmuxSession || owner !== ownerId || (expected && (expected.paneId !== paneId || expected.panePid !== pid || expected.tmuxSession !== tmuxSession || expected.ownerId !== ownerId))) return null;
+    return { paneId, panePid: pid, tmuxSession, ownerId };
+  } catch {
+    return null;
+  }
 }
 
 async function emitLeaderPaneMissingDeferred({
@@ -365,7 +382,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
   if (!myHeartbeat.fresh) return;
 
   // Read team config to get worker list and leader tmux target
-  const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
+  const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName, cwd);
   if (!teamInfo) return;
   const { workers, tmuxSession, leaderPaneId } = teamInfo;
   const canonicalLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
@@ -421,6 +438,9 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
     });
     return;
   }
+  const leaderAuthority = await captureLeaderPaneAuthority(teamName, cwd);
+  if (!leaderAuthority || leaderAuthority.paneId !== canonicalLeaderPaneId) return;
+  const assertLeaderPaneAuthority = async () => (await captureLeaderPaneAuthority(teamName, cwd, leaderAuthority)) !== null;
 
   const N = workers.length;
   const nextAction = `Run \`omx team status ${teamName}\` now, read unread worker messages, then assign the next concrete task, reconcile results, or shut the team down.`;
@@ -459,6 +479,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
       prompt: message,
       submitKeyPresses: 2,
       submitDelayMs: 100,
+      assertPaneAuthority: assertLeaderPaneAuthority,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
 
@@ -589,7 +610,7 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
   if ((nowMs - lastNotifiedMs) < cooldownMs) return;
 
   // Read team config for tmux target
-  const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
+  const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName, cwd);
   if (!teamInfo) return;
   const { tmuxSession, leaderPaneId } = teamInfo;
   const canonicalLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
@@ -607,6 +628,9 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
     });
     return;
   }
+  const leaderAuthority = await captureLeaderPaneAuthority(teamName, cwd);
+  if (!leaderAuthority || leaderAuthority.paneId !== canonicalLeaderPaneId) return;
+  const assertLeaderPaneAuthority = async () => (await captureLeaderPaneAuthority(teamName, cwd, leaderAuthority)) !== null;
   const tmuxTarget = canonicalLeaderPaneId;
   const paneGuard = await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget);
   if (!paneGuard.ok) {
@@ -651,6 +675,7 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
       prompt: message,
       submitKeyPresses: 2,
       submitDelayMs: 100,
+      assertPaneAuthority: assertLeaderPaneAuthority,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
 

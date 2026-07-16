@@ -70,6 +70,14 @@ describe('normalizeTmuxHookConfig', () => {
     assert.equal(unsetConfig.reason, 'invalid_target');
     assert.equal(unsetConfig.target, null);
   });
+
+  it('rejects pane target aliases instead of trimming or normalizing them', () => {
+    for (const value of [' %2', '%2 ', '%02', '%4294967296']) {
+      const config = normalizeTmuxHookConfig({ enabled: true, target: { type: 'pane', value } });
+      assert.equal(config.valid, false, value);
+      assert.equal(config.target, null, value);
+    }
+  });
 });
 
 describe('pickActiveMode', () => {
@@ -419,6 +427,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}" && "$target" == "%2" ]]; then
+    echo "%2"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%2" ]]; then
     echo "node"
     exit 0
@@ -435,7 +447,15 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 1
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf "%%2\tnode\tnode /pkg/dist/cli/omx.js hud --watch\n%%42\tnode\tcodex --model gpt-5\n"
+  if [[ "$*" == *"#{pane_id}" && "$*" != *"#{pane_current_command}"* ]]; then
+    printf "%%2\n%%42\n"
+  else
+    if [[ "\${OMX_TEST_TMUX_BAD_BATCH:-}" == "1" ]]; then
+      printf "%%2\tnode\tnode /pkg/dist/cli/omx.js hud --watch\n%%42\tnode\tcodex --model gpt-5\nmalformed\n"
+    else
+      printf "%%2\tnode\tnode /pkg/dist/cli/omx.js hud --watch\n%%42\tnode\tcodex --model gpt-5\n"
+    fi
+  fi
   exit 0
 fi
 echo "unsupported" >&2
@@ -446,11 +466,44 @@ exit 1
       process.env.TMUX_PANE = '%2';
 
       assert.equal(resolveCodexPane(), '%42');
+      process.env.OMX_TEST_TMUX_BAD_BATCH = '1';
+      assert.equal(resolveCodexPane(), '');
+      delete process.env.OMX_TEST_TMUX_BAD_BATCH;
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
       if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
       else delete process.env.TMUX_PANE;
+      delete process.env.OMX_TEST_TMUX_BAD_BATCH;
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects noncanonical TMUX_PANE before any targeted tmux command', async () => {
+    const { mkdtemp, writeFile, chmod, readFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-resolve-codex-pane-invalid-'));
+    const fakeTmuxPath = join(fakeBinDir, 'tmux');
+    const logPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    try {
+      await writeFile(fakeTmuxPath, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "$OMX_TEST_TMUX_LOG"\nexit 1\n`);
+      await chmod(fakeTmuxPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+      process.env.OMX_TEST_TMUX_LOG = logPath;
+      for (const paneId of ['%01', '%4294967296', ' %2 ']) {
+        process.env.TMUX_PANE = paneId;
+        assert.equal(resolveCodexPane(), '');
+      }
+      await assert.rejects(readFile(logPath, 'utf8'), /ENOENT/);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      delete process.env.OMX_TEST_TMUX_LOG;
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });

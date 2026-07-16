@@ -490,10 +490,11 @@ export async function resolveManagedPaneFromAnchorAtPromptContext(anchorPane: st
 }
 
 export async function verifyManagedPaneTarget(paneId: string, cwd: string, payload: any, { allowTeamWorker = true } = {}): Promise<any> {
-  const paneTarget = safeString(paneId).trim();
-  if (!paneTarget) {
+  const paneTarget = safeString(paneId);
+  if (!isCanonicalPaneId(paneTarget)) {
     return { ok: false, reason: 'missing_pane_target', paneTarget: '' };
   }
+
 
   const managedContext = await resolveManagedSessionContext(cwd, payload, { allowTeamWorker, paneTarget });
   if (!managedContext.managed) {
@@ -612,21 +613,34 @@ interface ManagedSessionPaneRow {
   startCommand: string;
 }
 
-function parseManagedSessionPaneRows(stdout: string): ManagedSessionPaneRow[] {
-  return safeString(stdout)
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      const [paneId = '', activeRaw = '0', rawCurrentCommand = '', rawStartCommand = ''] = line.split('\t');
-      return {
-        paneId: safeString(paneId).trim(),
-        active: safeString(activeRaw).trim() === '1',
-        currentCommand: safeString(rawCurrentCommand).trim().toLowerCase(),
-        startCommand: safeString(rawStartCommand).trim().toLowerCase(),
-      };
-    })
-    .filter((row) => row.paneId !== '');
+function isCanonicalPaneId(value: string): boolean {
+  if (!/^%(?:0|[1-9]\d*)$/.test(value)) return false;
+  try {
+    return BigInt(value.slice(1)) <= BigInt(Number.MAX_SAFE_INTEGER);
+  } catch {
+    return false;
+  }
+}
+
+function parseManagedSessionPaneRows(stdout: string): ManagedSessionPaneRow[] | null {
+  const raw = safeString(stdout);
+  if (!raw.endsWith('\n')) return null;
+  const rows = raw.slice(0, -1).split('\n');
+  if (rows.length === 0) return null;
+  const paneIds = new Set<string>();
+  const parsedRows: ManagedSessionPaneRow[] = [];
+  for (const row of rows) {
+    const fields = row.split('\t');
+    if (fields.length !== 4 || !isCanonicalPaneId(fields[0]) || (fields[1] !== '0' && fields[1] !== '1') || paneIds.has(fields[0])) return null;
+    paneIds.add(fields[0]);
+    parsedRows.push({
+      paneId: fields[0],
+      active: fields[1] === '1',
+      currentCommand: fields[2].trim().toLowerCase(),
+      startCommand: fields[3].trim().toLowerCase(),
+    });
+  }
+  return parsedRows;
 }
 
 function selectManagedSessionPane(
@@ -646,8 +660,8 @@ function selectManagedSessionPane(
   return wrapperFallbackRows[0]?.paneId || '';
 }
 export async function resolveManagedCurrentPane(cwd: string, payload: any, { allowTeamWorker = false } = {}): Promise<string> {
-  const paneTarget = safeString(process.env.TMUX_PANE || '').trim();
-  if (!paneTarget) return '';
+  const paneTarget = safeString(process.env.TMUX_PANE || '');
+  if (!isCanonicalPaneId(paneTarget)) return '';
   const verdict = await verifyManagedPaneTarget(paneTarget, cwd, payload, { allowTeamWorker });
   if (!verdict.ok) return '';
   const commandState = await readManagedPaneCommandState(paneTarget);
@@ -666,7 +680,9 @@ export async function resolveManagedSessionPane(cwd: string, payload: any): Prom
       ['list-panes', '-s', '-t', expectedSession, '-F', '#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_start_command}'],
       2000,
     );
-    return selectManagedSessionPane(parseManagedSessionPaneRows(panesResult.stdout));
+    const paneRows = parseManagedSessionPaneRows(panesResult.stdout);
+    return paneRows ? selectManagedSessionPane(paneRows) : '';
+
   } catch {
     // best effort only
   }
@@ -675,8 +691,9 @@ export async function resolveManagedSessionPane(cwd: string, payload: any): Prom
 }
 
 export async function resolveManagedPaneFromAnchor(anchorPane: string, cwd: string, payload: any, { allowTeamWorker = false } = {}): Promise<string> {
-  const paneTarget = safeString(anchorPane).trim();
-  if (!paneTarget) return '';
+  const paneTarget = safeString(anchorPane);
+  if (!isCanonicalPaneId(paneTarget)) return '';
+
   const verdict = await verifyManagedPaneTarget(paneTarget, cwd, payload, { allowTeamWorker });
   if (!verdict.ok) return '';
 
@@ -693,9 +710,10 @@ export async function resolveManagedPaneFromAnchor(anchorPane: string, cwd: stri
       ['list-panes', '-s', '-t', sessionName, '-F', '#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_start_command}'],
       2000,
     );
-    const selectedPane = selectManagedSessionPane(parseManagedSessionPaneRows(panesResult.stdout), {
+    const paneRows = parseManagedSessionPaneRows(panesResult.stdout);
+    const selectedPane = paneRows ? selectManagedSessionPane(paneRows, {
       allowWrapperFallback: paneLooksLikeDetachedManagedWrapperFallback(commandState),
-    });
+    }) : '';
     if (selectedPane) return selectedPane;
   } catch {
     // best effort only

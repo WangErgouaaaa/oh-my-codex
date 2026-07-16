@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -226,29 +226,26 @@ describe('createHookPluginSdk', () => {
 set -eu
 cmd="$1"
 shift || true
-if [[ "$cmd" == "list-panes" ]]; then
-  printf "%%2	1	node /pkg/dist/cli/omx.js hud --watch
-%%42	0	codex --model gpt-5
-"
-  exit 0
-fi
-if [[ "$cmd" == "send-keys" ]]; then
-  exit 0
-fi
 if [[ "$cmd" == "display-message" ]]; then
-  target=""
-  format=""
-  while (($#)); do
-    case "$1" in
-      -p) shift ;;
-      -t) target="$2"; shift 2 ;;
-      *) format="$1"; shift ;;
-    esac
-  done
-  if [[ "$format" == "#{pane_id}" ]]; then
-    echo "$target"
-    exit 0
+  printf "devsess\n"
+  exit 0
+fi
+if [[ "$cmd" == "list-panes" ]]; then
+  if [[ "$*" == *"#{pane_active}"* ]]; then
+    printf "%%2\t0\t2002\t1\tnode /pkg/dist/cli/omx.js hud --watch\n%%42\t0\t4242\t0\tcodex --model gpt-5\n"
+  elif [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf "%%2\t0\t2002\n%%42\t0\t4242\n"
+  elif [[ "$*" == *"#{pane_id}"* ]]; then
+    printf "%%2\n%%42\n"
   fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+
+if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 exit 1
@@ -265,6 +262,10 @@ exit 1
         const result = await sdk.tmux.sendKeys({ text: 'hello', sessionName: 'devsess' });
         assert.equal(result.ok, true);
         assert.equal(result.target, '%42');
+
+        const directResult = await sdk.tmux.sendKeys({ text: 'direct hello', paneId: '%42', cooldownMs: 0 });
+        assert.equal(directResult.ok, true);
+        assert.equal(directResult.target, '%42');
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;
@@ -291,6 +292,127 @@ exit 1
           process.env.TMUX_PANE = originalPane;
         }
         await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects truncated session batches and PID-recycled targets before submit sinks', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
+      const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-sdk-bin-'));
+      const fakeTmuxPath = join(fakeBinDir, 'tmux');
+      const logPath = join(fakeBinDir, 'tmux.log');
+      const countPath = join(fakeBinDir, 'snapshot-count');
+      const previousPath = process.env.PATH;
+      try {
+        await writeFile(fakeTmuxPath, `#!/usr/bin/env bash
+set -eu
+cmd="$1"
+shift || true
+if [[ "$cmd" == "list-panes" ]]; then
+  if [[ "$*" == *"#{pane_active}"* ]]; then
+    detailed_count=0
+    [[ -f "$OMX_TEST_DETAILED_COUNT" ]] && detailed_count="$(<"$OMX_TEST_DETAILED_COUNT")"
+    detailed_count=$((detailed_count + 1))
+    printf '%s' "$detailed_count" > "$OMX_TEST_DETAILED_COUNT"
+    if [[ "\${OMX_TEST_BAD_DETAILED:-}" == "1" || ( "\${OMX_TEST_LATE_BAD_DETAILED:-}" == "1" && "$detailed_count" -gt 1 ) ]]; then
+      printf "%%42\t0\t4242\t1\tcodex --model gpt-5"
+    elif [[ "\${OMX_TEST_CLASSIFICATION_DRIFT:-}" == "1" && "$detailed_count" -gt 1 ]]; then
+      printf "%%42\t0\t4242\t1\tbash\n"
+    else
+      printf "%%42\t0\t4242\t1\tcodex --model gpt-5\n"
+    fi
+  elif [[ "$*" == *"#{pane_dead}"* ]]; then
+    count=0
+    [[ -f "$OMX_TEST_TMUX_COUNT" ]] && count="$(<"$OMX_TEST_TMUX_COUNT")"
+    count=$((count + 1))
+    printf '%s' "$count" > "$OMX_TEST_TMUX_COUNT"
+    pid=4242
+    if [[ "\${OMX_TEST_PID_RECYCLE:-}" == "1" && "$count" -gt 1 ]]; then pid=9999; fi
+    printf "%%42\t0\t%s\n" "$pid"
+  elif [[ "$*" == *"#{pane_id}"* ]]; then
+    if [[ "\${OMX_TEST_SESSION_DRIFT:-}" == "1" && "$(<"$OMX_TEST_DETAILED_COUNT")" -gt 1 ]]; then
+      printf "%%42\n%%99\n"
+    else
+      printf "%%42\n"
+    fi
+    [[ "\${OMX_TEST_EXTRA_ID:-}" == "1" ]] && printf "%%99\n"
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  printf '%s\n' "$*" >> "$OMX_TEST_TMUX_LOG"
+  if [[ "\${OMX_TEST_PID_RECYCLE:-}" == "1" ]]; then exit 0; fi
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
+if [[ "$cmd" == "send-keys" ]]; then
+  printf '%s\\n' "$*" >> "$OMX_TEST_TMUX_LOG"
+  exit 0
+fi
+exit 1
+`);
+        await import('node:fs/promises').then((fs) => fs.chmod(fakeTmuxPath, 0o755));
+        process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+        process.env.OMX_TEST_TMUX_LOG = logPath;
+        process.env.OMX_TEST_TMUX_COUNT = countPath;
+        process.env.OMX_TEST_DETAILED_COUNT = join(fakeBinDir, 'detailed-count');
+        process.env.OMX_TEST_BAD_DETAILED = '1';
+
+        const sdk = createHookPluginSdk({ cwd, pluginName: 'strict-target', event: makeEvent(), sideEffectsEnabled: true });
+        const truncated = await sdk.tmux.sendKeys({ text: 'hello', sessionName: 'devsess', cooldownMs: 0 });
+        assert.equal(truncated.ok, false);
+        assert.equal(truncated.reason, 'target_missing');
+        assert.equal(existsSync(logPath), false);
+
+        delete process.env.OMX_TEST_BAD_DETAILED;
+        process.env.OMX_TEST_EXTRA_ID = '1';
+        const mismatched = await sdk.tmux.sendKeys({ text: 'hello mismatch', sessionName: 'devsess', cooldownMs: 0 });
+        assert.equal(mismatched.ok, false);
+        assert.equal(mismatched.reason, 'target_missing');
+        assert.equal(existsSync(logPath), false);
+
+        delete process.env.OMX_TEST_EXTRA_ID;
+        process.env.OMX_TEST_PID_RECYCLE = '1';
+        const recycled = await sdk.tmux.sendKeys({ text: 'hello again', sessionName: 'devsess', cooldownMs: 0 });
+        assert.equal(recycled.ok, false);
+        assert.equal(recycled.reason, 'target_missing');
+        const sends = await readFile(logPath, 'utf8').catch(() => '');
+        assert.doesNotMatch(sends, /hello again \[OMX_TMUX_INJECT\]/);
+        delete process.env.OMX_TEST_PID_RECYCLE;
+        await writeFile(process.env.OMX_TEST_DETAILED_COUNT, '0');
+        const typedBeforeDrift = await readFile(logPath, 'utf8');
+        process.env.OMX_TEST_CLASSIFICATION_DRIFT = '1';
+        const classificationDrift = await sdk.tmux.sendKeys({ text: 'classification drift', sessionName: 'devsess', cooldownMs: 0 });
+        assert.equal(classificationDrift.ok, false);
+        assert.equal(classificationDrift.reason, 'target_missing');
+        assert.equal(await readFile(logPath, 'utf8'), typedBeforeDrift);
+        delete process.env.OMX_TEST_CLASSIFICATION_DRIFT;
+        await writeFile(process.env.OMX_TEST_DETAILED_COUNT, '0');
+
+        process.env.OMX_TEST_SESSION_DRIFT = '1';
+        const sessionDrift = await sdk.tmux.sendKeys({ text: 'session drift', sessionName: 'devsess', cooldownMs: 0 });
+        assert.equal(sessionDrift.ok, false);
+        assert.equal(sessionDrift.reason, 'target_missing');
+        assert.equal(await readFile(logPath, 'utf8'), typedBeforeDrift);
+        delete process.env.OMX_TEST_SESSION_DRIFT;
+        await writeFile(process.env.OMX_TEST_DETAILED_COUNT, '0');
+
+        process.env.OMX_TEST_LATE_BAD_DETAILED = '1';
+        const lateTruncated = await sdk.tmux.sendKeys({ text: 'late truncated', sessionName: 'devsess', cooldownMs: 0 });
+        assert.equal(lateTruncated.ok, false);
+        assert.equal(lateTruncated.reason, 'target_missing');
+        assert.equal(await readFile(logPath, 'utf8'), typedBeforeDrift);
+        delete process.env.OMX_TEST_LATE_BAD_DETAILED;
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        delete process.env.OMX_TEST_TMUX_LOG;
+        delete process.env.OMX_TEST_TMUX_COUNT;
+        delete process.env.OMX_TEST_EXTRA_ID;
+        delete process.env.OMX_TEST_BAD_DETAILED;
+        delete process.env.OMX_TEST_PID_RECYCLE;
+        delete process.env.OMX_TEST_DETAILED_COUNT;
+        await rm(cwd, { recursive: true, force: true });
+        await rm(fakeBinDir, { recursive: true, force: true });
       }
     });
   });

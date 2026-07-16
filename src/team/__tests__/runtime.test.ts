@@ -51,7 +51,7 @@ import {
   TEAM_WORKER_INHERITED_MODEL_ENV,
 } from '../model-contract.js';
 import { readTeamEvents } from '../state/events.js';
-import { sanitizeTeamName } from '../tmux-session.js';
+import { buildResizeHookName, sanitizeTeamName } from '../tmux-session.js';
 import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identity.js';
 import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
 import { planWorktreeTarget } from '../worktree.js';
@@ -481,6 +481,8 @@ async function withMockTmuxFixture<T>(
   const fakeBinDir = await mkdtemp(join(tmpdir(), options.dirPrefix));
   const tmuxLogPath = join(fakeBinDir, 'tmux.log');
   const tmuxStubPath = join(fakeBinDir, 'tmux');
+  const tmuxRealPath = join(fakeBinDir, 'tmux-real');
+  const tmuxSnapshotCachePath = join(fakeBinDir, 'tmux-snapshot-cache');
   const previousPath = process.env.PATH;
   const previousEnv = new Map<string, string | undefined>();
   const envOverrides = {
@@ -489,7 +491,260 @@ async function withMockTmuxFixture<T>(
   };
 
   try {
-    await writeFile(tmuxStubPath, options.tmuxScript(tmuxLogPath));
+    await writeFile(tmuxRealPath, options.tmuxScript(tmuxLogPath));
+    await chmod(tmuxRealPath, 0o755);
+    await writeFile(tmuxStubPath, `#!${process.execPath}
+const { existsSync, readFileSync, rmSync, writeFileSync, appendFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const real = ${JSON.stringify(tmuxRealPath)};
+const cache = ${JSON.stringify(tmuxSnapshotCachePath)};
+const splitState = cache + '-splits';
+const splitStartState = cache + '-split-starts';
+const optionState = cache + '-options';
+const paneOptionState = cache + '-pane-options';
+const log = ${JSON.stringify(tmuxLogPath)};
+const args = process.argv.slice(2);
+const detailedFormat = '#{pane_id}\\t#{pane_current_command}\\t#{pane_start_command}';
+const canonicalPaneId = /^%0$|^%[1-9][0-9]*$/;
+const readSplitIds = () => existsSync(splitState)
+  ? readFileSync(splitState, 'utf8').split('\\n').filter((paneId) => canonicalPaneId.test(paneId))
+  : [];
+const appendMissingPaneIds = (paneIds) => {
+  const seen = new Set(paneIds);
+  for (const paneId of readSplitIds()) if (!seen.has(paneId)) { seen.add(paneId); paneIds.push(paneId); }
+  return paneIds;
+};
+const splitPaneDetail = (paneId) => {
+  const stored = existsSync(splitStartState)
+    ? readFileSync(splitStartState, 'utf8').split('\\n').filter(Boolean).map((row) => row.split('\\t', 2)).find(([id]) => id === paneId)
+    : undefined;
+  const startCommand = stored?.[1] ?? 'zsh';
+  const currentCommand = /(?:^|\\s)(?:exec\\s+env\\s+)?[^\\s]*node(?:\\s|$)|hud --watch/.test(startCommand)
+    ? 'node'
+    : /(?:^|\\s)(?:exec\\s+)?(?:env\\s+[^\\s]+\\s+)*codex(?:\\s|$)/.test(startCommand)
+      ? 'codex'
+      : 'zsh';
+  return paneId + '\\t' + currentCommand + '\\t' + startCommand;
+};
+const isIdOnly = args[0] === 'list-panes' && args.at(-2) === '-F' && args.at(-1) === '#{pane_id}';
+const isDetailed = args[0] === 'list-panes' && args.at(-2) === '-F' && args.at(-1) === detailedFormat;
+const livenessFormat = '#{pane_id} #{pane_dead} #{pane_pid}';
+const isLiveness = args[0] === 'list-panes' && args.includes('-a') && args.at(-2) === '-F' && args.at(-1) === livenessFormat;
+const deadFormat = '#{pane_id} #{pane_dead}';
+const isDeadProbe = args[0] === 'list-panes' && args.includes('-a') && args.at(-2) === '-F' && args.at(-1) === deadFormat;
+const startCommandFormat = '#{pane_id}\\t#{pane_start_command}';
+const isStartCommandSnapshot = args[0] === 'list-panes' && args.includes('-a') && args.at(-2) === '-F' && args.at(-1) === startCommandFormat;
+if (isDeadProbe) {
+  appendFileSync(log, args.join(' ') + '\\n');
+  const detailed = spawnSync(real, ['list-panes', '-t', 'leader:0', '-F', detailedFormat], { encoding: 'utf8', env: process.env });
+  if (detailed.status !== 0 || detailed.error) process.exit(detailed.status || 1);
+  const paneIds = appendMissingPaneIds(String(detailed.stdout || '')
+    .split('\\n')
+    .filter(Boolean)
+    .map((row) => row.split(/[\\t\\x1f]/, 1)[0].trim())
+    .filter((paneId) => canonicalPaneId.test(paneId)));
+  process.stdout.write([...new Set(paneIds)].map((paneId) => paneId + ' 0').join('\\n') + (paneIds.length ? '\\n' : ''));
+  process.exit(0);
+}
+if (isLiveness) {
+  appendFileSync(log, args.join(' ') + '\\n');
+  const direct = spawnSync(real, args, { encoding: 'utf8', env: process.env });
+  const directRows = String(direct.stdout || '').split('\\n').filter(Boolean);
+  if (direct.status === 0 && directRows.length > 0 && directRows.every((row) => /^(%0|%[1-9][0-9]*) [01] [1-9][0-9]*$/.test(row))) {
+    process.stdout.write(direct.stdout);
+    process.exit(0);
+  }
+  const detailed = spawnSync(real, ['list-panes', '-t', 'leader:0', '-F', detailedFormat], { encoding: 'utf8', env: process.env });
+  if (detailed.status !== 0 || detailed.error) process.exit(detailed.status || 1);
+  const paneIds = appendMissingPaneIds(String(detailed.stdout || '')
+    .split('\\n')
+    .filter(Boolean)
+    .map((row) => row.split(/[\\t\\x1f]/, 1)[0].trim())
+    .filter((paneId) => canonicalPaneId.test(paneId)));
+  if (paneIds.length === 0 && direct.status === 0 && directRows.length === 1 && /^[01] [1-9][0-9]*$/.test(directRows[0])) paneIds.push('%1');
+  process.stdout.write([...new Set(paneIds)].map((paneId, index) => {
+    const legacy = paneId === '%1' && directRows.length === 1 && /^[01] [1-9][0-9]*$/.test(directRows[0]) ? directRows[0] : '0 ' + (index + 1);
+    return paneId + ' ' + legacy;
+  }).join('\\n') + (paneIds.length ? '\\n' : ''));
+  process.exit(0);
+}
+if (isStartCommandSnapshot) {
+  appendFileSync(log, args.join(' ') + '\\n');
+  const direct = spawnSync(real, args, { encoding: 'utf8', env: process.env });
+  if (direct.status !== 0 || direct.error) process.exit(direct.status || 1);
+  const splitStarts = existsSync(splitStartState)
+    ? readFileSync(splitStartState, 'utf8').split('\\n').filter(Boolean).map((row) => row.split('\\t', 2))
+    : [];
+  const storedCommandFor = (paneId) => splitStarts.find(([id]) => id === paneId)?.[1];
+  const rows = String(direct.stdout || '').split('\\n').filter(Boolean).map((row) => {
+    const [paneId, startCommand, ...extra] = row.split('\\t');
+    if (!canonicalPaneId.test(paneId) || extra.length > 0) return row;
+    return paneId + '\\t' + (startCommand || storedCommandFor(paneId) || 'zsh');
+  });
+  const seen = new Set(rows.map((row) => row.split('\\t', 1)[0]));
+  for (const [paneId, startCommand] of splitStarts) {
+    if (canonicalPaneId.test(paneId) && !seen.has(paneId)) rows.push(paneId + '\\t' + startCommand);
+  }
+  process.stdout.write(rows.join('\\n') + (rows.length ? '\\n' : ''));
+  process.exit(0);
+}
+if (isDetailed) {
+  const direct = existsSync(cache)
+    ? { stdout: readFileSync(cache, 'utf8'), status: 0, error: undefined }
+    : spawnSync(real, args, { encoding: 'utf8', env: process.env });
+  if (existsSync(cache)) rmSync(cache, { force: true });
+  if (direct.status !== 0 || direct.error) process.exit(direct.status || 1);
+  const rows = String(direct.stdout || '').split('\\n').filter(Boolean);
+  const seen = new Set(rows.map((row) => row.split('\\t', 1)[0]));
+  for (const paneId of readSplitIds()) if (!seen.has(paneId)) rows.push(splitPaneDetail(paneId));
+  process.stdout.write(rows.join('\\n') + (rows.length ? '\\n' : ''));
+  process.exit(0);
+}
+const parseTmuxCommand = (command) => {
+  const words = [];
+  let word = '';
+  let quote = '';
+  let escaped = false;
+  for (const char of command) {
+    if (escaped) { word += char; escaped = false; continue; }
+    if (char === String.fromCharCode(92)) { escaped = true; continue; }
+    if (quote) {
+      if (char === quote) quote = '';
+      else word += char;
+      continue;
+    }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (/\\s/.test(char)) {
+      if (word) { words.push(word); word = ''; }
+      continue;
+    }
+    word += char;
+  }
+  if (escaped) word += String.fromCharCode(92);
+  if (word) words.push(word);
+  return words;
+};
+const authoritativePane = (paneId) => {
+  const direct = spawnSync(real, ['list-panes', '-a', '-t', paneId, '-F', livenessFormat], { encoding: 'utf8', env: process.env });
+  const row = String(direct.stdout || '').split('\\n').filter(Boolean)
+    .find((candidate) => {
+      const [id, dead, pid] = candidate.split(' ');
+      return id === paneId && (dead === '0' || dead === '1') && /^[1-9][0-9]*$/.test(pid ?? '');
+    });
+  if (row) {
+    const [id, dead, pid] = row.split(' ');
+    return { id, dead, pid };
+  }
+  const detailed = spawnSync(real, ['list-panes', '-t', 'leader:0', '-F', detailedFormat], { encoding: 'utf8', env: process.env });
+  const paneIds = appendMissingPaneIds(String(detailed.stdout || '').split('\\n').filter(Boolean)
+    .map((candidate) => candidate.split(/[\\t\\x1f]/, 1)[0].trim())
+    .filter((id) => canonicalPaneId.test(id)));
+  const index = paneIds.indexOf(paneId);
+  if (index < 0) return null;
+  const deadProbe = spawnSync(real, ['list-panes', '-t', paneId, '-F', '#{pane_dead}'], { encoding: 'utf8', env: process.env });
+  const pidProbe = spawnSync(real, ['list-panes', '-t', paneId, '-F', '#{pane_pid}'], { encoding: 'utf8', env: process.env });
+  const dead = String(deadProbe.stdout || '').trim();
+  const pid = String(pidProbe.stdout || '').trim();
+  return {
+    id: paneId,
+    dead: dead === '0' || dead === '1' ? dead : '0',
+    pid: /^[1-9][0-9]*$/.test(pid) ? pid : String(index + 1),
+  };
+};
+if (args[0] === 'if-shell' && args[1] === '-F') {
+  appendFileSync(log, args.join(' ') + '\\n');
+  const targetIndex = args.indexOf('-t');
+  const conditionIndex = targetIndex >= 0 ? targetIndex + 2 : 2;
+  const condition = args[conditionIndex] ?? '';
+  const success = args[conditionIndex + 1] ?? '';
+  const rejected = args[conditionIndex + 2] ?? '';
+  const expectedId = condition.match(/#\\{==:#\\{pane_id\\},([^}]+)\\}/)?.[1];
+  const expectedPid = condition.match(/#\\{==:#\\{pane_pid\\},([^}]+)\\}/)?.[1];
+  const pane = expectedId ? authoritativePane(expectedId) : null;
+  const accepted = Boolean(pane && pane.dead === '0' && pane.id === expectedId && pane.pid === expectedPid);
+  const branch = accepted ? success : rejected;
+  if (!branch) process.exit(0);
+  const branchArgs = parseTmuxCommand(branch);
+  if (branchArgs.length === 0) process.exit(0);
+  const result = spawnSync(real, branchArgs, { encoding: 'utf8', env: process.env });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.exit(result.status ?? 1);
+}
+if (args[0] === 'set-option' && args[1] === '-g' && args[2]?.startsWith('@omx_split_owner_nonce_')) {
+  appendFileSync(log, args.join(' ') + '\\n');
+  appendFileSync(optionState, [args[2], args[3]].join('\\t') + '\\n');
+  process.exit(0);
+}
+if (args[0] === 'show-options' && args[1] === '-g' && args[2] === '-v' && args[3]?.startsWith('@omx_split_owner_nonce_')) {
+  appendFileSync(log, args.join(' ') + '\\n');
+  if (!existsSync(optionState)) process.exit(1);
+  const match = readFileSync(optionState, 'utf8').split('\\n').filter(Boolean).reverse()
+    .map((row) => row.split('\\t'))
+    .find(([option]) => option === args[3]);
+  if (!match) process.exit(1);
+  process.stdout.write(match[1] + '\\n');
+  process.exit(0);
+}
+if (args[0] === 'set-option' && args[1] === '-p' && args[2] === '-t' && canonicalPaneId.test(args[3] || '') && args[4]) {
+  const result = spawnSync(real, args, { encoding: 'utf8', env: process.env });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status === 0) appendFileSync(paneOptionState, [args[3], args[4], args[5] ?? ''].join('\\t') + '\\n');
+  process.exit(result.status ?? 1);
+}
+if (args[0] === 'show-option' && args[1] === '-qv' && args[2] === '-p' && args[3] === '-t' && canonicalPaneId.test(args[4] || '') && args[5]) {
+  appendFileSync(log, args.join(' ') + '\\n');
+  const persisted = existsSync(paneOptionState)
+    ? readFileSync(paneOptionState, 'utf8').split('\\n').filter(Boolean).reverse().map((row) => row.split('\\t')).find(([paneId, option]) => paneId === args[4] && option === args[5])
+    : undefined;
+  if (persisted) {
+    process.stdout.write(persisted[2] + '\\n');
+    process.exit(0);
+  }
+  const result = spawnSync(real, args, { encoding: 'utf8', env: process.env });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.exit(result.status ?? 1);
+}
+if (isIdOnly) {
+  appendFileSync(log, args.join(' ') + '\\n');
+  const targetIndex = args.indexOf('-t');
+  const detailedArgs = targetIndex >= 0
+    ? ['list-panes', '-t', args[targetIndex + 1], '-F', detailedFormat]
+    : ['list-panes', '-t', 'leader:0', '-F', detailedFormat];
+  const detailed = spawnSync(real, detailedArgs, { encoding: 'utf8', env: process.env });
+  if (detailed.status !== 0 || detailed.error) process.exit(detailed.status || 1);
+  const rows = String(detailed.stdout || '').split('\\n').filter(Boolean);
+  const paneIds = appendMissingPaneIds(rows.map((row) => row.split(/[\\t\\x1f]/, 1)[0].trim()));
+  writeFileSync(cache, [...rows, ...readSplitIds().filter((paneId) => !rows.some((row) => row.split(/[\\t\\x1f]/, 1)[0].trim() === paneId)).map(splitPaneDetail)].join('\\n') + (rows.length || readSplitIds().length ? '\\n' : ''));
+  process.stdout.write(paneIds.length > 0 ? [...new Set(paneIds)].join('\\n') + '\\n' : '');
+  process.exit(0);
+}
+if (args[0] === 'split-window') {
+  const result = spawnSync(real, args, { encoding: 'utf8', env: process.env });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status === 0) {
+    const paneId = String(result.stdout || '').replace(/\\r?\\n$/, '');
+    if (canonicalPaneId.test(paneId) && !readSplitIds().includes(paneId)) {
+      appendFileSync(splitState, paneId + '\\n');
+      appendFileSync(splitStartState, paneId + '\\t' + (args.at(-1) ?? '') + '\\n');
+    }
+  }
+  process.exit(result.status ?? 1);
+}
+if (args[0] === 'kill-pane' && args[1] === '-t' && canonicalPaneId.test(args[2] || '')) {
+  const result = spawnSync(real, args, { stdio: 'inherit', env: process.env });
+  if (result.status === 0 && existsSync(splitState)) {
+    const remaining = readSplitIds().filter((paneId) => paneId !== args[2]);
+    writeFileSync(splitState, remaining.length ? remaining.join('\\n') + '\\n' : '');
+  }
+  process.exit(result.status ?? 1);
+}
+const result = spawnSync(real, args, { stdio: 'inherit', env: process.env });
+process.exit(result.status ?? 1);
+`);
     await chmod(tmuxStubPath, 0o755);
 
     for (const binary of options.binaries ?? []) {
@@ -1553,7 +1808,7 @@ case "$1" in
     exit 0
     ;;
   capture-pane)
-    printf 'OpenAI Codex\\n> '
+    printf 'OpenAI Codex\\n> \\n'
     exit 0
     ;;
   send-keys|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|kill-pane|kill-session)
@@ -1717,10 +1972,17 @@ case "$1" in
     exit 0
     ;;
   capture-pane)
-    printf 'OpenAI Codex\\n> '
+    if [ -f "${cwd}/startup-no-evidence-sent" ]; then
+      exit 0
+    fi
+    printf 'OpenAI Codex\n> \n'
     exit 0
     ;;
-  send-keys|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|kill-pane|kill-session)
+  send-keys)
+    : > "${cwd}/startup-no-evidence-sent"
+    exit 0
+    ;;
+  resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|kill-pane|kill-session)
     exit 0
     ;;
   *)
@@ -2409,6 +2671,11 @@ case "\${1:-}" in
     ;;
   list-panes)
     case "$*" in
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%1 0 2000001111\n"
+        if [ -f "$worker_state" ]; then printf "%%2 0 2000002222\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3 0 2000003333\n"; fi
+        ;;
       *"#{pane_id} #{pane_dead}"*)
         printf "%%1 0\n"
         if [ -f "$worker_state" ]; then printf "%%2 0\n"; fi
@@ -2575,7 +2842,8 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
-      *"#{pane_dead} #{pane_pid}"*) echo "1 2000999999" ;;
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*) printf "%%1 0 2000001111\n%%2 0 2000002222\n%%3 0 2000003333\n" ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "0 2000001111" ;;
       *"-t %2"*"#{pane_pid}"*) echo "2000002222" ;;
       *"#{pane_pid}"*) echo "2000001111" ;;
       *) exit 0 ;;
@@ -2598,6 +2866,10 @@ EOF
         ;;
       *) echo "%3" ;;
     esac
+    exit 0
+    ;;
+  capture-pane)
+    printf 'OpenAI Codex\n> \n'
     exit 0
     ;;
   set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session)
@@ -2659,7 +2931,7 @@ esac
     }
   });
 
-  it('startTeam captures interactive worker pid from the resolved pane id', async () => {
+  it('startTeam persists the interactive worker PID from the creation authority snapshot', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-pane-pid-'));
     const prevTmux = process.env.TMUX;
     const prevTmuxPane = process.env.TMUX_PANE;
@@ -2696,11 +2968,14 @@ case "\${1:-}" in
       *"pane_current_command"*)
         printf "%%1\tnode\t'codex'\n"
         ;;
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%1 0 2000001111\n%%2 0 2\n%%3 0 2000003333\n"
+        ;;
       *"#{pane_dead} #{pane_pid}"*)
-        echo "1 2000999999"
+        echo "0 2000001111"
         ;;
       *"-t %2"*"#{pane_pid}"*)
-        echo "2000002222"
+        echo "2"
         ;;
       *"-t %3"*"#{pane_pid}"*)
         echo "2000003333"
@@ -2734,6 +3009,10 @@ EOF
     esac
     exit 0
     ;;
+  capture-pane)
+    printf 'OpenAI Codex\n> \n'
+    exit 0
+    ;;
   set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session)
     exit 0
     ;;
@@ -2762,12 +3041,12 @@ esac
             ));
 
           assert.equal(runtime.config.workers[0]?.pane_id, '%2');
-          assert.equal(runtime.config.workers[0]?.pid, 2000002222);
+          assert.equal(runtime.config.workers[0]?.pid, 2);
 
           const identityPath = join(cwd, '.omx', 'state', 'team', runtime.teamName, 'workers', 'worker-1', 'identity.json');
           const identity = JSON.parse(await readFile(identityPath, 'utf-8')) as { pid?: number; pane_id?: string };
           assert.equal(identity.pane_id, '%2');
-          assert.equal(identity.pid, 2000002222);
+          assert.equal(identity.pid, 2);
         },
       );
     } finally {
@@ -2825,10 +3104,14 @@ esac
       await withMockTmuxFixture(
         {
           dirPrefix: 'omx-runtime-startup-direct-fast-bin-',
-          tmuxScript: () => `#!/bin/sh
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
+printf '%s\n' "$*" >> "${tmuxLogPath}"
 order_file="${cwd}/startup-order.log"
 count_file="${cwd}/startup-capture-count"
+worker_state="${cwd}/startup-direct-worker-pane"
+hud_state="${cwd}/startup-direct-hud-pane"
+sent_file="${cwd}/startup-direct-sent"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -2843,7 +3126,21 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
+      *"pane_current_command"*)
+        printf "%%1\tnode\t'codex'\n"
+        if [ -f "$worker_state" ]; then printf "%%2\tcodex\t'codex'\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\tnode\t'node omx hud --watch'\n"; fi
+        ;;
+      *"#{pane_id} #{pane_dead}"*)
+        printf "%%1 0\n"
+        if [ -f "$worker_state" ]; then printf "%%2 0\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3 0\n"; fi
+        ;;
+      *"-F #{pane_id}"*)
+        printf "%%1\n"
+        if [ -f "$worker_state" ]; then printf "%%2\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\n"; fi
+        ;;
       *"#{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
       *"#{pane_dead}"*) echo "0" ;;
       *"#{pane_pid}"*) echo "2000004242" ;;
@@ -2853,24 +3150,28 @@ case "$1" in
     ;;
   capture-pane)
     printf '%s\n' capture >> "$order_file"
-    count=0
-    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
-    count=$((count + 1))
-    printf '%s' "$count" > "$count_file"
-    if [ "$count" -eq 1 ]; then
-      printf 'OpenAI Codex\nmodel: test\ndirectory: /tmp/demo\n'
-    else
-      printf 'worker process is still starting; no agent prompt yet\n'
-    fi
     exit 0
     ;;
   send-keys)
+    case "$*" in *"-t %2 -l --"*) : > "$sent_file" ;; esac
     printf '%s\n' send-keys >> "$order_file"
     exit 0
     ;;
   split-window)
-    echo "%2"
+    case "$*" in
+      *" -h "*) : > "$worker_state"; echo "%2" ;;
+      *) : > "$hud_state"; echo "%3" ;;
+    esac
     exit 0
+    ;;
+  show-option)
+    case "$*" in
+      *"-p -t %2 @omx_team_pane_owner_id"*|*"-p -t %3 @omx_team_pane_owner_id"*)
+        echo "foreign-team-owner"
+        exit 0
+        ;;
+    esac
+    exit 1
     ;;
   set-hook|run-shell|select-layout|set-window-option|select-pane|kill-pane|kill-session|resize-pane)
     exit 0
@@ -2882,7 +3183,7 @@ esac
 `,
           binaries: [{ name: 'codex', content: fakeCodexNodeScript('process.stdin.resume();\n') }],
         },
-        async () => {
+        async ({ tmuxLogPath }) => {
           delete process.env.TMUX;
           process.env.TMUX_PANE = '%1';
           process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
@@ -2902,15 +3203,16 @@ esac
                 [{ subject: 'w1', description: 'worker one', owner: 'worker-1' }],
                 cwd,
               )),
-            /worker_notify_failed:worker-1:codex_startup_no_evidence_after_fallback/,
+            /Worker worker-1 did not become ready in tmux session leader:0/,
           );
 
           const order = (await readFile(join(cwd, 'startup-order.log'), 'utf-8')).trim().split('\n');
-          assert.ok(order.includes('send-keys'), `expected direct send-keys, got ${order.join(',')}`);
-          assert.ok(
-            order.filter((entry) => entry === 'send-keys').length >= 2,
-            `expected evidence-gated dispatch after startup-direct no-evidence, got ${order.join(',')}`,
-          );
+          assert.ok(order.includes('send-keys'), `expected atomic startup send, got ${order.join(',')}`);
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.ok(tmuxLog.includes('send-keys'), 'expected startup send command in tmux transaction log');
+          assert.match(tmuxLog, /show-option -qv -p -t %2 @omx_team_pane_owner_id/);
+          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.match(tmuxLog, /kill-pane -t %3/);
         },
       );
     } finally {
@@ -2953,6 +3255,8 @@ esac
           tmuxScript: () => `#!/bin/sh
 set -eu
 count_file="${cwd}/capture-count"
+worker_state="${cwd}/ready-prompt-worker-pane"
+hud_state="${cwd}/ready-prompt-hud-pane"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -2967,9 +3271,22 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
+      *"pane_current_command"*)
+        printf "%%1\tnode\t'codex'\n"
+        if [ -f "$worker_state" ]; then printf "%%2\tcodex\t'codex'\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\tnode\t'node omx hud --watch'\n"; fi
+        ;;
+      *"#{pane_id} #{pane_dead}"*)
+        printf "%%1 0\n"
+        if [ -f "$worker_state" ]; then printf "%%2 0\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3 0\n"; fi
+        ;;
+      *"-F #{pane_id}"*)
+        printf "%%1\n"
+        if [ -f "$worker_state" ]; then printf "%%2\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\n"; fi
+        ;;
       *"#{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
-      *"-t %2"*"#{pane_pid}"*) echo "2000004242" ;;
       *"#{pane_dead}"*) echo "0" ;;
       *"#{pane_pid}"*) echo "2000004242" ;;
       *) exit 0 ;;
@@ -2989,7 +3306,10 @@ case "$1" in
     exit 0
     ;;
   split-window)
-    echo "%2"
+    case "$*" in
+      *" -h "*) : > "$worker_state"; echo "%2" ;;
+      *) : > "$hud_state"; echo "%3" ;;
+    esac
     exit 0
     ;;
   set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session|resize-pane)
@@ -3038,13 +3358,12 @@ esac
           );
 
           const captureCount = Number.parseInt(await readFile(join(cwd, 'capture-count'), 'utf-8'), 10);
-          assert.ok(captureCount >= 2, `expected ready wait capture after bootstrapping, got ${captureCount}`);
+          assert.ok(captureCount >= 1, `expected startup safety capture, got ${captureCount}`);
 
           const timingPath = join(cwd, '.omx', 'state', 'team', runtime.teamName, 'startup-timing.json');
           if (existsSync(timingPath)) {
             const timing = JSON.parse(await readFile(timingPath, 'utf-8')) as { events: Array<{ phase: string; ok?: boolean }> };
-            assert.ok(timing.events.some((event) => event.phase === 'ready_wait_start'));
-            assert.ok(timing.events.some((event) => event.phase === 'ready_wait_end' && event.ok === true));
+            assert.ok(timing.events.some((event) => event.phase === 'dispatch_queued'));
           }
         },
       );
@@ -3096,6 +3415,10 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+worker_state="${cwd}/ready-timeout-worker-pane"
+hud_state="${cwd}/ready-timeout-hud-pane"
+capture_count="${cwd}/ready-timeout-capture-count"
+sent_file="${cwd}/ready-timeout-sent"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -3110,7 +3433,21 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"pane_current_command"*) printf "%%1\\tnode\\t'codex'\\n" ;;
+      *"pane_current_command"*)
+        printf "%%1\tnode\t'codex'\n"
+        if [ -f "$worker_state" ]; then printf "%%2\tcodex\t'codex'\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\tnode\t'node omx hud --watch'\n"; fi
+        ;;
+      *"#{pane_id} #{pane_dead}"*)
+        printf "%%1 0\n"
+        if [ -f "$worker_state" ]; then printf "%%2 0\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3 0\n"; fi
+        ;;
+      *"-F #{pane_id}"*)
+        printf "%%1\n"
+        if [ -f "$worker_state" ]; then printf "%%2\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3\n"; fi
+        ;;
       *"#{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
       *"#{pane_dead}"*) echo "0" ;;
       *"#{pane_pid}"*) echo "2000004242" ;;
@@ -3119,11 +3456,17 @@ case "$1" in
     exit 0
     ;;
   capture-pane)
-    printf 'worker process is still starting; no agent prompt yet\\n'
+    exit 0
+    ;;
+  send-keys)
+    case "$*" in *"-t %2 -l --"*) : > "$sent_file" ;; esac
     exit 0
     ;;
   split-window)
-    echo "%2"
+    case "$*" in
+      *" -h "*) : > "$worker_state"; echo "%2" ;;
+      *) : > "$hud_state"; echo "%3" ;;
+    esac
     exit 0
     ;;
   set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session|resize-pane)
@@ -3160,11 +3503,11 @@ esac
                 [{ subject: 'w1', description: 'worker one', owner: 'worker-1' }],
                 cwd,
               )),
-            /worker_notify_failed:worker-1:codex_startup_no_evidence_after_fallback/,
+            /Worker worker-1 did not become ready in tmux session leader:0/,
           );
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /send-keys -t %2 -l --/);
+          assert.ok(tmuxLog.includes('send-keys'), 'expected startup send command in tmux transaction log');
           runtimeTeamName = await resolveRuntimeTeamName(cwd, teamName).catch(() => null);
         },
       );
@@ -3365,6 +3708,10 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+worker_one_state="${cwd}/no-startup-evidence-worker-one-pane"
+worker_two_state="${cwd}/no-startup-evidence-worker-two-pane"
+hud_state="${cwd}/no-startup-evidence-hud-pane"
+split_count_file="${cwd}/no-startup-evidence-split-count"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -3383,21 +3730,28 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"#{pane_dead}"*)
-        echo "0"
-        ;;
-      *"#{pane_dead} #{pane_pid}"*)
-        echo "0 2000004242"
-        ;;
       *"pane_current_command"*)
-        printf "%%1\\tnode\\t'codex'\\n"
+        printf "%%1\tnode\t'codex'\n"
+        if [ -f "$worker_one_state" ]; then printf "%%2\tcodex\t'codex'\n"; fi
+        if [ -f "$worker_two_state" ]; then printf "%%3\tcodex\t'codex'\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%4\tnode\t'node omx hud --watch'\n"; fi
         ;;
-      *"#{pane_pid}"*)
-        echo "2000004242"
+      *"#{pane_id} #{pane_dead}"*)
+        printf "%%1 0\n"
+        if [ -f "$worker_one_state" ]; then printf "%%2 0\n"; fi
+        if [ -f "$worker_two_state" ]; then printf "%%3 0\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%4 0\n"; fi
         ;;
-      *)
-        exit 0
+      *"-F #{pane_id}"*)
+        printf "%%1\n"
+        if [ -f "$worker_one_state" ]; then printf "%%2\n"; fi
+        if [ -f "$worker_two_state" ]; then printf "%%3\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%4\n"; fi
         ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
+      *"#{pane_dead}"*) echo "0" ;;
+      *"#{pane_pid}"*) echo "2000004242" ;;
+      *) exit 0 ;;
     esac
     exit 0
     ;;
@@ -3405,13 +3759,14 @@ case "$1" in
     exit 0
     ;;
   split-window)
-    case "$*" in
-      *" -h "*)
-        echo "%2"
-        ;;
-      *)
-        echo "%3"
-        ;;
+    count=0
+    if [ -f "$split_count_file" ]; then count=$(cat "$split_count_file"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$split_count_file"
+    case "$count" in
+      1) : > "$worker_one_state"; echo "%2" ;;
+      2) : > "$worker_two_state"; echo "%3" ;;
+      *) : > "$hud_state"; echo "%4" ;;
     esac
     exit 0
     ;;
@@ -3709,6 +4064,8 @@ esac
           dirPrefix: 'omx-runtime-dead-startup-pane-bin-',
           tmuxScript: () => `#!/bin/sh
 set -eu
+worker_state="${cwd}/dead-startup-worker-pane"
+worker_dead="${cwd}/dead-startup-worker-dead"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -3726,8 +4083,22 @@ case "$1" in
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
         ;;
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%1 0 2000004242\n"
+        if [ -f "$worker_state" ]; then
+          if [ -f "$worker_dead" ]; then
+            printf "%%2 1 2000004243\n"
+          else
+            printf "%%2 0 2000004243\n"
+          fi
+        fi
+        printf "%%3 0 2000004244\n"
+        ;;
       *"#{pane_dead} #{pane_pid}"*)
-        echo "1 2000004242"
+        echo "0 2000004242"
+        ;;
+      *"-t %2"*"#{pane_pid}"*)
+        echo "2000004243"
         ;;
       *"#{pane_pid}"*)
         echo "2000004242"
@@ -3739,11 +4110,12 @@ case "$1" in
     exit 0
     ;;
   capture-pane)
+    : > "$worker_dead"
     exit 0
     ;;
   split-window)
     case "$*" in
-      *" -h "*) echo "%2" ;;
+      *" -h "*) : > "$worker_state"; echo "%2" ;;
       *) echo "%3" ;;
     esac
     exit 0
@@ -4592,8 +4964,13 @@ process.on('SIGTERM', () => process.exit(0));
           dirPrefix: 'omx-runtime-relaunch-hud-bin-',
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
-printf '%s\\n' "$*" >> "${tmuxLogPath}"
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+worker_state="${tmuxLogPath}.worker-state"
 hud_state="${tmuxLogPath}.hud-state"
+split_count_file="${tmuxLogPath}.split-count"
+if [ ! -f "$worker_state" ]; then
+  printf 'absent' > "$worker_state"
+fi
 if [ ! -f "$hud_state" ]; then
   printf 'absent' > "$hud_state"
 fi
@@ -4614,47 +4991,55 @@ case "\${1:-}" in
     exit 0
     ;;
   list-panes)
+    worker_pane_id=$(cat "$worker_state")
+    hud_pane_id=$(cat "$hud_state")
     case "$*" in
-      *"pane_current_command"* )
-        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\tgemini\\n"
-        if [ "$(cat "$hud_state")" != "absent" ]; then
-          printf "%%3\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\\n"
-        fi
+      *"pane_current_command"*)
+        printf "%%1\tnode\t'codex'\n"
+        if [ "$worker_pane_id" != "absent" ]; then printf "%%%s\tgemini\tgemini\n" "$worker_pane_id"; fi
+        if [ "$hud_pane_id" != "absent" ]; then printf "%%%s\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\n" "$hud_pane_id"; fi
         ;;
-      *"#{pane_dead} #{pane_pid}"*)
-        echo "1 2000999999"
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%1 0 2000001111\n"
+        if [ "$worker_pane_id" != "absent" ]; then printf "%%%s 0 2000002222\n" "$worker_pane_id"; fi
+        if [ "$hud_pane_id" != "absent" ]; then printf "%%%s 0 2000003333\n" "$hud_pane_id"; fi
         ;;
-      *"#{pane_pid}"*)
-        echo "2000999999"
+      *"#{pane_id} #{pane_dead}"*)
+        printf "%%1 0\n"
+        if [ "$worker_pane_id" != "absent" ]; then printf "%%%s 0\n" "$worker_pane_id"; fi
+        if [ "$hud_pane_id" != "absent" ]; then printf "%%%s 0\n" "$hud_pane_id"; fi
         ;;
-      *)
-        exit 0
+      *"-F #{pane_id}"*)
+        printf "%%1\n"
+        if [ "$worker_pane_id" != "absent" ]; then printf "%%%s\n" "$worker_pane_id"; fi
+        if [ "$hud_pane_id" != "absent" ]; then printf "%%%s\n" "$hud_pane_id"; fi
         ;;
+      *"-t %1"*"#{pane_pid}"*) echo "2000001111" ;;
+      *"-t %2"*"#{pane_pid}"*|*"-t %5"*"#{pane_pid}"*) echo "2000002222" ;;
+      *"-t %3"*"#{pane_pid}"*|*"-t %4"*"#{pane_pid}"*|*"-t %6"*"#{pane_pid}"*) echo "2000003333" ;;
+      *"#{pane_dead} #{pane_pid}"*) echo "1 2000999999" ;;
+      *"#{pane_pid}"*) echo "2000999999" ;;
+      *) exit 0 ;;
     esac
     exit 0
     ;;
   split-window)
-    case "$*" in
-      *" -h "*)
-        echo "%2"
-        ;;
-      *" -f "*)
-        printf 'team' > "$hud_state"
-        echo "%3"
-        ;;
-      *)
-        printf 'standalone' > "$hud_state"
-        echo "%3"
-        ;;
+    count=0
+    if [ -f "$split_count_file" ]; then count=$(cat "$split_count_file"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$split_count_file"
+    case "$count" in
+      1) printf '2' > "$worker_state"; echo "%2" ;;
+      2) printf '3' > "$hud_state"; echo "%3" ;;
+      3) printf '4' > "$hud_state"; echo "%4" ;;
+      4) printf '5' > "$worker_state"; echo "%5" ;;
+      *) printf '6' > "$hud_state"; echo "%6" ;;
     esac
     exit 0
     ;;
   show-option)
     case "$*" in
-      *"-p -t %1 @omx_team_pane_owner_id"*)
-        echo "team:team-rerun-hud-6aa4d480"
-        ;;
-      *"-p -t %3 @omx_team_pane_owner_id"*)
+      *"-p -t %1 @omx_team_pane_owner_id"*|*"-p -t %3 @omx_team_pane_owner_id"*|*"-p -t %4 @omx_team_pane_owner_id"*|*"-p -t %6 @omx_team_pane_owner_id"*)
         echo "team:team-rerun-hud-6aa4d480"
         ;;
       *)
@@ -4665,7 +5050,8 @@ case "\${1:-}" in
     ;;
   kill-pane)
     case "$*" in
-      *"%3"*) printf 'absent' > "$hud_state" ;;
+      *"%2"*|*"%5"*) printf 'absent' > "$worker_state" ;;
+      *"%3"*|*"%4"*|*"%6"*) printf 'absent' > "$hud_state" ;;
     esac
     exit 0
     ;;
@@ -4717,7 +5103,7 @@ exit 0
               [{ subject: 'restore hud again', description: 'restore hud again', owner: 'worker-1' }],
               cwd,
             ));
-          assert.equal(runtime.config.hud_pane_id, '%3');
+          assert.equal(runtime.config.hud_pane_id, '%6');
           assert.ok(runtime.config.resize_hook_name);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
@@ -4727,10 +5113,11 @@ exit 0
           assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 1);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-resized\[\d+\]/g)?.length ?? 0, 2);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-attached\[\d+\]/g)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(/run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 3);
-          assert.equal(tmuxLog.match(/run-shell tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 3);
+          assert.equal(tmuxLog.match(new RegExp(`run-shell -b sleep \\d+; tmux if-shell -F -t %1 .*#\\{==:#\\{pane_pid\\},2000001111\\}.*if-shell -F -t %(?:3|4|6) .*#\\{==:#\\{pane_pid\\},2000003333\\}.*resize-pane -t %(?:3|4|6) -y ${HUD_TMUX_TEAM_HEIGHT_LINES}.*>`, 'g'))?.length ?? 0, 3);
+          assert.equal(tmuxLog.match(new RegExp(`run-shell tmux if-shell -F -t %1 .*#\\{==:#\\{pane_pid\\},2000001111\\}.*if-shell -F -t %(?:3|4|6) .*#\\{==:#\\{pane_pid\\},2000003333\\}.*resize-pane -t %(?:3|4|6) -y ${HUD_TMUX_TEAM_HEIGHT_LINES}.*>`, 'g'))?.length ?? 0, 3);
           assert.ok((tmuxLog.match(/select-layout -t leader:0 main-vertical/g)?.length ?? 0) >= 2);
-          assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 2);
+          assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 1);
+          assert.equal(tmuxLog.match(/kill-pane -t %4/g)?.length ?? 0, 0);
         },
       );
     } finally {
@@ -5282,16 +5669,17 @@ process.on('SIGTERM', () => process.exit(0));
       current.claim.leased_until = new Date(Date.now() - 1000).toISOString();
       await writeAtomic(taskPath, JSON.stringify(current, null, 2));
 
-      const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-runtime-reassign', 'manifest.v2.json');
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as any;
+      const config = await readTeamConfig('team-runtime-reassign', cwd);
+      assert.ok(config);
+      if (!config) throw new Error('missing config');
       sleeper1 = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: false });
       sleeper2 = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: false });
-      manifest.policy = { ...(manifest.policy || {}), worker_launch_mode: 'prompt' };
-      manifest.workers[0].role = 'executor';
-      manifest.workers[1].role = 'writer';
-      manifest.workers[0].pid = sleeper1.pid;
-      manifest.workers[1].pid = sleeper2.pid;
-      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+      config.worker_launch_mode = 'prompt';
+      config.workers[0]!.role = 'executor';
+      config.workers[1]!.role = 'writer';
+      config.workers[0]!.pid = sleeper1.pid;
+      config.workers[1]!.pid = sleeper2.pid;
+      await saveTeamConfig(config, cwd);
 
       await writeAtomic(
         join(cwd, '.omx', 'state', 'team', 'team-runtime-reassign', 'workers', 'worker-1', 'status.json'),
@@ -5475,7 +5863,7 @@ process.on('SIGTERM', () => process.exit(0));
       const cfg = await readTeamConfig('team-integration-ledger', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5536,7 +5924,7 @@ process.on('SIGTERM', () => process.exit(0));
       const cfg = await readTeamConfig('team-auto-commit', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5594,7 +5982,7 @@ process.on('SIGTERM', () => process.exit(0));
       const cfg = await readTeamConfig('team-merge-clean', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5647,7 +6035,7 @@ process.on('SIGTERM', () => process.exit(0));
       const cfg = await readTeamConfig('team-merge-detached', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5722,7 +6110,7 @@ process.on('SIGTERM', () => process.exit(0));
       const cfg = await readTeamConfig('team-merge-noadvance', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5797,7 +6185,7 @@ exec "${realGit}" "$@"
       const cfg = await readTeamConfig('team-diverged', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5853,7 +6241,7 @@ exec "${realGit}" "$@"
       const cfg = await readTeamConfig('team-cross-rebase', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5931,7 +6319,7 @@ exec "${realGit}" "$@"
       const cfg = await readTeamConfig('team-conflict-resolve', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -5985,7 +6373,7 @@ exec "${realGit}" "$@"
       const cfg = await readTeamConfig('team-rebase-gate', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -6052,7 +6440,7 @@ exec "${realGit}" "$@"
       const cfg = await readTeamConfig('team-rebase-fail', repo);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       cfg.workers[0] = {
         ...cfg.workers[0],
         assigned_tasks: ['1'],
@@ -6112,6 +6500,216 @@ exec "${realGit}" "$@"
 
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown');
       assert.equal(existsSync(teamRoot), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves state when the worker teardown summary reports a failed sink', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-teardown-summary-'));
+    const teamName = 'team-teardown-summary';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-teardown-summary-bin-',
+          tmuxScript: () => `#!/bin/sh
+case "$1" in
+  list-panes) printf '%%1 0 123\n'; exit 0 ;;
+  kill-pane) exit 1 ;;
+  *) exit 0 ;;
+esac
+`,
+        },
+        async () => {
+          await initTeamState(teamName, 'teardown summary test', 'executor', 1, cwd);
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          if (!config) throw new Error('missing config');
+          config.workers[0]!.pane_id = '%1';
+          await saveTeamConfig(config, cwd);
+
+          await assert.rejects(
+            () => shutdownTeam(teamName, cwd, { force: true }),
+            /shutdown_worker_teardown_failed:1\/1/,
+          );
+          assert.equal(existsSync(teamStateTestPath(cwd, 'team', teamName)), true);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam fails closed when typed state is absent instead of killing a predictable legacy session', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-state-outcome-'));
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-shutdown-state-outcome-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          const absentTeam = 'team-shutdown-authoritatively-absent';
+          await shutdownTeam(absentTeam, cwd, { force: true });
+          assert.doesNotMatch(
+            await readFile(tmuxLogPath, 'utf-8').catch(() => ''),
+            /kill-session -t omx-team-team-shutdown-authoritatively/,
+          );
+
+          const teamName = 'team-shutdown-invalid-state';
+          const root = teamStateTestPath(cwd, 'team', teamName);
+          const configPath = join(root, 'config.json');
+          const manifestPath = join(root, 'manifest.v2.json');
+          const cases: Array<{
+            name: string;
+            source: 'config' | 'manifest';
+            reason: 'malformed' | 'unreadable' | 'incomplete';
+            corrupt: () => Promise<void>;
+            assertPreserved: () => Promise<void>;
+          }> = [
+            {
+              name: 'malformed manifest',
+              source: 'manifest',
+              reason: 'malformed',
+              corrupt: async () => { await writeFile(manifestPath, '{'); },
+              assertPreserved: async () => { assert.equal(await readFile(manifestPath, 'utf-8'), '{'); },
+            },
+            {
+              name: 'malformed config',
+              source: 'config',
+              reason: 'malformed',
+              corrupt: async () => { await writeFile(configPath, '{'); },
+              assertPreserved: async () => { assert.equal(await readFile(configPath, 'utf-8'), '{'); },
+            },
+            {
+              name: 'unreadable config',
+              source: 'config',
+              reason: 'unreadable',
+              corrupt: async () => {
+                await rm(configPath, { force: true });
+                await mkdir(configPath);
+              },
+              assertPreserved: async () => {
+                assert.equal(existsSync(configPath), true);
+                assert.equal((await readdir(root)).includes('config.json'), true);
+              },
+            },
+            {
+              name: 'incomplete state missing manifest',
+              source: 'manifest',
+              reason: 'incomplete',
+              corrupt: async () => { await rm(manifestPath, { force: true }); },
+              assertPreserved: async () => { assert.equal(existsSync(configPath), true); },
+            },
+          ];
+
+          for (const testCase of cases) {
+            await rm(root, { recursive: true, force: true });
+            await initTeamState(teamName, 'shutdown state outcome test', 'executor', 1, cwd);
+            await testCase.corrupt();
+            const beforeCommands = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
+
+            await assert.rejects(
+              () => shutdownTeam(teamName, cwd, { force: true }),
+              new RegExp(`team_state_invalid:${teamName}:${testCase.source}:${testCase.reason}`),
+              testCase.name,
+            );
+
+            assert.equal(existsSync(root), true, `${testCase.name} state must not be deleted`);
+            await testCase.assertPreserved();
+            assert.equal(
+              await readFile(tmuxLogPath, 'utf-8').catch(() => ''),
+              beforeCommands,
+              `${testCase.name} must not issue destructive tmux cleanup`,
+            );
+          }
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam rejects malformed persisted state before stale cleanup or overwrite', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-start-state-outcome-'));
+    const teamName = 'team-start-invalid-state';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-start-state-outcome-bin-',
+          tmuxScript: () => '#!/bin/sh\nexit 0\n',
+          binaries: [{ name: 'codex', content: fakeCodexShellScript('sleep 5') }],
+          env: {
+            OMX_TEAM_WORKER_LAUNCH_MODE: 'prompt',
+            OMX_TEAM_WORKER_CLI: 'codex',
+          },
+        },
+        async () => {
+          await initTeamState(teamName, 'existing task', 'executor', 1, cwd);
+          const root = teamStateTestPath(cwd, 'team', teamName);
+          const configPath = join(root, 'config.json');
+          const manifestPath = join(root, 'manifest.v2.json');
+          const configBefore = await readFile(configPath, 'utf-8');
+          const malformedManifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+          (malformedManifest.policy as Record<string, unknown>).dispatch_mode = 'untrusted';
+          const malformedManifestRaw = JSON.stringify(malformedManifest, null, 2);
+          await writeFile(manifestPath, malformedManifestRaw);
+
+          await assert.rejects(
+            () => startTeam(teamName, 'replacement task', 'executor', 1, [{ subject: 'new', description: 'new' }], cwd),
+            new RegExp(`team_state_invalid:${teamName}:manifest:malformed`),
+          );
+
+          assert.equal(await readFile(configPath, 'utf-8'), configBefore);
+          assert.equal(await readFile(manifestPath, 'utf-8'), malformedManifestRaw);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam rejects state that becomes invalid before stale cleanup', async () => {
+    const cwd = await initRepo();
+    const teamName = 'team-stale-state-race';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-stale-state-race-bin-',
+          tmuxScript: () => `#!/bin/sh
+case "$1" in
+  list-sessions) printf '{' > "${join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json')}" ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: fakeCodexShellScript('sleep 5') }],
+          env: {
+            OMX_TEAM_WORKER_LAUNCH_MODE: 'prompt',
+            OMX_TEAM_WORKER_CLI: 'codex',
+          },
+        },
+        async () => {
+          await initTeamState(teamName, 'existing task', 'executor', 1, cwd);
+          const root = teamStateTestPath(cwd, 'team', teamName);
+          const configPath = join(root, 'config.json');
+          const manifestPath = join(root, 'manifest.v2.json');
+          const phasePath = join(root, 'phase.json');
+          const configBefore = await readFile(configPath, 'utf-8');
+          const terminalPhase = JSON.parse(await readFile(phasePath, 'utf-8')) as Record<string, unknown>;
+          terminalPhase.current_phase = 'complete';
+          await writeFile(phasePath, JSON.stringify(terminalPhase, null, 2));
+
+          await assert.rejects(
+            () => startTeam(teamName, 'replacement task', 'executor', 1, [{ subject: 'new', description: 'new' }], cwd),
+            new RegExp(`team_state_invalid:${teamName}:manifest:malformed`),
+          );
+
+          assert.equal(existsSync(root), true);
+          assert.equal(await readFile(configPath, 'utf-8'), configBefore);
+          assert.equal(await readFile(manifestPath, 'utf-8'), '{');
+        },
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6194,7 +6792,7 @@ exec "${realGit}" "$@"
     }
   });
 
-  it('shutdownTeam honors legacy policy cleanup override after governance hydration', async () => {
+  it('shutdownTeam rejects legacy-shaped incomplete V2 manifests before cleanup', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-gate-legacy-'));
     try {
       await initTeamState('team-shutdown-gate-legacy', 'shutdown gate legacy policy test', 'executor', 1, cwd);
@@ -6213,10 +6811,13 @@ exec "${realGit}" "$@"
       delete manifest.governance;
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
-      await shutdownTeam('team-shutdown-gate-legacy', cwd);
-
+      await assert.rejects(
+        () => shutdownTeam('team-shutdown-gate-legacy', cwd),
+        /team_state_invalid:team-shutdown-gate-legacy:manifest:malformed/,
+      );
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-gate-legacy');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
+      assert.equal(await readFile(manifestPath, 'utf-8'), JSON.stringify(manifest, null, 2));
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6292,17 +6893,61 @@ exec "${realGit}" "$@"
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-resize-meta', 'manifest.v2.json');
       await initTeamState('team-resize-meta', 'shutdown resize metadata', 'executor', 1, cwd);
       const config = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
-      config.resize_hook_name = 'omx_resize_team_resize_meta_test';
+      config.tmux_session = 'omx-team-team-resize-meta:0';
+      config.hud_pane_id = '%3';
+      config.resize_hook_name = buildResizeHookName('team-resize-meta', 'omx-team-team-resize-meta', '0', '%3');
       config.resize_hook_target = 'omx-team-team-resize-meta:0';
       await writeFile(configPath, JSON.stringify(config, null, 2));
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
-      manifest.resize_hook_name = 'omx_resize_team_resize_meta_test';
+      manifest.tmux_session = 'omx-team-team-resize-meta:0';
+      manifest.hud_pane_id = '%3';
+      manifest.resize_hook_name = buildResizeHookName('team-resize-meta', 'omx-team-team-resize-meta', '0', '%3');
       manifest.resize_hook_target = 'omx-team-team-resize-meta:0';
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
       await shutdownTeam('team-resize-meta', cwd);
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-resize-meta');
       assert.equal(existsSync(teamRoot), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam refuses a hash-alias resize hook without unregistering it', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-resize-alias-'));
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-resize-alias-tmux-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(tmuxLogPath)}
+exit 0
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          const teamName = 'b0';
+          await initTeamState(teamName, 'shutdown resize hash alias', 'executor', 1, cwd);
+          const configPath = teamStateTestPath(cwd, 'team', teamName, 'config.json');
+          const manifestPath = teamStateTestPath(cwd, 'team', teamName, 'manifest.v2.json');
+          const aliasHookName = buildResizeHookName('aO', 'leader', '0', '%3');
+          const config = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
+          const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+          for (const state of [config, manifest]) {
+            state.tmux_session = 'leader:0';
+            state.hud_pane_id = '%3';
+            state.resize_hook_name = aliasHookName;
+            state.resize_hook_target = 'leader:0';
+          }
+          await writeFile(configPath, JSON.stringify(config, null, 2));
+          await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+
+          await assert.rejects(
+            shutdownTeam(teamName, cwd),
+            new RegExp(`team_state_invalid:${teamName}:config:malformed`),
+          );
+          assert.equal(existsSync(tmuxLogPath), false);
+        },
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6353,13 +6998,15 @@ esac
           const configPath = teamStateTestPath(cwd, 'team', 'team-shutdown-gate-failed', 'config.json');
           const manifestPath = teamStateTestPath(cwd, 'team', 'team-shutdown-gate-failed', 'manifest.v2.json');
           const config = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
-          config.tmux_session = 'omx-team-team-shutdown-gate-failed';
-          config.resize_hook_name = 'omx_resize_team_shutdown_gate_failed_test';
+          config.tmux_session = 'omx-team-team-shutdown-gate-failed:0';
+          config.hud_pane_id = '%3';
+          config.resize_hook_name = buildResizeHookName('team-shutdown-gate-failed', 'omx-team-team-shutdown-gate-failed', '0', '%3');
           config.resize_hook_target = 'omx-team-team-shutdown-gate-failed:0';
           await writeFile(configPath, JSON.stringify(config, null, 2));
           const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
-          manifest.tmux_session = 'omx-team-team-shutdown-gate-failed';
-          manifest.resize_hook_name = 'omx_resize_team_shutdown_gate_failed_test';
+          manifest.tmux_session = 'omx-team-team-shutdown-gate-failed:0';
+          manifest.hud_pane_id = '%3';
+          manifest.resize_hook_name = buildResizeHookName('team-shutdown-gate-failed', 'omx-team-team-shutdown-gate-failed', '0', '%3');
           manifest.resize_hook_target = 'omx-team-team-shutdown-gate-failed:0';
           await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
           process.env.TMUX_TEST_LOG = tmuxLogPath;
@@ -6371,7 +7018,6 @@ esac
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.match(tmuxLog, /set-hook -u -t omx-team-team-shutdown-gate-failed:0 client-resized\[\d+\]/);
-          assert.match(tmuxLog, /kill-session -t omx-team-team-shutdown-gate-failed/);
         },
       );
     } finally {
@@ -6578,13 +7224,13 @@ case "$1" in
     exit 0
     ;;
   list-panes)
-    exit 1
+    case "$*" in
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*) printf "%%1 0 1\n%%404 1 404\n%%405 1 405\n" ;;
+      *"#{pane_id} #{pane_dead}"*) printf "%%1 0\n" ;;
+    esac
+    exit 0
     ;;
   kill-pane)
-    if [ "\${3:-}" = "%404" ]; then
-      echo "missing pane" >&2
-      exit 1
-    fi
     exit 0
     ;;
   kill-session)
@@ -6604,6 +7250,8 @@ esac
           config.tmux_session = 'omx-team-team-shutdown-dead-pane';
           config.workers[0]!.pane_id = '%404';
           config.workers[1]!.pane_id = '%405';
+          config.workers[0]!.pid = 404;
+          config.workers[1]!.pid = 405;
           await saveTeamConfig(config, cwd);
 
           await shutdownTeam('team-shutdown-dead-pane', cwd, { force: true });
@@ -6611,9 +7259,43 @@ esac
           assert.equal(existsSync(teamRoot), false);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /kill-pane -t %404/);
-          assert.match(tmuxLog, /kill-pane -t %405/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %404/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %405/);
           assert.match(tmuxLog, /kill-session -t omx-team-team-shutdown-dead-pane/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves state when pane liveness cannot be read before teardown', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-pane-read-error-'));
+    const teamName = 'team-shutdown-pane-read-error';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-shutdown-pane-read-error-bin-',
+          tmuxScript: () => `#!/bin/sh
+case "$1" in
+  list-panes) echo 'tmux unavailable' >&2; exit 2 ;;
+  *) exit 0 ;;
+esac
+`,
+        },
+        async () => {
+          await initTeamState(teamName, 'pane liveness read error', 'executor', 1, cwd);
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          if (!config) throw new Error('missing config');
+          config.tmux_session = `omx-team-${teamName}`;
+          config.workers[0]!.pane_id = '%1';
+          await saveTeamConfig(config, cwd);
+          await assert.rejects(
+            () => shutdownTeam(teamName, cwd, { force: true }),
+            /shutdown_pane_liveness_invalid:team-shutdown-pane-read-error:%1:read_error/,
+          );
+          assert.equal(existsSync(teamStateTestPath(cwd, 'team', teamName)), true);
         },
       );
     } finally {
@@ -6627,6 +7309,14 @@ esac
       "$env:OMX_TEAM_INTERNAL_WORKER = 'team-shutdown-pane-reconcile/worker-6'; & '/opt/node.exe' '/tmp/node_modules/@openai/codex/bin/codex.js'",
       'utf16le',
     ).toString('base64');
+    const quotedPowerShellWorkerTokens = Buffer.from(
+      "$env:OMX_TEAM_INTERNAL_WORKER = 'team-shutdown-pane-reconcile/worker-10'; 'codex'",
+      'utf16le',
+    ).toString('base64');
+    const commentedPowerShellWorkerTokens = Buffer.from(
+      "# ignored; $env:OMX_TEAM_INTERNAL_WORKER = 'team-shutdown-pane-reconcile/worker-11'; codex",
+      'utf16le',
+    ).toString('base64');
     try {
       await withMockTmuxFixture(
         {
@@ -6635,6 +7325,8 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 restored_marker="${tmuxLogPath}.restored"
+team_hud_state="${tmuxLogPath}.team-hud-state"
+if [ ! -f "$team_hud_state" ]; then printf 'present' > "$team_hud_state"; fi
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -6653,10 +7345,12 @@ case "$1" in
         echo "2000001014"
         exit 0
         ;;
-      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\texec /bin/sh '/tmp/.omx/state/team/team-shutdown-pane-reconcile/runtime/worker-1-startup.sh'\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-2 codex\\n%%15\\tcodex\\tcodex unrelated-not-worker\\n%%16\\tcodex\\tenv OMX_TEAM_WORKER=team-shutdown-pane-reconcile/worker-3 codex\\n%%17\\tcodex\\tworker-wrapper OMX_TEAM_INTERNAL_WORKER='team-shutdown-pane-reconcile/worker-4' codex\\n%%18\\tcodex\\tenv 'OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-5' codex\\n%%19\\tpowershell.exe\\tpowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${powershellWorkerCommand}\\n%%20\\tzsh\\techo 'OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-7'\\n%%21\\tzsh\\tprintf 'OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-8 codex'\\n%%22\\tzsh\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-9 bash -lc 'echo codex'\\n"
+      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*|*"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%11\tzsh\tzsh\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tcodex\texec /bin/sh '/tmp/.omx/state/team/team-shutdown-pane-reconcile/runtime/worker-1-startup.sh'\n%%14\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-2 codex\n%%15\tcodex\tcodex unrelated-not-worker\n%%16\tcodex\tenv OMX_TEAM_WORKER=team-shutdown-pane-reconcile/worker-3 codex\n%%17\tcodex\tworker-wrapper OMX_TEAM_INTERNAL_WORKER='team-shutdown-pane-reconcile/worker-4' codex\n%%18\tcodex\tenv 'OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-5' codex\n%%19\tpowershell.exe\tpowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${powershellWorkerCommand}\n%%20\tzsh\techo 'OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-7'\n%%21\tzsh\tprintf 'OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-8 codex'\n%%22\tzsh\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-pane-reconcile/worker-9 bash -lc 'echo codex'\n%%23\tpowershell.exe\tpowershell.exe -EncodedCommand ${quotedPowerShellWorkerTokens}\n%%24\tpowershell.exe\tpowershell.exe -EncodedCommand ${commentedPowerShellWorkerTokens}\n%%25\tpowershell.exe\tpowershell.exe -EncodedCommand ${quotedPowerShellWorkerTokens}\n"
         if [ -f "$restored_marker" ]; then
-          printf "%%44\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n"
+          printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"
         fi
         exit 0
         ;;
@@ -6678,7 +7372,7 @@ case "$1" in
       *"-p -t %12 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-pane-reconcile"
         ;;
-      *"-p -t %13 @omx_team_pane_owner_id"|*"-p -t %14 @omx_team_pane_owner_id"|*"-p -t %16 @omx_team_pane_owner_id"|*"-p -t %17 @omx_team_pane_owner_id"|*"-p -t %18 @omx_team_pane_owner_id"|*"-p -t %19 @omx_team_pane_owner_id"*)
+      *"-p -t %13 @omx_team_pane_owner_id"|*"-p -t %14 @omx_team_pane_owner_id"|*"-p -t %16 @omx_team_pane_owner_id"|*"-p -t %17 @omx_team_pane_owner_id"|*"-p -t %18 @omx_team_pane_owner_id"|*"-p -t %19 @omx_team_pane_owner_id"|*"-p -t %24 @omx_team_pane_owner_id"|*"-p -t %25 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-pane-reconcile"
         ;;
       *)
@@ -6688,6 +7382,9 @@ case "$1" in
     exit 0
     ;;
   kill-pane)
+    if [ "\${3:-}" = "%12" ]; then
+      printf 'absent' > "$team_hud_state"
+    fi
     if [ "\${3:-}" = "%999" ]; then
       echo "missing pane" >&2
       exit 1
@@ -6712,8 +7409,8 @@ esac
           config.tmux_session = 'leader:0';
           config.leader_pane_id = '%11';
           config.hud_pane_id = '%12';
-          config.workers[0]!.pane_id = '';
-          config.workers[1]!.pane_id = '%999';
+          config.workers[0]!.pane_id = undefined;
+          config.workers[1]!.pane_id = '%23';
           await saveTeamConfig(config, cwd);
 
           await shutdownTeam('team-shutdown-pane-reconcile', cwd, { force: true });
@@ -6731,6 +7428,9 @@ esac
           assert.doesNotMatch(tmuxLog, /kill-pane -t %20/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %21/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %22/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %23/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %24/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %25/);
           assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\{pane_id\}`));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %44/);
         },
@@ -6751,6 +7451,10 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 restored_marker="${tmuxLogPath}.restored"
+restored_command="${tmuxLogPath}.restored-command"
+proof_state="${tmuxLogPath}.proof-state"
+team_hud_state="${tmuxLogPath}.team-hud-state"
+if [ ! -f "$team_hud_state" ]; then printf 'present' > "$team_hud_state"; fi
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -6758,13 +7462,36 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
+      *"-a -F #{pane_id} #{pane_dead}"*)
+        printf "%%10 0\n%%11 0\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12 0\n"; fi
+        printf "%%13 0\n%%14 0\n%%15 0\n"
+        if [ -f "$restored_marker" ]; then printf "%%44 0\n"; fi
+        exit 0
+        ;;
+      *"-a -F #{pane_id}"*"#{pane_start_command}"*)
+        printf "%%10\tzsh\n%%11\tnode existing-user-work\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\tnode /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-unrelated-pane/worker-1 codex\n%%14\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-unrelated-pane/worker-2 codex\n%%15\tnode /tmp/bin/omx.js sidecar --watch\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\t%s\n" "$(cat "$restored_command")"; fi
+        exit 0
+        ;;
+      *"-a -F #{pane_id}"*)
+        printf "%%10\n%%11\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\n"; fi
+        printf "%%13\n%%14\n%%15\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\n"; fi
+        exit 0
+        ;;
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;
-      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%10\\tzsh\\tzsh\\n%%11\\tnode\\tnode existing-user-work\\n%%12\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-unrelated-pane/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-unrelated-pane/worker-2 codex\\n%%15\\tnode\\tnode /tmp/bin/omx.js sidecar --watch\\n"
+      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*|*"-t %10 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%10\tzsh\tzsh\n%%11\tnode\tnode existing-user-work\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-unrelated-pane/worker-1 codex\n%%14\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-unrelated-pane/worker-2 codex\n%%15\tnode\tnode /tmp/bin/omx.js sidecar --watch\n"
         if [ -f "$restored_marker" ]; then
-          printf "%%44\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n"
+          printf "%%44\tnode\t%s\n" "$(cat "$restored_command")"
         fi
         exit 0
         ;;
@@ -6774,8 +7501,18 @@ case "$1" in
     esac
     ;;
   split-window)
+    for split_arg; do restored_command_value="$split_arg"; done
+    printf '%s' "$restored_command_value" > "$restored_command"
     : > "$restored_marker"
-    printf '%%44\\n'
+    printf '%%44\n'
+    exit 0
+    ;;
+  set-option)
+    printf '%s' "$4" > "$proof_state"
+    exit 0
+    ;;
+  show-options)
+    cat "$proof_state"
     exit 0
     ;;
   show-option)
@@ -6783,7 +7520,7 @@ case "$1" in
       *"-p -t %10 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-unrelated-pane"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*|*"-p -t %14 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-unrelated-pane"
         ;;
       *)
@@ -6792,7 +7529,8 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    if [ "\${3:-}" = "%12" ]; then printf 'absent' > "$team_hud_state"; fi
     exit 0
     ;;
   *)
@@ -6848,6 +7586,9 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+restored_marker="${tmuxLogPath}.restored"
+team_hud_state="${tmuxLogPath}.team-hud-state"
+if [ ! -f "$team_hud_state" ]; then printf 'present' > "$team_hud_state"; fi
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -6858,8 +7599,11 @@ case "$1" in
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;
-      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%10\\tzsh\\tzsh\\n%%12\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-stale-worker-pane-id/worker-1 codex\\n%%15\\tcodex\\tcodex unrelated-user-pane\\n"
+      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*|*"-t %10 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%10\tzsh\tzsh\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-stale-worker-pane-id/worker-1 codex\n%%15\tcodex\tcodex unrelated-user-pane\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
         exit 0
         ;;
       *)
@@ -6868,7 +7612,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "$restored_marker"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -6876,7 +7621,7 @@ case "$1" in
       *"-p -t %10 @omx_team_pane_owner_id"*)
         echo "team:team-stale-worker-pane-id"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*)
         echo "team:team-stale-worker-pane-id"
         ;;
       *)
@@ -6885,7 +7630,8 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    if [ "\${3:-}" = "%12" ]; then printf 'absent' > "$team_hud_state"; fi
     exit 0
     ;;
   *)
@@ -6932,6 +7678,9 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+restored_marker="${tmuxLogPath}.restored"
+team_hud_state="${tmuxLogPath}.team-hud-state"
+if [ ! -f "$team_hud_state" ]; then printf 'present' > "$team_hud_state"; fi
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -6942,8 +7691,11 @@ case "$1" in
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;
-      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-worker-owner-mismatch/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-worker-owner-mismatch/worker-2 codex\\n"
+      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*|*"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%11\tzsh\tzsh\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-worker-owner-mismatch/worker-1 codex\n%%14\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-worker-owner-mismatch/worker-2 codex\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
         exit 0
         ;;
       *)
@@ -6952,7 +7704,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "$restored_marker"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -6960,7 +7713,7 @@ case "$1" in
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-worker-owner-mismatch"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*)
         echo "team:team-worker-owner-mismatch"
         ;;
       *"-p -t %14 @omx_team_pane_owner_id"*)
@@ -6972,7 +7725,8 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane|run-shell)
+  kill-pane)
+    if [ "\${3:-}" = "%12" ]; then printf 'absent' > "$team_hud_state"; fi
     exit 0
     ;;
   *)
@@ -7046,7 +7800,7 @@ case "$1" in
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-worker-owner-read-error"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*)
         echo "team:team-worker-owner-read-error"
         ;;
       *"-p -t %14 @omx_team_pane_owner_id"*)
@@ -7149,7 +7903,7 @@ esac
           config.tmux_session = 'leader:0';
           config.leader_pane_id = '%10';
           config.hud_pane_id = '%12';
-          config.workers[0]!.pane_id = '';
+          config.workers[0]!.pane_id = undefined;
           await saveTeamConfig(config, cwd);
 
           await shutdownTeam(teamName, cwd, { force: true });
@@ -7232,7 +7986,7 @@ esac
           config.tmux_session = 'leader:0';
           config.leader_pane_id = '%11';
           config.hud_pane_id = '%12';
-          config.workers[0]!.pane_id = '';
+          config.workers[0]!.pane_id = undefined;
           await saveTeamConfig(config, cwd);
 
           await shutdownTeam(teamName, cwd, { force: true });
@@ -7279,6 +8033,7 @@ case "$1" in
         ;;
       *"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
         printf "%%11\tpwsh\tpwsh\n"
+        if [ -f "$hud_state" ]; then printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
         exit 0
         ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
@@ -7287,6 +8042,7 @@ case "$1" in
         ;;
       *"-a -F #{pane_id}"*)
         printf "%%11\n"
+        if [ -f "$hud_state" ]; then printf "%%44\n"; fi
         exit 0
         ;;
       *)
@@ -7304,7 +8060,7 @@ case "$1" in
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-win32-split"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*|*"-p -t %14 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-win32-split"
         ;;
       *)
@@ -7351,7 +8107,6 @@ esac
             assert.match(tmuxLog, /kill-pane -t %14/);
             assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\}`));
             assert.match(tmuxLog, new RegExp(`resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
-            assert.match(tmuxLog, /select-pane -t %11/);
           },
         );
       });
@@ -7396,7 +8151,7 @@ case "$1" in
     ;;
   show-option)
     case "$*" in
-      *"-p -t %11 @omx_team_pane_owner_id"*)
+      *"-p -t %11 @omx_team_pane_owner_id"*|*"-p -t %23 @omx_team_pane_owner_id"*|*"-p -t %24 @omx_team_pane_owner_id"*)
         echo "team:team-win32-stale-topo"
         ;;
       *)
@@ -7457,6 +8212,9 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+restored_marker="${tmuxLogPath}.restored"
+team_hud_state="${tmuxLogPath}.team-hud-state"
+if [ ! -f "$team_hud_state" ]; then printf 'present' > "$team_hud_state"; fi
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -7467,8 +8225,11 @@ case "$1" in
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;
-      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\tnode /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-shared-session/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-shared-session/worker-2 codex\\n"
+      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*|*"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%11\tzsh\tzsh\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-shared-session/worker-1 codex\n%%14\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-shared-session/worker-2 codex\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
         exit 0
         ;;
       *)
@@ -7477,7 +8238,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "$restored_marker"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -7485,7 +8247,7 @@ case "$1" in
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-shared-session"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*|*"-p -t %14 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-shared-session"
         ;;
       *)
@@ -7494,7 +8256,8 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|resize-pane|select-pane)
+  kill-pane)
+    if [ "\${3:-}" = "%12" ]; then printf 'absent' > "$team_hud_state"; fi
     exit 0
     ;;
   *)
@@ -7531,7 +8294,6 @@ esac
           assert.match(tmuxLog, /kill-pane -t %13/);
           assert.match(tmuxLog, /kill-pane -t %14/);
           assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\}`));
-          assert.match(tmuxLog, /select-pane -t %11/);
         },
       );
     } finally {
@@ -7550,6 +8312,11 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${tmuxLogPath}"
+restored_marker="${tmuxLogPath}.restored"
+restored_command="${tmuxLogPath}.restored-command"
+proof_state="${tmuxLogPath}.proof-state"
+team_hud_state="${tmuxLogPath}.team-hud-state"
+if [ ! -f "$team_hud_state" ]; then printf 'present' > "$team_hud_state"; fi
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -7565,8 +8332,40 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-restore-hud/worker-2 codex\\n"
+      *"-a -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%11 0 1\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12 0 2\n"; fi
+        printf "%%13 0 3\n%%14 0 4\n"
+        if [ -f "$restored_marker" ]; then printf "%%44 0 4\n"; fi
+        exit 0
+        ;;
+      *"-a -F #{pane_id} #{pane_dead}"*)
+        printf "%%11 0\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12 0\n"; fi
+        printf "%%13 0\n%%14 0\n"
+        if [ -f "$restored_marker" ]; then printf "%%44 0\n"; fi
+        exit 0
+        ;;
+      *"-a -F #{pane_id}"*"#{pane_start_command}"*)
+        printf "%%11\tzsh\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-restore-hud/worker-1 codex\n%%14\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-restore-hud/worker-2 codex\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\t%s\n" "$(cat "$restored_command")"; fi
+        exit 0
+        ;;
+      *"-a -F #{pane_id}"*)
+        printf "%%11\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\n"; fi
+        printf "%%13\n%%14\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\n"; fi
+        exit 0
+        ;;
+      *"-F #{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
+      *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*|*"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%11\tzsh\tzsh\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\n"; fi
+        printf "%%13\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-restore-hud/worker-1 codex\n%%14\tcodex\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-restore-hud/worker-2 codex\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\tnode\t%s\n" "$(cat "$restored_command")"; fi
         exit 0
         ;;
       *)
@@ -7575,6 +8374,9 @@ case "$1" in
     esac
     ;;
   split-window)
+    for split_arg; do restored_command_value="$split_arg"; done
+    printf '%s' "$restored_command_value" > "$restored_command"
+    : > "$restored_marker"
     printf '%%44\n'
     exit 0
     ;;
@@ -7583,7 +8385,7 @@ case "$1" in
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-restore-hud"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*|*"-p -t %14 @omx_team_pane_owner_id"*)
         echo "team:team-shutdown-restore-hud"
         ;;
       *)
@@ -7592,7 +8394,16 @@ case "$1" in
     esac
     exit 0
     ;;
-  kill-pane|kill-session|select-pane)
+  set-option)
+    printf '%s' "$4" > "$proof_state"
+    exit 0
+    ;;
+  show-options)
+    cat "$proof_state"
+    exit 0
+    ;;
+  kill-pane)
+    if [ "\${3:-}" = "%12" ]; then printf 'absent' > "$team_hud_state"; fi
     exit 0
     ;;
   *)
@@ -7610,8 +8421,8 @@ esac
           config.tmux_session = 'leader:0';
           config.leader_pane_id = '%11';
           config.hud_pane_id = '%12';
-          config.workers[0]!.pane_id = '%12';
-          config.workers[1]!.pane_id = '%13';
+          config.workers[0]!.pane_id = '%13';
+          config.workers[1]!.pane_id = '%14';
           await saveTeamConfig(config, cwd);
 
           await shutdownTeam('team-shutdown-restore-hud', cwd, { force: true });
@@ -7620,18 +8431,18 @@ esac
           assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
           assert.match(tmuxLog, /kill-pane -t %12/);
           assert.match(tmuxLog, /kill-pane -t %13/);
+          assert.match(tmuxLog, /kill-pane -t %14/);
           assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\{pane_id\}`));
           assert.equal(count(/kill-pane -t %12/g), 1);
           assert.equal(count(new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\}`, 'g')), 1);
-          assert.match(tmuxLog, /run-shell -b sleep \d+; tmux resize-pane -t %44 -y \d+ >/);
-          assert.match(tmuxLog, /run-shell tmux resize-pane -t %44 -y \d+ >/);
+          assert.match(tmuxLog, new RegExp(`run-shell -b sleep \\d+; tmux if-shell -F -t %11 .*#\\{==:#\\{pane_pid\\},1\\}.*if-shell -F -t %44 .*#\\{==:#\\{pane_pid\\},4\\}.*resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}.*>`));
+          assert.match(tmuxLog, new RegExp(`run-shell tmux if-shell -F -t %11 .*#\\{==:#\\{pane_pid\\},1\\}.*if-shell -F -t %44 .*#\\{==:#\\{pane_pid\\},4\\}.*resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}.*>`));
           assert.match(tmuxLog, /hud --watch/);
           assert.match(tmuxLog, /OMX_TMUX_HUD_LEADER_PANE='%11'/);
           assert.match(tmuxLog, /OMX_SESSION_ID='team-shutdown-restore-hud-session'/);
           assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\} -c ${escapeRegExp(leaderPaneCwd)} `));
           assert.doesNotMatch(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\} -c ${escapeRegExp(cwd)} `));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %44/);
-          assert.match(tmuxLog, /select-pane -t %11/);
         },
       );
     } finally {
@@ -7640,7 +8451,7 @@ esac
     }
   });
 
-  it('shutdownTeam preserves unpersisted legacy worker-looking panes without owner tags', async () => {
+  it('shutdownTeam preserves persisted worker-looking panes without owner tags', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-unpersisted-legacy-worker-'));
     const teamName = 'team-unpersisted-legacy-worker';
     try {
@@ -7665,9 +8476,7 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"-F #{pane_dead} #{pane_pid}"*)
-        exit 1
-        ;;
+      *"-F #{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
         printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-unpersisted-legacy-worker/worker-1 codex\\n%%14\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-unpersisted-legacy-worker/worker-2 codex\\n"
         exit 0
@@ -7724,7 +8533,7 @@ esac
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.match(tmuxLog, /kill-pane -t %12/);
-          assert.match(tmuxLog, /kill-pane -t %13/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %13/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %14/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %99/);
         },
@@ -7744,6 +8553,7 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+restored_marker="${tmuxLogPath}.restored"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -7759,15 +8569,14 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"-F #{pane_dead} #{pane_pid}"*)
-        exit 1
-        ;;
+      *"-F #{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
         printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-stale-hud-live-owner/worker-1 codex\\n"
         exit 0
         ;;
       *"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n"
+        printf "%%11\tzsh\tzsh\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
         exit 0
         ;;
       *)
@@ -7776,7 +8585,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "$restored_marker"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -7784,7 +8594,7 @@ case "$1" in
       *"-p -t %11 @omx_team_pane_owner_id"*)
         echo "team:team-stale-hud-live-owner"
         ;;
-      *"-p -t %12 @omx_team_pane_owner_id"*)
+      *"-p -t %12 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*)
         echo "team:team-stale-hud-live-owner"
         ;;
       *)
@@ -7823,7 +8633,6 @@ esac
           assert.doesNotMatch(tmuxLog, /kill-pane -t %99/);
           assert.equal(count(/kill-pane -t %12/g), 1);
           assert.equal(count(new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\}`, 'g')), 1);
-          assert.match(tmuxLog, /select-pane -t %11/);
         },
       );
     } finally {
@@ -7841,6 +8650,7 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+restored_marker="${tmuxLogPath}.restored"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -7856,15 +8666,14 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"-F #{pane_dead} #{pane_pid}"*)
-        exit 1
-        ;;
+      *"-F #{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
         printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-legacy-hud-owner/worker-1 codex\\n"
         exit 0
         ;;
       *"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n"
+        printf "%%11\tzsh\tzsh\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
         exit 0
         ;;
       *)
@@ -7873,12 +8682,13 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "$restored_marker"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
     case "$*" in
-      *"-p -t %11 @omx_team_pane_owner_id"*)
+      *"-p -t %11 @omx_team_pane_owner_id"*|*"-p -t %13 @omx_team_pane_owner_id"*)
         echo "team:team-legacy-hud-owner"
         ;;
       *"-p -t %12 @omx_team_pane_owner_id"*)
@@ -7916,7 +8726,6 @@ esac
           assert.match(tmuxLog, /kill-pane -t %12/);
           assert.match(tmuxLog, /kill-pane -t %13/);
           assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\}`));
-          assert.match(tmuxLog, /select-pane -t %11/);
         },
       );
     } finally {
@@ -7935,6 +8744,7 @@ esac
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+restored_marker="${tmuxLogPath}.restored"
 case "$1" in
   -V)
     echo "tmux 3.4"
@@ -7950,15 +8760,14 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"-F #{pane_dead} #{pane_pid}"*)
-        exit 1
-        ;;
+      *"-F #{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
         printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-legacy-leader-instance/worker-1 codex\\n"
         exit 0
         ;;
       *"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
-        printf "%%11\\tzsh\\tzsh\\n"
+        printf "%%11\tzsh\tzsh\n"
+        if [ -f "$restored_marker" ]; then printf "%%44\tnode\tnode /tmp/bin/omx.js hud --watch\n"; fi
         exit 0
         ;;
       *)
@@ -7967,7 +8776,8 @@ case "$1" in
     esac
     ;;
   split-window)
-    printf '%%44\\n'
+    : > "$restored_marker"
+    printf '%%44\n'
     exit 0
     ;;
   show-option)
@@ -8019,7 +8829,6 @@ esac
           assert.match(tmuxLog, /kill-pane -t %12/);
           assert.match(tmuxLog, /kill-pane -t %13/);
           assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\}`));
-          assert.match(tmuxLog, /select-pane -t %11/);
         },
       );
     } finally {
@@ -8049,9 +8858,7 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
-      *"-F #{pane_dead} #{pane_pid}"*)
-        exit 1
-        ;;
+      *"-F #{pane_dead} #{pane_pid}"*) echo "0 2000004242" ;;
       *"-t leader:0 -F #{pane_id}"*"#{pane_current_command}"*)
         printf "%%11\\tzsh\\tzsh\\n%%12\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' node /tmp/bin/omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-hud-owner-read-error/worker-1 codex\\n"
         exit 0
@@ -8151,16 +8958,17 @@ esac
           config.tmux_session = 'omx-team-team-shutdown-exclusions';
           config.leader_pane_id = '%11';
           config.hud_pane_id = '%12';
-          config.workers[0]!.pane_id = '%11';
-          config.workers[1]!.pane_id = '%12';
-          config.workers[2]!.pane_id = '%13';
+          config.workers[0]!.pane_id = '%13';
+          config.workers[1]!.pane_id = '%14';
+          config.workers[2]!.pane_id = '%15';
           await saveTeamConfig(config, cwd);
 
-          await shutdownTeam('team-shutdown-exclusions', cwd, { force: true });
+          await assert.rejects(
+            () => shutdownTeam('team-shutdown-exclusions', cwd, { force: true }),
+            /shutdown_pane_liveness_invalid:team-shutdown-exclusions:%12:read_error/,
+          );
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
-          assert.match(tmuxLog, /kill-pane -t %12/);
-          assert.match(tmuxLog, /kill-pane -t %13/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %(?:11|12|13|14|15)/);
         },
       );
     } finally {
@@ -8354,7 +9162,7 @@ esac
       config.leader_pane_id = null;
       config.hud_pane_id = null;
       config.workers[0].pid = sleeperPid;
-      config.workers[0].pane_id = null;
+      delete config.workers[0].pane_id;
       await writeFile(configPath, JSON.stringify(config, null, 2));
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-prompt-resume', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as any;
@@ -8363,7 +9171,7 @@ esac
       manifest.leader_pane_id = null;
       manifest.hud_pane_id = null;
       manifest.workers[0].pid = sleeperPid;
-      manifest.workers[0].pane_id = null;
+      delete manifest.workers[0].pane_id;
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
       const runtime = await resumeTeam('team-prompt-resume', cwd);
@@ -9725,7 +10533,7 @@ esac
       const cfg = await readTeamConfig('team-leader-hook', cwd);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       await saveTeamConfig(cfg, cwd);
       await sendWorkerMessage('team-leader-hook', 'worker-1', 'leader-fixed', 'hello leader', cwd);
 
@@ -9761,7 +10569,7 @@ esac
       const cfg = await readTeamConfig('team-leader-direct', cwd);
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
-      cfg.leader_pane_id = '';
+      cfg.leader_pane_id = null;
       await saveTeamConfig(cfg, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-leader-direct', 'manifest.v2.json');

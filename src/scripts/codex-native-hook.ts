@@ -61,8 +61,8 @@ import {
   appendTeamEvent,
   readTeamLeaderAttention,
   readTeamConfig,
-  readTeamManifestV2,
   readTeamPhase,
+  readTeamStateOutcome,
   writeTeamLeaderAttention,
   writeTeamPhase,
 } from "../team/state.js";
@@ -9576,14 +9576,15 @@ async function findCanonicalActiveTeamForSession(
     const teamName = entry.name.trim();
     if (!teamName) continue;
 
-    const [manifest, phaseState] = await Promise.all([
-      readTeamManifestV2(teamName, cwd),
+    const [teamStateOutcome, phaseState] = await Promise.all([
+      readTeamStateOutcome(teamName, cwd),
       readTeamPhase(teamName, cwd),
     ]);
-    if (!manifest || !phaseState) continue;
-    const ownerSessionId = (manifest.leader?.session_id ?? "").trim();
+    if (teamStateOutcome.status !== "valid" || !phaseState) continue;
+    const leader = teamStateOutcome.manifest.leader;
+    const ownerSessionId = (leader?.session_id ?? "").trim();
     if (ownerSessionId && ownerSessionId !== sessionId.trim()) continue;
-    if (!teamStateMatchesThreadForStop(manifest.leader as unknown as Record<string, unknown>, threadId)) continue;
+    if (!teamStateMatchesThreadForStop(leader as unknown as Record<string, unknown>, threadId)) continue;
     if (!isNonTerminalPhase(phaseState.current_phase)) continue;
 
     return {

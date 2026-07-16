@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { AUTOPILOT_DEEP_INTERVIEW_QUESTION_OWNER_ENV } from '../autopilot-wait.js';
 import { evaluateQuestionPolicy } from '../policy.js';
+import { initTeamState } from '../../team/state.js';
 
 const tempDirs: string[] = [];
 const originalOmxRoot = process.env.OMX_ROOT;
@@ -49,33 +50,39 @@ describe('evaluateQuestionPolicy', { concurrency: false }, () => {
 
   it('blocks canonical active team ownership for the current session', { concurrency: false }, async () => {
     const cwd = await makeRepo();
-    const teamRoot = join(cwd, '.omx', 'state', 'team', 'alpha');
-    await mkdir(teamRoot, { recursive: true });
-    await writeFile(join(teamRoot, 'manifest.v2.json'), JSON.stringify({
-      schema_version: 2,
-      name: 'alpha',
-      task: 'demo',
-      leader: { session_id: 'sess-team', worker_id: 'leader-fixed', role: 'coordinator' },
-      policy: { display_mode: 'auto', worker_launch_mode: 'interactive', dispatch_mode: 'hook_preferred_with_fallback', dispatch_ack_timeout_ms: 2000 },
-      governance: { approvals: 'leader', merge_strategy: 'sequential' },
-      lifecycle_profile: 'default',
-      permissions_snapshot: { sandbox_mode: 'workspace-write', approval_policy: 'never' },
-      tmux_session: 'alpha:0',
-      worker_count: 1,
-      workers: [],
-      next_task_id: 1,
-      created_at: new Date().toISOString(),
-      leader_pane_id: null,
-      hud_pane_id: null,
-      resize_hook_name: null,
-      resize_hook_target: null,
-    }));
-    await writeFile(join(teamRoot, 'phase.json'), JSON.stringify({ current_phase: 'team-exec', max_fix_attempts: 3, current_fix_attempt: 0, transitions: [], updated_at: new Date().toISOString() }));
+    await initTeamState('alpha', 'demo', 'executor', 1, cwd, undefined, {
+      ...process.env,
+      OMX_SESSION_ID: 'sess-team',
+    });
     await writeFile(join(cwd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: 'sess-team' }));
     const result = await evaluateQuestionPolicy({ cwd, explicitSessionId: 'sess-team', env: { ...process.env, OMX_TEAM_WORKER: '' } });
     assert.equal(result.allowed, false);
     assert.equal(result.code, 'team_blocked');
     assert.equal(result.fallbackAllowed, false);
+  });
+
+  it('fails closed when canonical active team companion state is malformed or divergent', { concurrency: false }, async () => {
+    const cwd = await makeRepo();
+    const teamRoot = join(cwd, '.omx', 'state', 'team', 'alpha');
+    const configPath = join(teamRoot, 'config.json');
+    await initTeamState('alpha', 'demo', 'executor', 1, cwd, undefined, {
+      ...process.env,
+      OMX_SESSION_ID: 'sess-team',
+    });
+    await writeFile(join(cwd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: 'sess-team' }));
+
+    await writeFile(configPath, '{');
+    let result = await evaluateQuestionPolicy({ cwd, explicitSessionId: 'sess-team', env: { ...process.env, OMX_TEAM_WORKER: '' } });
+    assert.equal(result.allowed, true, 'a malformed companion config must not authorize Team ownership');
+
+    await initTeamState('alpha', 'demo', 'executor', 1, cwd, undefined, {
+      ...process.env,
+      OMX_SESSION_ID: 'sess-team',
+    });
+    const config = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+    await writeFile(configPath, JSON.stringify({ ...config, task: 'divergent task' }));
+    result = await evaluateQuestionPolicy({ cwd, explicitSessionId: 'sess-team', env: { ...process.env, OMX_TEAM_WORKER: '' } });
+    assert.equal(result.allowed, true, 'a divergent companion config must not authorize Team ownership');
   });
 
   it('blocks active execution-like workflows for the current session', { concurrency: false }, async () => {
@@ -92,28 +99,10 @@ describe('evaluateQuestionPolicy', { concurrency: false }, () => {
 
   it('does not falsely block from another session team state', { concurrency: false }, async () => {
     const cwd = await makeRepo();
-    const teamRoot = join(cwd, '.omx', 'state', 'team', 'beta');
-    await mkdir(teamRoot, { recursive: true });
-    await writeFile(join(teamRoot, 'manifest.v2.json'), JSON.stringify({
-      schema_version: 2,
-      name: 'beta',
-      task: 'demo',
-      leader: { session_id: 'sess-other', worker_id: 'leader-fixed', role: 'coordinator' },
-      policy: { display_mode: 'auto', worker_launch_mode: 'interactive', dispatch_mode: 'hook_preferred_with_fallback', dispatch_ack_timeout_ms: 2000 },
-      governance: { approvals: 'leader', merge_strategy: 'sequential' },
-      lifecycle_profile: 'default',
-      permissions_snapshot: { sandbox_mode: 'workspace-write', approval_policy: 'never' },
-      tmux_session: 'beta:0',
-      worker_count: 1,
-      workers: [],
-      next_task_id: 1,
-      created_at: new Date().toISOString(),
-      leader_pane_id: null,
-      hud_pane_id: null,
-      resize_hook_name: null,
-      resize_hook_target: null,
-    }));
-    await writeFile(join(teamRoot, 'phase.json'), JSON.stringify({ current_phase: 'team-exec', max_fix_attempts: 3, current_fix_attempt: 0, transitions: [], updated_at: new Date().toISOString() }));
+    await initTeamState('beta', 'demo', 'executor', 1, cwd, undefined, {
+      ...process.env,
+      OMX_SESSION_ID: 'sess-other',
+    });
     const result = await evaluateQuestionPolicy({ cwd, explicitSessionId: 'sess-main', env: { ...process.env, OMX_TEAM_WORKER: '' } });
     assert.equal(result.allowed, true);
   });

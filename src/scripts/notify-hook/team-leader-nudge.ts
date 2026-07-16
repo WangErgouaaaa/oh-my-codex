@@ -6,6 +6,8 @@
 import { readFile, writeFile, mkdir, appendFile, readdir, rename, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, resolve } from 'path';
+import { migrateV1ToV2, readTeamStateOutcome } from '../../team/state.js';
+import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
 import { readUsableSessionState } from '../../hooks/session.js';
 import { asNumber, safeString, isTerminalPhase } from './utils.js';
 import { readJsonIfExists, getScopedStateDirsForCurrentSession } from './state-io.js';
@@ -107,6 +109,37 @@ async function teamStateAllowsLeaderNudge(stateDir, teamName) {
   if (currentPhase && isTerminalPhase(currentPhase)) return false;
 
   return true;
+}
+
+async function readLeaderPaneAuthority(teamName, cwd, expected = null) {
+  let outcome = await readTeamStateOutcome(teamName, cwd);
+  if (outcome.status === 'invalid' && outcome.source === 'manifest' && outcome.reason === 'incomplete') {
+    await migrateV1ToV2(teamName, cwd);
+    outcome = await readTeamStateOutcome(teamName, cwd);
+  }
+  if (outcome.status !== 'valid') return null;
+
+  const config = outcome.config;
+  const paneId = parseCanonicalTmuxPaneId(config?.leader_pane_id);
+  const tmuxSession = safeString(config?.tmux_session);
+  const ownerId = safeString(config?.tmux_pane_owner_id);
+  if (!paneId || paneId !== config?.leader_pane_id || !tmuxSession || !ownerId) return null;
+
+  try {
+    const result = await runProcess('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}\t#{@omx_team_pane_owner_id}'], 2000);
+    const rawRows = safeString(result.stdout);
+    if (!rawRows || rawRows.includes('\r') || !rawRows.endsWith('\n') || rawRows.endsWith('\n\n')) return null;
+    const rows = rawRows.slice(0, -1).split('\n').map((line) => line.split('\t'));
+    const seenPaneIds = new Set();
+    if (rows.some((row) => row.length !== 5 || parseCanonicalTmuxPaneId(row[0]) !== row[0] || (row[1] !== '0' && row[1] !== '1') || !/^[1-9][0-9]*$/.test(row[2]) || !row[3] || !row[4] || seenPaneIds.has(row[0]) || !seenPaneIds.add(row[0]))) return null;
+    const row = rows.find(([id]) => id === paneId);
+    if (!row) return null;
+    const [, dead, panePid, sessionName, paneOwnerId] = row;
+    if (dead !== '0' || sessionName !== tmuxSession || paneOwnerId !== ownerId || (expected && (expected.paneId !== paneId || expected.panePid !== panePid || expected.tmuxSession !== tmuxSession || expected.ownerId !== ownerId))) return null;
+    return { config, paneId, panePid, tmuxSession, ownerId };
+  } catch {
+    return null;
+  }
 }
 
 async function recordSuppressedLeaderNudge({
@@ -725,24 +758,22 @@ export async function maybeNudgeTeamLeader({
       });
       continue;
     }
-    let tmuxSession = '';
-    let leaderPaneId = '';
-    let ownerSessionId = '';
-    let workers = [];
-    try {
-      const manifestPath = join(omxDir, 'state', 'team', teamName, 'manifest.v2.json');
-      const configPath = join(omxDir, 'state', 'team', teamName, 'config.json');
-      const srcPath = existsSync(manifestPath) ? manifestPath : configPath;
-      if (existsSync(srcPath)) {
-        const raw = JSON.parse(await readFile(srcPath, 'utf-8'));
-        tmuxSession = safeString(raw && raw.tmux_session ? raw.tmux_session : '').trim();
-        leaderPaneId = safeString(raw && raw.leader_pane_id ? raw.leader_pane_id : '').trim();
-        ownerSessionId = safeString(raw && raw.leader && raw.leader.session_id ? raw.leader.session_id : '').trim();
-        if (Array.isArray(raw && raw.workers)) workers = raw.workers;
-      }
-    } catch {
-      // ignore
+    const leaderAuthority = await readLeaderPaneAuthority(teamName, cwd);
+    if (!leaderAuthority) {
+      await recordSuppressedLeaderNudge({
+        logsDir,
+        source,
+        teamName,
+        reason: 'leader_authority_invalid',
+      });
+      continue;
     }
+    const { config: teamConfig } = leaderAuthority;
+    const tmuxSession = leaderAuthority.tmuxSession;
+    const leaderPaneId = leaderAuthority.paneId;
+    const ownerSessionId = safeString(teamConfig?.leader?.session_id).trim();
+    const workers = Array.isArray(teamConfig?.workers) ? teamConfig.workers : [];
+    const assertLeaderAuthority = async () => Boolean(await readLeaderPaneAuthority(teamName, cwd, leaderAuthority));
     if (currentSessionId && ownerSessionId && ownerSessionId !== currentSessionId) continue;
     let mailbox = null;
     try {
@@ -772,9 +803,9 @@ export async function maybeNudgeTeamLeader({
         '',
         {},
       ).catch(() => null);
-      if (resolvedLeaderTarget?.paneTarget) {
-        tmuxTarget = safeString(resolvedLeaderTarget.paneTarget).trim();
-      } else if (resolvedLeaderTarget && ['target_is_hud_pane', 'pane_cwd_mismatch'].includes(safeString(resolvedLeaderTarget.reason).trim())) {
+      if (resolvedLeaderTarget?.paneTarget === leaderAuthority.paneId) {
+        tmuxTarget = leaderAuthority.paneId;
+      } else if (resolvedLeaderTarget) {
         tmuxTarget = '';
       }
     }
@@ -1087,6 +1118,7 @@ export async function maybeNudgeTeamLeader({
       requireRunningAgent: true,
       requireReady: false,
       requireIdle: false,
+      assertPaneAuthority: assertLeaderAuthority,
     });
     if (!paneGuard.ok) {
       const deferredReason = paneGuard.reason === 'pane_running_shell'
@@ -1191,6 +1223,7 @@ export async function maybeNudgeTeamLeader({
         const sendResult = await queuePaneInput({
           paneTarget: tmuxTarget,
           prompt: markedText,
+          assertPaneAuthority: assertLeaderAuthority,
         });
         if (!sendResult.ok) {
           throw new Error(sendResult.error || sendResult.reason);
@@ -1202,6 +1235,7 @@ export async function maybeNudgeTeamLeader({
           prompt: markedText,
           submitKeyPresses: 2,
           submitDelayMs: 100,
+          assertPaneAuthority: assertLeaderAuthority,
         });
         if (!sendResult.ok) {
           throw new Error(sendResult.error || sendResult.reason);

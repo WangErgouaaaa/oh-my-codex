@@ -68,6 +68,9 @@ import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
+import { parseCanonicalTmuxPaneId } from '../hud/tmux.js';
+import { buildResizeHookName, buildResizeHookTarget } from './tmux-session.js';
+
 
 export type { TeamDispatchRequestStatus, TeamWorkerIntegrationStatus } from './contracts.js';
 
@@ -293,6 +296,8 @@ export interface TeamManifestV2 {
   schema_version: 2;
   name: string;
   task: string;
+  agent_type: string;
+  max_workers: number;
   leader: TeamLeader;
   policy: TeamPolicy;
   governance: TeamGovernance;
@@ -470,7 +475,7 @@ function validateTaskId(taskId: string): void {
 
 function defaultLeader(): TeamLeader {
   return {
-    session_id: '',
+    session_id: 'legacy',
     worker_id: 'leader-fixed',
     role: 'coordinator',
   };
@@ -478,6 +483,15 @@ function defaultLeader(): TeamLeader {
 
 function defaultTmuxPaneOwnerId(teamName: string): string {
   return `team:${teamName}`;
+}
+
+function isCanonicalTeamPaneOwnerId(value: unknown, teamName: string): value is string {
+  if (typeof value !== 'string') return false;
+  const ownerId = value;
+  // The team segment binds this token to the persisted Team root. Optional
+  // suffixes are generation nonces and must be non-empty, colon-delimited
+  // atoms so an owner token can never be reinterpreted for another team.
+  return new RegExp(`^team:${teamName}(?::[A-Za-z0-9_-]+)*$`).test(ownerId);
 }
 
 function defaultPolicy(
@@ -604,7 +618,8 @@ function resolvePermissionsSnapshot(env: NodeJS.ProcessEnv): PermissionsSnapshot
 async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv): Promise<string> {
   const fromEnv = readEnvValue(env, ['OMX_SESSION_ID', 'CODEX_SESSION_ID', 'SESSION_ID']);
   if (fromEnv) return fromEnv;
-  return (await readUsableSessionState(cwd))?.session_id ?? '';
+  const persistedSessionId = (await readUsableSessionState(cwd))?.session_id;
+  return isNonBlankString(persistedSessionId) ? persistedSessionId : `cwd:${resolve(cwd)}`;
 }
 
 function normalizeTask(task: TeamTask): TeamTaskV2 {
@@ -730,26 +745,260 @@ function isTeamTask(value: unknown): value is TeamTask {
   return true;
 }
 
-function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Record<string, unknown>;
-  if (v.schema_version !== 2) return false;
-  if (typeof v.name !== 'string') return false;
-  if (typeof v.task !== 'string') return false;
-  if (typeof v.tmux_session !== 'string') return false;
-  if (typeof v.worker_count !== 'number') return false;
-  if (typeof v.next_task_id !== 'number') return false;
-  if (typeof v.created_at !== 'string') return false;
-  if (!Array.isArray(v.workers)) return false;
-  if (!(typeof v.leader_pane_id === 'string' || v.leader_pane_id === null)) return false;
-  if (!(typeof v.hud_pane_id === 'string' || v.hud_pane_id === null)) return false;
-  if (!(typeof v.resize_hook_name === 'string' || v.resize_hook_name === null)) return false;
-  if (!(typeof v.resize_hook_target === 'string' || v.resize_hook_target === null)) return false;
-  if (!v.leader || typeof v.leader !== 'object') return false;
-  if (!v.policy || typeof v.policy !== 'object') return false;
-  if (!v.permissions_snapshot || typeof v.permissions_snapshot !== 'object') return false;
+function isPersistedWorkerInfo(value: unknown): value is WorkerInfo {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const worker = value as Record<string, unknown>;
+  if (typeof worker.name !== 'string' || worker.name.trim() === '') return false;
+  if (!Number.isInteger(worker.index) || (worker.index as number) < 1) return false;
+  if (typeof worker.role !== 'string' || worker.role.trim() === '') return false;
+  if (worker.assigned_tasks !== undefined && (!Array.isArray(worker.assigned_tasks) || !worker.assigned_tasks.every((taskId) => typeof taskId === 'string'))) return false;
+  if (worker.pane_id !== undefined && typeof worker.pane_id !== 'string') return false;
   return true;
 }
+
+function canonicalizeTeamPaneIds(
+  leaderPaneId: unknown,
+  hudPaneId: unknown,
+  workers: unknown,
+): { leaderPaneId: string | null; hudPaneId: string | null; workers: WorkerInfo[] } | null {
+  if (!Array.isArray(workers)) return null;
+
+  const canonicalizeOptionalPaneId = (value: unknown): string | null | undefined => {
+    if (value == null) return null;
+    if (typeof value !== 'string') return undefined;
+    if (value.trim() === '') return null;
+    return parseCanonicalTmuxPaneId(value) ?? undefined;
+  };
+  const canonicalLeaderPaneId = canonicalizeOptionalPaneId(leaderPaneId);
+  const canonicalHudPaneId = canonicalizeOptionalPaneId(hudPaneId);
+  if (canonicalLeaderPaneId === undefined || canonicalHudPaneId === undefined) return null;
+
+  const paneIds = new Set<string>();
+  const addPaneId = (paneId: string | null): boolean => {
+    if (!paneId) return true;
+    if (paneIds.has(paneId)) return false;
+    paneIds.add(paneId);
+    return true;
+  };
+  if (!addPaneId(canonicalLeaderPaneId) || !addPaneId(canonicalHudPaneId)) return null;
+
+  const canonicalWorkers: WorkerInfo[] = [];
+  const workerNames = new Set<string>();
+  const workerIndexes = new Set<number>();
+  for (const worker of workers) {
+    if (!isPersistedWorkerInfo(worker)) return null;
+    const workerInfo: WorkerInfo = {
+      ...worker,
+      assigned_tasks: Array.isArray(worker.assigned_tasks) ? [...worker.assigned_tasks] : [],
+    };
+    if (workerNames.has(workerInfo.name) || workerIndexes.has(workerInfo.index)) return null;
+    workerNames.add(workerInfo.name);
+    workerIndexes.add(workerInfo.index);
+
+    if (workerInfo.pane_id === undefined) {
+      canonicalWorkers.push(workerInfo);
+      continue;
+    }
+    if (typeof workerInfo.pane_id !== 'string') return null;
+    if (workerInfo.pane_id.trim() === '') {
+      const { pane_id: _paneId, ...workerWithoutPaneId } = workerInfo;
+      canonicalWorkers.push(workerWithoutPaneId);
+      continue;
+    }
+    const paneId = parseCanonicalTmuxPaneId(workerInfo.pane_id);
+    if (!paneId || !addPaneId(paneId)) return null;
+    canonicalWorkers.push({ ...workerInfo, pane_id: paneId });
+  }
+
+  return {
+    leaderPaneId: canonicalLeaderPaneId,
+    hudPaneId: canonicalHudPaneId,
+    workers: canonicalWorkers,
+  };
+}
+
+function isTeamConfig(value: unknown, teamName: string): value is TeamConfig {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const config = value as Record<string, unknown>;
+  if (config.name !== teamName) return false;
+  if (typeof config.task !== 'string' || typeof config.agent_type !== 'string') return false;
+  if (config.worker_launch_mode !== 'interactive' && config.worker_launch_mode !== 'prompt') return false;
+  if (!Number.isInteger(config.worker_count) || (config.worker_count as number) < 0) return false;
+  if (!Number.isInteger(config.max_workers) || (config.max_workers as number) < 1) return false;
+  if (config.next_task_id !== undefined && (!Number.isInteger(config.next_task_id) || (config.next_task_id as number) < 1)) return false;
+  if (typeof config.created_at !== 'string' || typeof config.tmux_session !== 'string' || config.tmux_session.trim() === '') return false;
+  if (!Array.isArray(config.workers) || config.workers.length !== config.worker_count) return false;
+  return canonicalizeTeamPaneIds(config.leader_pane_id, config.hud_pane_id, config.workers) !== null;
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+function isSafePositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+}
+
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isCanonicalNullablePaneId(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && parseCanonicalTmuxPaneId(value) === value);
+}
+
+function isCanonicalLeaderWorkerId(value: unknown): value is string {
+  if (!isNonBlankString(value)) return false;
+  const segments = value.split('/');
+  return (segments.length === 1 && WORKER_NAME_SAFE_PATTERN.test(segments[0]!))
+    || (segments.length === 2 && TEAM_NAME_SAFE_PATTERN.test(segments[0]!) && WORKER_NAME_SAFE_PATTERN.test(segments[1]!));
+}
+
+function isStrictPersistedWorkerInfo(value: unknown): value is WorkerInfo {
+  if (!isPersistedWorkerInfo(value)) return false;
+  const worker = value as unknown as Record<string, unknown>;
+  if (!WORKER_NAME_SAFE_PATTERN.test(worker.name as string)) return false;
+  if (!isSafePositiveInteger(worker.index) || (worker.index as number) > ABSOLUTE_MAX_WORKERS) return false;
+  if (!Array.isArray(worker.assigned_tasks) || !worker.assigned_tasks.every((taskId) => typeof taskId === 'string' && TASK_ID_SAFE_PATTERN.test(taskId))) return false;
+  if (new Set(worker.assigned_tasks).size !== worker.assigned_tasks.length) return false;
+  if (worker.worker_cli !== undefined && worker.worker_cli !== 'codex' && worker.worker_cli !== 'claude' && worker.worker_cli !== 'gemini') return false;
+  if (worker.pid !== undefined && !isSafePositiveInteger(worker.pid)) return false;
+  if (worker.pane_id !== undefined && (typeof worker.pane_id !== 'string' || parseCanonicalTmuxPaneId(worker.pane_id) !== worker.pane_id)) return false;
+  for (const field of ['working_dir', 'worktree_repo_root', 'worktree_path', 'worktree_branch', 'team_state_root'] as const) {
+    if (worker[field] !== undefined && !isNonBlankString(worker[field])) return false;
+  }
+  for (const field of ['worktree_detached', 'worktree_created'] as const) {
+    if (worker[field] !== undefined && typeof worker[field] !== 'boolean') return false;
+  }
+  return true;
+}
+
+/**
+ * Resize-hook metadata identifies a numeric tmux hook slot. The slot is a
+ * hash-derived implementation detail, so persisted metadata must be the
+ * exact derivation for this Team's target and HUD pane rather than merely a
+ * nonblank pair; otherwise a colliding hook name can unregister another hook.
+ */
+export function hasCanonicalResizeHookMetadata(config: Pick<TeamConfig, 'name' | 'tmux_session' | 'hud_pane_id' | 'resize_hook_name' | 'resize_hook_target'>): boolean {
+  if (config.resize_hook_name === null || config.resize_hook_target === null) {
+    return config.resize_hook_name === null && config.resize_hook_target === null;
+  }
+  if (!isCanonicalNullablePaneId(config.hud_pane_id) || config.hud_pane_id === null) return false;
+  const targetMatch = /^([^:\s]+):([^\s]+)$/.exec(config.tmux_session);
+  if (!targetMatch) return false;
+  const [, sessionName, windowIndex] = targetMatch;
+  return config.resize_hook_target === buildResizeHookTarget(sessionName!, windowIndex!)
+    && config.resize_hook_name === buildResizeHookName(config.name, sessionName!, windowIndex!, config.hud_pane_id);
+}
+
+function isStrictTeamConfigCompatibilityShape(config: TeamConfig): boolean {
+  if (!isNonBlankString(config.task) || !isNonBlankString(config.agent_type)) return false;
+  if (config.worker_launch_mode !== 'interactive' && config.worker_launch_mode !== 'prompt') return false;
+  if (config.lifecycle_profile !== 'default') return false;
+  if (!isSafeNonNegativeInteger(config.worker_count) || config.worker_count > ABSOLUTE_MAX_WORKERS) return false;
+  if (!isSafePositiveInteger(config.max_workers) || config.max_workers > ABSOLUTE_MAX_WORKERS) return false;
+  if (config.max_workers < config.worker_count) return false;
+  if (!isSafePositiveInteger(config.next_task_id)) return false;
+  if (!isNonBlankString(config.created_at) || !Number.isFinite(Date.parse(config.created_at))) return false;
+  if (!isNonBlankString(config.tmux_session)) return false;
+  if (!Array.isArray(config.workers) || config.workers.length !== config.worker_count || !config.workers.every(isStrictPersistedWorkerInfo)) return false;
+  if (!isSafePositiveInteger(config.next_worker_index)) return false;
+  const workerIndexes = config.workers.map((worker) => worker.index);
+  if (config.next_worker_index <= Math.max(0, ...workerIndexes)) return false;
+  return isCanonicalTeamPaneOwnerId(config.tmux_pane_owner_id, config.name)
+    && isCanonicalNullablePaneId(config.leader_pane_id)
+    && isCanonicalNullablePaneId(config.hud_pane_id)
+    && hasCanonicalResizeHookMetadata(config);
+}
+
+function configMatchesManifestCompatibilityProjection(config: TeamConfig, manifest: TeamManifestV2): boolean {
+  if (!isStrictTeamConfigCompatibilityShape(config)) return false;
+  const projection = teamConfigFromManifest(manifest);
+  const requiredFields: Array<keyof TeamConfig> = [
+    'name', 'task', 'agent_type', 'worker_launch_mode', 'lifecycle_profile', 'worker_count',
+    'max_workers', 'workers', 'created_at', 'tmux_session', 'next_task_id', 'leader_cwd',
+    'team_state_root', 'workspace_mode', 'worktree_mode', 'leader_pane_id', 'hud_pane_id',
+    'tmux_pane_owner_id', 'resize_hook_name', 'resize_hook_target', 'next_worker_index',
+    'display_name', 'requested_name', 'identity_source',
+  ];
+  return requiredFields.every((field) => JSON.stringify(config[field]) === JSON.stringify(projection[field]));
+}
+
+function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  if (v.schema_version !== 2 || !isNonBlankString(v.name) || !TEAM_NAME_SAFE_PATTERN.test(v.name)) return false;
+  if (!isNonBlankString(v.task) || !isNonBlankString(v.tmux_session) || !isNonBlankString(v.created_at) || !Number.isFinite(Date.parse(v.created_at))) return false;
+  if (!isNonBlankString(v.agent_type) || !isSafePositiveInteger(v.max_workers) || v.max_workers > ABSOLUTE_MAX_WORKERS) return false;
+  if (!isSafeNonNegativeInteger(v.worker_count) || v.worker_count > ABSOLUTE_MAX_WORKERS || !isSafePositiveInteger(v.next_task_id)) return false;
+  if (v.max_workers < v.worker_count) return false;
+  if (!Array.isArray(v.workers) || v.workers.length !== v.worker_count || !v.workers.every(isStrictPersistedWorkerInfo)) return false;
+  if (!isSafePositiveInteger(v.next_worker_index)) return false;
+  const workerIndexes = v.workers.map((worker) => (worker as WorkerInfo).index);
+  if (v.next_worker_index <= Math.max(0, ...workerIndexes)) return false;
+  if (!isCanonicalNullablePaneId(v.leader_pane_id) || !isCanonicalNullablePaneId(v.hud_pane_id)) return false;
+  if (!hasCanonicalResizeHookMetadata(v as unknown as TeamManifestV2)) return false;
+  if (!isCanonicalTeamPaneOwnerId(v.tmux_pane_owner_id, v.name)) return false;
+
+  if (!v.leader || typeof v.leader !== 'object' || Array.isArray(v.leader)) return false;
+  const leader = v.leader as Record<string, unknown>;
+  if (!isNonBlankString(leader.session_id) || !isCanonicalLeaderWorkerId(leader.worker_id) || !isNonBlankString(leader.role)) return false;
+  if (leader.thread_id !== undefined && !isNonBlankString(leader.thread_id)) return false;
+
+  if (!v.policy || typeof v.policy !== 'object' || Array.isArray(v.policy)) return false;
+  const policy = v.policy as Record<string, unknown>;
+  if (policy.display_mode !== 'split_pane' && policy.display_mode !== 'auto') return false;
+  if (policy.worker_launch_mode !== 'interactive' && policy.worker_launch_mode !== 'prompt') return false;
+  if (policy.dispatch_mode !== 'hook_preferred_with_fallback' && policy.dispatch_mode !== 'transport_direct') return false;
+  if (!isSafePositiveInteger(policy.dispatch_ack_timeout_ms) || policy.dispatch_ack_timeout_ms < MIN_DISPATCH_ACK_TIMEOUT_MS || policy.dispatch_ack_timeout_ms > MAX_DISPATCH_ACK_TIMEOUT_MS) return false;
+
+  if (!v.governance || typeof v.governance !== 'object' || Array.isArray(v.governance)) return false;
+  const governance = v.governance as Record<string, unknown>;
+  for (const field of ['delegation_only', 'plan_approval_required', 'nested_teams_allowed', 'one_team_per_leader_session', 'cleanup_requires_all_workers_inactive']) {
+    if (typeof governance[field] !== 'boolean') return false;
+  }
+  if (v.lifecycle_profile !== 'default') return false;
+
+  if (!v.permissions_snapshot || typeof v.permissions_snapshot !== 'object' || Array.isArray(v.permissions_snapshot)) return false;
+  const permissions = v.permissions_snapshot as Record<string, unknown>;
+  if (!isNonBlankString(permissions.approval_mode) || !isNonBlankString(permissions.sandbox_mode) || typeof permissions.network_access !== 'boolean') return false;
+
+  if (v.workspace_mode !== undefined && v.workspace_mode !== 'single' && v.workspace_mode !== 'worktree') return false;
+  for (const field of ['leader_cwd', 'team_state_root', 'display_name', 'requested_name', 'identity_source'] as const) {
+    if (v[field] !== undefined && !isNonBlankString(v[field])) return false;
+  }
+  if (v.worktree_mode !== undefined) {
+    if (!v.worktree_mode || typeof v.worktree_mode !== 'object' || Array.isArray(v.worktree_mode)) return false;
+    const worktreeMode = v.worktree_mode as Record<string, unknown>;
+    if (typeof worktreeMode.enabled !== 'boolean') return false;
+    if (worktreeMode.enabled === false && ('detached' in worktreeMode || 'name' in worktreeMode)) return false;
+    if (worktreeMode.enabled === true) {
+      if (typeof worktreeMode.detached !== 'boolean') return false;
+      if (worktreeMode.detached === true ? worktreeMode.name !== null : !isNonBlankString(worktreeMode.name)) return false;
+    }
+  }
+
+  const paneIds = canonicalizeTeamPaneIds(v.leader_pane_id, v.hud_pane_id, v.workers);
+  if (!paneIds) return false;
+  const assignedTaskIds = new Set<string>();
+  for (const worker of v.workers as WorkerInfo[]) {
+    for (const taskId of worker.assigned_tasks) {
+      if (assignedTaskIds.has(taskId)) return false;
+      assignedTaskIds.add(taskId);
+    }
+  }
+  return true;
+}
+
+export type TeamStateReadOutcome =
+  | { status: 'absent' }
+  | { status: 'valid'; config: TeamConfig; manifest: TeamManifestV2 }
+  | { status: 'invalid'; source: 'config' | 'manifest'; reason: 'malformed' | 'unreadable' | 'incomplete' };
+
+type TeamStateFileReadOutcome<T> =
+  | { status: 'absent' }
+  | { status: 'valid'; value: T }
+  | { status: 'invalid'; reason: 'malformed' | 'unreadable' };
 
 // Atomic write: write to {path}.tmp.{pid}, then rename
 export async function writeAtomic(filePath: string, data: string): Promise<void> {
@@ -876,6 +1125,8 @@ export async function initTeamState(
       schema_version: 2,
       name: teamName,
       task,
+      agent_type: agentType,
+      max_workers: maxWorkers,
       leader: {
         ...defaultLeader(),
         session_id: leaderSessionId,
@@ -920,10 +1171,19 @@ async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
     const merged: TeamManifestV2 = {
       ...existing,
       task: normalized.task,
+      agent_type: normalized.agent_type,
+      max_workers: normalized.max_workers,
       tmux_session: normalized.tmux_session,
       worker_count: normalized.worker_count,
       workers: normalized.workers,
       lifecycle_profile: normalized.lifecycle_profile,
+      policy: normalizeTeamPolicy(
+        { ...existing.policy, worker_launch_mode: normalized.worker_launch_mode },
+        {
+          display_mode: existing.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
+          worker_launch_mode: normalized.worker_launch_mode,
+        },
+      ),
       next_task_id: normalizeNextTaskId(normalized.next_task_id),
       leader_cwd: normalized.leader_cwd,
       team_state_root: normalized.team_state_root,
@@ -943,20 +1203,44 @@ async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
   }
 }
 
+
+function normalizeTeamConfig(config: TeamConfig): TeamConfig {
+  const paneIds = canonicalizeTeamPaneIds(
+    config.leader_pane_id,
+    config.hud_pane_id,
+    config.workers,
+  );
+  if (!paneIds) throw new Error('invalid_team_pane_ids');
+
+  const workerLaunchMode = config.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive';
+  return {
+    ...config,
+    lifecycle_profile: 'default',
+    leader_pane_id: paneIds.leaderPaneId,
+    hud_pane_id: paneIds.hudPaneId,
+    workers: paneIds.workers,
+    tmux_pane_owner_id: typeof config.tmux_pane_owner_id === 'string' && config.tmux_pane_owner_id.trim() !== ''
+      ? config.tmux_pane_owner_id.trim()
+      : defaultTmuxPaneOwnerId(config.name),
+    resize_hook_name: config.resize_hook_name ?? null,
+    resize_hook_target: config.resize_hook_target ?? null,
+    worker_launch_mode: workerLaunchMode,
+  };
+}
+
 function teamConfigFromManifest(manifest: TeamManifestV2): TeamConfig {
   const normalizedPolicy = normalizeTeamPolicy(manifest.policy, {
     display_mode: manifest.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
     worker_launch_mode: manifest.policy?.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive',
   });
-  const workerLaunchMode = normalizedPolicy.worker_launch_mode;
   return {
     name: manifest.name,
     task: manifest.task,
-    agent_type: manifest.workers[0]?.role ?? 'executor',
-    worker_launch_mode: workerLaunchMode,
+    agent_type: manifest.agent_type,
+    worker_launch_mode: normalizedPolicy.worker_launch_mode,
     lifecycle_profile: manifest.lifecycle_profile,
     worker_count: manifest.worker_count,
-    max_workers: DEFAULT_MAX_WORKERS,
+    max_workers: manifest.max_workers,
     workers: manifest.workers,
     created_at: manifest.created_at,
     tmux_session: manifest.tmux_session,
@@ -977,22 +1261,6 @@ function teamConfigFromManifest(manifest: TeamManifestV2): TeamConfig {
   };
 }
 
-function normalizeTeamConfig(config: TeamConfig): TeamConfig {
-  const workerLaunchMode = config.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive';
-  return {
-    ...config,
-    lifecycle_profile: 'default',
-    leader_pane_id: config.leader_pane_id ?? null,
-    hud_pane_id: config.hud_pane_id ?? null,
-    tmux_pane_owner_id: typeof config.tmux_pane_owner_id === 'string' && config.tmux_pane_owner_id.trim() !== ''
-      ? config.tmux_pane_owner_id.trim()
-      : defaultTmuxPaneOwnerId(config.name),
-    resize_hook_name: config.resize_hook_name ?? null,
-    resize_hook_target: config.resize_hook_target ?? null,
-    worker_launch_mode: workerLaunchMode,
-  };
-}
-
 function teamManifestFromConfig(config: TeamConfig): TeamManifestV2 {
   const normalized = normalizeTeamConfig(config);
   const policy = normalizeTeamPolicy(
@@ -1008,6 +1276,8 @@ function teamManifestFromConfig(config: TeamConfig): TeamManifestV2 {
     schema_version: 2,
     name: normalized.name,
     task: normalized.task,
+    agent_type: normalized.agent_type,
+    max_workers: normalized.max_workers,
     leader: defaultLeader(),
     policy,
     governance: defaultGovernance(),
@@ -1027,7 +1297,7 @@ function teamManifestFromConfig(config: TeamConfig): TeamManifestV2 {
     tmux_pane_owner_id: normalized.tmux_pane_owner_id,
     resize_hook_name: normalized.resize_hook_name,
     resize_hook_target: normalized.resize_hook_target,
-    next_worker_index: normalized.next_worker_index,
+    next_worker_index: normalized.next_worker_index ?? Math.max(0, ...normalized.workers.map((worker) => worker.index)) + 1,
     display_name: normalized.display_name,
     requested_name: normalized.requested_name,
     identity_source: normalized.identity_source,
@@ -1035,6 +1305,13 @@ function teamManifestFromConfig(config: TeamConfig): TeamManifestV2 {
 }
 
 export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string): Promise<void> {
+  const paneIds = canonicalizeTeamPaneIds(
+    manifest.leader_pane_id,
+    manifest.hud_pane_id,
+    manifest.workers,
+  );
+  if (!paneIds) throw new Error('invalid_team_pane_ids');
+
   const normalizedPolicy = normalizeTeamPolicy(manifest.policy, {
     display_mode: manifest.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
     worker_launch_mode: manifest.policy?.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive',
@@ -1052,6 +1329,9 @@ export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string)
     JSON.stringify(
       {
         ...manifest,
+        leader_pane_id: paneIds.leaderPaneId,
+        hud_pane_id: paneIds.hudPaneId,
+        workers: paneIds.workers,
         tmux_pane_owner_id: tmuxPaneOwnerId,
         policy: normalizedPolicy,
         governance: normalizedGovernance,
@@ -1063,26 +1343,54 @@ export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string)
   );
 }
 
-export async function readTeamManifestV2(teamName: string, cwd: string): Promise<TeamManifestV2 | null> {
+async function readTeamManifestV2Outcome(
+  teamName: string,
+  cwd: string,
+): Promise<TeamStateFileReadOutcome<TeamManifestV2>> {
+  const p = teamManifestV2Path(teamName, cwd);
+  if (!existsSync(p)) return { status: 'absent' };
+
+  let raw: string;
   try {
-    const p = teamManifestV2Path(teamName, cwd);
-    if (!existsSync(p)) return null;
-    const raw = await readFile(p, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isTeamManifestV2(parsed)) return null;
-    const parsedManifest = parsed as TeamManifestV2 & {
-      policy?: Partial<TeamPolicy> & Partial<TeamGovernance>;
-      governance?: Partial<TeamGovernance>;
-    };
-    const legacyPolicy = parsedManifest.policy as (Partial<TeamPolicy> & Partial<TeamGovernance> & {
-      team_decomposition?: unknown;
-    }) | undefined;
-    const legacyTeamDecomposition = legacyPolicy?.team_decomposition;
-    const tmuxPaneOwnerId = typeof parsedManifest.tmux_pane_owner_id === 'string' && parsedManifest.tmux_pane_owner_id.trim() !== ''
-      ? parsedManifest.tmux_pane_owner_id.trim()
-      : defaultTmuxPaneOwnerId(parsedManifest.name);
-    return {
+    raw = await readFile(p, 'utf8');
+  } catch {
+    return { status: 'invalid', reason: 'unreadable' };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return { status: 'invalid', reason: 'malformed' };
+  }
+  if (!isTeamManifestV2(parsed)) return { status: 'invalid', reason: 'malformed' };
+  if (parsed.name !== teamName) return { status: 'invalid', reason: 'malformed' };
+
+  const parsedManifest = parsed as TeamManifestV2 & {
+    policy?: Partial<TeamPolicy> & Partial<TeamGovernance>;
+    governance?: Partial<TeamGovernance>;
+  };
+  const legacyPolicy = parsedManifest.policy as (Partial<TeamPolicy> & Partial<TeamGovernance> & {
+    team_decomposition?: unknown;
+  }) | undefined;
+  const legacyTeamDecomposition = legacyPolicy?.team_decomposition;
+  const tmuxPaneOwnerId = typeof parsedManifest.tmux_pane_owner_id === 'string' && parsedManifest.tmux_pane_owner_id.trim() !== ''
+    ? parsedManifest.tmux_pane_owner_id.trim()
+    : defaultTmuxPaneOwnerId(parsedManifest.name);
+  const paneIds = canonicalizeTeamPaneIds(
+    parsedManifest.leader_pane_id,
+    parsedManifest.hud_pane_id,
+    parsedManifest.workers,
+  );
+  if (!paneIds) return { status: 'invalid', reason: 'malformed' };
+
+  return {
+    status: 'valid',
+    value: {
       ...parsedManifest,
+      leader_pane_id: paneIds.leaderPaneId,
+      hud_pane_id: paneIds.hudPaneId,
+      workers: paneIds.workers,
       tmux_pane_owner_id: tmuxPaneOwnerId,
       policy: normalizeTeamPolicy(parsedManifest.policy, {
         display_mode: parsedManifest.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
@@ -1094,30 +1402,45 @@ export async function readTeamManifestV2(teamName: string, cwd: string): Promise
           ? legacyTeamDecomposition as Record<string, unknown>
           : undefined),
       lifecycle_profile: 'default',
-    };
-  } catch {
-    return null;
-  }
+    },
+  };
 }
 
-// Idempotent migration; keeps config.json untouched.
+export async function readTeamManifestV2(teamName: string, cwd: string): Promise<TeamManifestV2 | null> {
+  const outcome = await readTeamManifestV2Outcome(teamName, cwd);
+  return outcome.status === 'valid' ? outcome.value : null;
+}
+
+
+// Idempotent migration from config-only legacy state.
+function isExplicitLegacyV1Config(config: TeamConfig): boolean {
+  return (config as TeamConfig & { schema_version?: unknown }).schema_version === 1;
+}
+
 export async function migrateV1ToV2(teamName: string, cwd: string): Promise<TeamManifestV2 | null> {
-  const existing = await readTeamManifestV2(teamName, cwd);
-  if (existing) return existing;
+  const manifestOutcome = await readTeamManifestV2Outcome(teamName, cwd);
+  if (manifestOutcome.status === 'valid') return manifestOutcome.value;
+  if (manifestOutcome.status === 'invalid') return null;
+
+  const configOutcome = await readLegacyTeamConfigFileOutcome(teamName, cwd);
+  if (configOutcome.status !== 'valid' || !isExplicitLegacyV1Config(configOutcome.value)) return null;
 
   try {
-    const p = teamConfigPath(teamName, cwd);
-    if (!existsSync(p)) return null;
-    const raw = await readFile(p, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== 'object') return null;
-    const manifest = teamManifestFromConfig(parsed as TeamConfig);
-    await writeTeamManifestV2(manifest, cwd);
+    const { schema_version: _legacySchemaVersion, ...legacyConfig } = configOutcome.value as TeamConfig & { schema_version: 1 };
+    const migratedConfig: TeamConfig = {
+      ...legacyConfig,
+      next_task_id: normalizeNextTaskId(configOutcome.value.next_task_id),
+      next_worker_index: configOutcome.value.next_worker_index
+        ?? Math.max(0, ...configOutcome.value.workers.map((worker) => worker.index)) + 1,
+    };
+    await writeAtomic(teamConfigPath(teamName, cwd), JSON.stringify(migratedConfig, null, 2));
+    await writeTeamManifestV2(teamManifestFromConfig(migratedConfig), cwd);
     return await readTeamManifestV2(teamName, cwd);
   } catch {
     return null;
   }
 }
+
 
 function normalizeNextTaskId(raw: unknown): number {
   const asNum = typeof raw === 'number' ? raw : Number(raw);
@@ -1153,25 +1476,118 @@ async function computeNextTaskIdFromDisk(teamName: string, cwd: string): Promise
   return maxId + 1;
 }
 
-// Read team config
-export async function readTeamConfig(teamName: string, cwd: string): Promise<TeamConfig | null> {
-  const v2 = await readTeamManifestV2(teamName, cwd);
-  if (v2) return teamConfigFromManifest(v2);
+async function readLegacyTeamConfigFileOutcome(
+  teamName: string,
+  cwd: string,
+): Promise<TeamStateFileReadOutcome<TeamConfig>> {
+  const p = teamConfigPath(teamName, cwd);
+  if (!existsSync(p)) return { status: 'absent' };
 
-  // Attempt idempotent migration on first read.
-  const migrated = await migrateV1ToV2(teamName, cwd);
-  if (migrated) return teamConfigFromManifest(migrated);
+  let raw: string;
+  try {
+    raw = await readFile(p, 'utf8');
+  } catch {
+    return { status: 'invalid', reason: 'unreadable' };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return { status: 'invalid', reason: 'malformed' };
+  }
+  if (!parsed || typeof parsed !== 'object' || !isTeamConfig(parsed, teamName)) {
+    return { status: 'invalid', reason: 'malformed' };
+  }
 
   try {
-    const p = teamConfigPath(teamName, cwd);
-    if (!existsSync(p)) return null;
-    const raw = await readFile(p, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== 'object') return null;
-    return normalizeTeamConfig(parsed as TeamConfig);
+    return { status: 'valid', value: normalizeTeamConfig(parsed as TeamConfig) };
   } catch {
-    return null;
+    return { status: 'invalid', reason: 'malformed' };
   }
+}
+
+async function readTeamConfigFileOutcome(
+  teamName: string,
+  cwd: string,
+): Promise<TeamStateFileReadOutcome<TeamConfig>> {
+  const p = teamConfigPath(teamName, cwd);
+  if (!existsSync(p)) return { status: 'absent' };
+
+  let raw: string;
+  try {
+    raw = await readFile(p, 'utf8');
+  } catch {
+    return { status: 'invalid', reason: 'unreadable' };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return { status: 'invalid', reason: 'malformed' };
+  }
+  if (!parsed || typeof parsed !== 'object' || !isTeamConfig(parsed, teamName)) {
+    return { status: 'invalid', reason: 'malformed' };
+  }
+  if (!isStrictTeamConfigCompatibilityShape(parsed as TeamConfig)) {
+    return { status: 'invalid', reason: 'malformed' };
+  }
+
+  return { status: 'valid', value: parsed as TeamConfig };
+}
+
+/**
+ * Reads both persisted Team state authorities without collapsing invalid state
+ * into absence. Callers that may destroy or overwrite state must use this
+ * outcome rather than nullable compatibility readers.
+ */
+export async function readTeamStateOutcome(teamName: string, cwd: string): Promise<TeamStateReadOutcome> {
+  const [configOutcome, manifestOutcome] = await Promise.all([
+    readTeamConfigFileOutcome(teamName, cwd),
+    readTeamManifestV2Outcome(teamName, cwd),
+  ]);
+  if (configOutcome.status === 'invalid') {
+    return { status: 'invalid', source: 'config', reason: configOutcome.reason };
+  }
+  if (manifestOutcome.status === 'invalid') {
+    return { status: 'invalid', source: 'manifest', reason: manifestOutcome.reason };
+  }
+  if (configOutcome.status === 'absent' && manifestOutcome.status === 'absent') {
+    try {
+      await readdir(teamDir(teamName, cwd));
+      return { status: 'invalid', source: 'config', reason: 'incomplete' };
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      return err.code === 'ENOENT'
+        ? { status: 'absent' }
+        : { status: 'invalid', source: 'config', reason: 'unreadable' };
+    }
+  }
+  if (configOutcome.status !== 'valid') {
+    return { status: 'invalid', source: 'config', reason: 'incomplete' };
+  }
+  if (manifestOutcome.status !== 'valid') {
+    return { status: 'invalid', source: 'manifest', reason: 'incomplete' };
+  }
+  const config = configOutcome.value;
+  const manifest = manifestOutcome.value;
+  if (!isCanonicalTeamPaneOwnerId(config.tmux_pane_owner_id, teamName)) {
+    return { status: 'invalid', source: 'config', reason: 'malformed' };
+  }
+  if (!isCanonicalTeamPaneOwnerId(manifest.tmux_pane_owner_id, teamName)) {
+    return { status: 'invalid', source: 'manifest', reason: 'malformed' };
+  }
+  if (!configMatchesManifestCompatibilityProjection(config, manifest)) {
+    return { status: 'invalid', source: 'config', reason: 'malformed' };
+  }
+  return { status: 'valid', config: teamConfigFromManifest(manifest), manifest };
+}
+
+// Read team config
+export async function readTeamConfig(teamName: string, cwd: string): Promise<TeamConfig | null> {
+  const outcome = await readTeamStateOutcome(teamName, cwd);
+  return outcome.status === 'valid' ? outcome.config : null;
 }
 
 // Write worker identity file

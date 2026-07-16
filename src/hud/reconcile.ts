@@ -10,6 +10,7 @@ import {
   findLegacyFocusedHudWatchPaneIds,
   findHudWatchPaneIds,
   isHudWatchPane,
+  hasValidHudOwnerMarker,
   killTmuxPane,
   listCurrentWindowPanes,
   readCurrentWindowSize,
@@ -17,8 +18,13 @@ import {
   registerHudResizeHook,
   unregisterHudResizeHook,
   resizeTmuxPane,
+  parseCanonicalTmuxPaneId,
+  rollbackHudWatchPaneAuthority,
+  verifyHudWatchPaneAuthority,
+  hudPaneMatchesOwner,
   type HudPaneOwner,
   type TmuxPaneSnapshot,
+
 } from './tmux.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 
@@ -27,6 +33,130 @@ export const OMX_TMUX_HUD_OWNER_ENV = 'OMX_TMUX_HUD_OWNER';
 function isExplicitOmxOwnedTmuxEnv(env: NodeJS.ProcessEnv): boolean {
   return env[OMX_TMUX_HUD_OWNER_ENV] === '1';
 }
+
+function isStrictLivePaneSnapshot(panes: readonly TmuxPaneSnapshot[], currentPaneId: string | undefined): boolean {
+  const canonicalCurrentPaneId = parseCanonicalTmuxPaneId(currentPaneId);
+  if (!canonicalCurrentPaneId || panes.length === 0) return false;
+  const paneIds = new Set<string>();
+  for (const pane of panes) {
+    if (
+      parseCanonicalTmuxPaneId(pane.paneId) !== pane.paneId
+      || pane.paneDead !== false
+      || !/^[1-9][0-9]*$/.test(pane.panePid ?? '')
+      || paneIds.has(pane.paneId)
+    ) return false;
+    paneIds.add(pane.paneId);
+  }
+  return paneIds.has(canonicalCurrentPaneId);
+}
+
+function samePaneIncarnation(expected: TmuxPaneSnapshot, observed: TmuxPaneSnapshot): boolean {
+  return expected.paneId === observed.paneId
+    && expected.panePid === observed.panePid
+    && expected.paneDead === false
+    && observed.paneDead === false;
+}
+
+function sameLeaderIncarnation(
+  expectedLeader: TmuxPaneSnapshot,
+  observedPanes: readonly TmuxPaneSnapshot[],
+): boolean {
+  const observedLeader = observedPanes.find((pane) => pane.paneId === expectedLeader.paneId);
+  return Boolean(observedLeader && !isHudWatchPane(observedLeader) && samePaneIncarnation(expectedLeader, observedLeader));
+}
+
+function readFreshLeaderPane(
+  expectedLeader: TmuxPaneSnapshot,
+  currentPaneId: string | undefined,
+  listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[],
+): TmuxPaneSnapshot | null {
+  const panes = listPanes(currentPaneId);
+  return isStrictLivePaneSnapshot(panes, currentPaneId) && sameLeaderIncarnation(expectedLeader, panes)
+    ? panes.find((pane) => pane.paneId === expectedLeader.paneId) ?? null
+    : null;
+}
+
+type FreshHudKillPredicate = (pane: TmuxPaneSnapshot, panes: readonly TmuxPaneSnapshot[]) => boolean;
+
+function killFreshHudPanes(
+  paneIds: readonly string[],
+  expectedPanes: readonly TmuxPaneSnapshot[],
+  expectedLeader: TmuxPaneSnapshot,
+  currentPaneId: string | undefined,
+  listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[],
+  killPane: (paneId: string) => boolean,
+  shouldKill: FreshHudKillPredicate,
+): { reaped: string[]; complete: boolean } {
+  const candidatePaneIds = [...new Set(paneIds)];
+  if (candidatePaneIds.some((paneId) => parseCanonicalTmuxPaneId(paneId) !== paneId)) {
+    return { reaped: [], complete: false };
+  }
+  const expectedById = new Map(expectedPanes.map((pane) => [pane.paneId, pane]));
+
+  const reaped: string[] = [];
+  for (const paneId of candidatePaneIds) {
+    // A pane id can be recycled after a prior kill. Re-read the complete window
+    // immediately before every sink and re-prove owner and exact PID incarnation.
+    const panes = listPanes(currentPaneId);
+    if (!isStrictLivePaneSnapshot(panes, currentPaneId) || !sameLeaderIncarnation(expectedLeader, panes)) {
+      return { reaped, complete: false };
+    }
+    const pane = panes.find((candidate) => candidate.paneId === paneId);
+    const expectedPane = expectedById.get(paneId);
+    if (!pane || !expectedPane || !samePaneIncarnation(expectedPane, pane) || !isHudWatchPane(pane) || !shouldKill(pane, panes) || !killPane(paneId)) {
+      return { reaped, complete: false };
+    }
+    reaped.push(paneId);
+  }
+  return { reaped, complete: true };
+}
+
+function matchesOwnedHudScope(
+  pane: TmuxPaneSnapshot,
+  panes: readonly TmuxPaneSnapshot[],
+  currentPaneId: string | undefined,
+  owner: HudPaneOwner,
+): boolean {
+  return hudPaneMatchesOwner(pane, owner)
+    || findLegacyFocusedHudWatchPaneIds([...panes], currentPaneId).includes(pane.paneId);
+}
+
+function matchesFreshHudPane(
+  paneId: string,
+  expectedPane: TmuxPaneSnapshot,
+  expectedLeader: TmuxPaneSnapshot,
+  currentPaneId: string | undefined,
+  owner: HudPaneOwner,
+  listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[],
+): TmuxPaneSnapshot | null {
+  const readFreshPane = (): TmuxPaneSnapshot | null => {
+    const panes = listPanes(currentPaneId);
+    if (!isStrictLivePaneSnapshot(panes, currentPaneId) || !sameLeaderIncarnation(expectedLeader, panes)) return null;
+    const pane = panes.find((candidate) => candidate.paneId === paneId);
+    if (!pane || !samePaneIncarnation(expectedPane, pane) || !isHudWatchPane(pane) || !matchesOwnedHudScope(pane, panes, currentPaneId, owner)) return null;
+    return pane.startCommand === expectedPane.startCommand
+      && pane.currentCommand === expectedPane.currentCommand
+      && pane.currentPath === expectedPane.currentPath
+      ? pane
+      : null;
+  };
+
+  const first = readFreshPane();
+  if (!first) return null;
+  const second = readFreshPane();
+  return second
+    && samePaneIncarnation(first, second)
+    && second.startCommand === first.startCommand
+    && second.currentCommand === first.currentCommand
+    && second.currentPath === first.currentPath
+    ? second
+    : null;
+}
+
+function failedReconcileResult(desiredHeight: number | null = null, duplicateCount = 0): ReconcileHudForPromptSubmitResult {
+  return { status: 'failed', paneId: null, desiredHeight, duplicateCount };
+}
+
 
 /**
  * Kill HUD watch panes that belong to the *current* session but whose owning
@@ -51,65 +181,73 @@ function reapOrphanedSessionHudPanes(
     sessionId: string | undefined;
     sessionIds?: string[];
     currentPaneId: string | undefined;
+    expectedLeader: TmuxPaneSnapshot;
+    listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[];
     killPane: (paneId: string) => boolean;
   },
-): string[] {
-  const { sessionId, currentPaneId, killPane } = opts;
+): { reaped: string[]; complete: boolean } {
+  const { sessionId, currentPaneId, killPane, listPanes } = opts;
   const sameSessionIds = new Set(
     [sessionId, ...(opts.sessionIds ?? [])]
       .map((candidate) => candidate?.trim() ?? '')
       .filter((candidate) => candidate !== ''),
   );
-  if (sameSessionIds.size === 0) return [];
-  // A recorded leader only counts as "live" if it exists in this window AND is not
-  // itself a HUD watcher. Without the HUD exclusion, an orphan whose recorded leader
-  // is *another HUD pane* would be preserved here; that referenced HUD could be
-  // reaped on a later iteration, leaving a dangling orphan that still never matches
-  // the real current pane — so the all-HUD-strip state is only partially cleaned.
+  if (sameSessionIds.size === 0) return { reaped: [], complete: true };
   const liveNonHudPaneIds = new Set(
     panes.filter((pane) => !isHudWatchPane(pane)).map((pane) => pane.paneId),
   );
-  const reaped: string[] = [];
-  for (const pane of panes) {
-    if (!isHudWatchPane(pane)) continue;
+  const orphanPaneIds = panes
+    .filter((pane) => isHudWatchPane(pane))
+    .filter((pane) => {
+      const owner = readHudPaneOwner(pane);
+      return Boolean(owner.sessionId && sameSessionIds.has(owner.sessionId) && owner.leaderPaneId)
+        && owner.leaderPaneId !== currentPaneId
+        && !liveNonHudPaneIds.has(owner.leaderPaneId!);
+
+    })
+    .map((pane) => pane.paneId);
+
+  return killFreshHudPanes(orphanPaneIds, panes, opts.expectedLeader, currentPaneId, listPanes, killPane, (pane, freshPanes) => {
     const owner = readHudPaneOwner(pane);
-    // Only reclaim HUDs that explicitly belong to this session and name a leader.
-    if (!owner.sessionId || !sameSessionIds.has(owner.sessionId) || !owner.leaderPaneId) continue;
-    // Keep HUDs whose leader is the current pane or another live non-HUD leader pane.
-    if (owner.leaderPaneId === currentPaneId || liveNonHudPaneIds.has(owner.leaderPaneId)) continue;
-    if (killPane(pane.paneId)) reaped.push(pane.paneId);
-  }
-  return reaped;
+    if (!owner.sessionId || !sameSessionIds.has(owner.sessionId) || !owner.leaderPaneId) return false;
+    const liveNonHudPaneIds = new Set(
+      freshPanes.filter((candidate) => !isHudWatchPane(candidate)).map((candidate) => candidate.paneId),
+    );
+    return owner.leaderPaneId !== currentPaneId && !liveNonHudPaneIds.has(owner.leaderPaneId);
+  });
 }
 
-function hasExplicitHudOwnerMarker(pane: TmuxPaneSnapshot): boolean {
-  const command = `${pane.startCommand} ${pane.currentCommand}`;
-  return new RegExp(`(?:^|\\s)${OMX_TMUX_HUD_OWNER_ENV}=(?:'1'|1)(?=$|\\s)`).test(command);
-}
 
 function reapStaleCurrentLeaderHudPanes(
   panes: TmuxPaneSnapshot[],
   opts: {
     sessionIds: string[];
     currentPaneId: string | undefined;
+    listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[];
+    expectedLeader: TmuxPaneSnapshot;
     killPane: (paneId: string) => boolean;
   },
-): string[] {
-  const { currentPaneId, killPane } = opts;
-  if (!currentPaneId) return [];
+): { reaped: string[]; complete: boolean } {
+  const { currentPaneId, killPane, listPanes } = opts;
+  if (!currentPaneId) return { reaped: [], complete: true };
   const currentSessionIds = new Set(opts.sessionIds.map((sessionId) => sessionId.trim()).filter(Boolean));
-  if (currentSessionIds.size === 0) return [];
+  if (currentSessionIds.size === 0) return { reaped: [], complete: true };
+  const stalePaneIds = panes
+    .filter((pane) => isHudWatchPane(pane))
+    .filter((pane) => {
+      const owner = readHudPaneOwner(pane);
+      return owner.leaderPaneId === currentPaneId
+        && hasValidHudOwnerMarker(pane)
+        && Boolean(owner.sessionId && !currentSessionIds.has(owner.sessionId));
+    })
+    .map((pane) => pane.paneId);
 
-  const reaped: string[] = [];
-  for (const pane of panes) {
-    if (!isHudWatchPane(pane)) continue;
+  return killFreshHudPanes(stalePaneIds, panes, opts.expectedLeader, currentPaneId, listPanes, killPane, (pane) => {
     const owner = readHudPaneOwner(pane);
-    if (owner.leaderPaneId !== currentPaneId) continue;
-    if (!hasExplicitHudOwnerMarker(pane)) continue;
-    if (!owner.sessionId || currentSessionIds.has(owner.sessionId)) continue;
-    if (killPane(pane.paneId)) reaped.push(pane.paneId);
-  }
-  return reaped;
+    return owner.leaderPaneId === currentPaneId
+      && hasValidHudOwnerMarker(pane)
+      && Boolean(owner.sessionId && !currentSessionIds.has(owner.sessionId));
+  });
 }
 
 export interface ReconcileHudForPromptSubmitResult {
@@ -417,7 +555,7 @@ export async function reconcileHudForPromptSubmit(
 
   try {
 
-  const currentPaneId = env.TMUX_PANE?.trim();
+  const currentPaneId = env.TMUX_PANE;
   const resolvedSessionId = deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
   const equivalentSessionIds = [
     resolvedSessionId,
@@ -427,16 +565,31 @@ export async function reconcileHudForPromptSubmit(
     .map((sessionId) => sessionId?.trim() ?? '')
     .filter((sessionId, index, sessionIds) => sessionId !== '' && sessionIds.indexOf(sessionId) === index);
   let panes = listPanes(currentPaneId);
+  if (!isStrictLivePaneSnapshot(panes, currentPaneId)) {
+    return {
+      status: 'failed',
+      paneId: null,
+      desiredHeight: null,
+      duplicateCount: 0,
+    };
+
+  }
+  const expectedLeaderPane = panes.find((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane));
+  if (!expectedLeaderPane) return failedReconcileResult();
 
   // Reclaim orphaned HUD panes left behind by a destroyed leader before deciding
   // whether a HUD already exists; otherwise dead-leader HUDs accumulate one per
   // prompt submit and the window fills with stacked HUD strips.
-  const reapedOrphanPaneIds = reapOrphanedSessionHudPanes(panes, {
+  const orphanReap = reapOrphanedSessionHudPanes(panes, {
     sessionId: resolvedSessionId,
     sessionIds: equivalentSessionIds,
     currentPaneId,
+    expectedLeader: expectedLeaderPane,
+    listPanes,
     killPane,
   });
+  if (!orphanReap.complete) return failedReconcileResult();
+  const reapedOrphanPaneIds = orphanReap.reaped;
   if (reapedOrphanPaneIds.length > 0) {
     const reapedPaneIdSet = new Set(reapedOrphanPaneIds);
     panes = panes.filter((pane) => !reapedPaneIdSet.has(pane.paneId));
@@ -448,15 +601,20 @@ export async function reconcileHudForPromptSubmit(
   // does not match same-owner dedupe and the next launch would create a second HUD
   // beside it. Reap only HUDs tied to this exact leader pane; neighboring panes'
   // HUDs remain isolated by leaderPaneId.
-  const reapedStaleLeaderPaneIds = reapStaleCurrentLeaderHudPanes(panes, {
+  const staleLeaderReap = reapStaleCurrentLeaderHudPanes(panes, {
     sessionIds: equivalentSessionIds,
     currentPaneId,
+    expectedLeader: expectedLeaderPane,
+    listPanes,
     killPane,
   });
+  if (!staleLeaderReap.complete) return failedReconcileResult();
+  const reapedStaleLeaderPaneIds = staleLeaderReap.reaped;
   if (reapedStaleLeaderPaneIds.length > 0) {
     const reapedPaneIdSet = new Set(reapedStaleLeaderPaneIds);
     panes = panes.filter((pane) => !reapedPaneIdSet.has(pane.paneId));
   }
+
 
   const owner = {
     sessionId: resolvedSessionId,
@@ -479,20 +637,23 @@ export async function reconcileHudForPromptSubmit(
     omxTeamStateRoot: env.OMX_TEAM_STATE_ROOT,
     rootSource: env.OMX_TEAM_STATE_ROOT ? 'team-env' : env.OMX_ROOT ? 'omx-root-env' : env.OMX_STATE_ROOT ? 'omx-state-root-env' : 'cwd-default',
   });
-  const leaderPane = currentPaneId
-    ? panes.find((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane))
-    : undefined;
+  const leaderPane = expectedLeaderPane;
 
   const singleHudPane = hudPaneIds.length === 1
     ? panes.find((pane) => pane.paneId === hudPaneIds[0])
     : undefined;
   if (singleHudPane && !needsHudTopologyRecreate(singleHudPane, leaderPane)) {
     const shouldResize = needsHudHeightResize(singleHudPane, desiredHeight);
-    const resized = shouldResize ? resizePane(singleHudPane.paneId, desiredHeight) : true;
-    if (resized) ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+    const paneForResize = matchesFreshHudPane(singleHudPane.paneId, singleHudPane, expectedLeaderPane, currentPaneId, owner, listPanes);
+    if (!paneForResize) return failedReconcileResult(desiredHeight, duplicateCount);
+    const resized = shouldResize ? resizePane(paneForResize.paneId, desiredHeight) : true;
+    const paneForHook = resized
+      ? matchesFreshHudPane(paneForResize.paneId, paneForResize, expectedLeaderPane, currentPaneId, owner, listPanes)
+      : null;
+    if (paneForHook) ensureHudResizeHook(paneForHook.paneId, currentPaneId, desiredHeight, cwd, deps);
     return {
-      status: resized ? (shouldResize ? 'resized' : 'unchanged') : 'failed',
-      paneId: singleHudPane.paneId,
+      status: resized && paneForHook ? (shouldResize ? 'resized' : 'unchanged') : 'failed',
+      paneId: paneForHook?.paneId ?? null,
       desiredHeight,
       duplicateCount,
     };
@@ -505,18 +666,40 @@ export async function reconcileHudForPromptSubmit(
     const keeperPane = hudPanes.find((pane) => !needsHudTopologyRecreate(pane, leaderPane));
 
     if (keeperPane) {
-      for (const paneId of hudPaneIds.filter((paneId) => paneId !== keeperPane.paneId)) {
-        killPane(paneId);
-      }
-      const resized = resizePane(keeperPane.paneId, desiredHeight);
-      if (resized) ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+      const duplicateReap = killFreshHudPanes(
+        hudPaneIds.filter((paneId) => paneId !== keeperPane.paneId),
+        panes,
+        expectedLeaderPane,
+        currentPaneId,
+        listPanes,
+        killPane,
+        (pane, freshPanes) => pane.paneId !== keeperPane.paneId
+          && matchesOwnedHudScope(pane, freshPanes, currentPaneId, owner),
+      );
+      if (!duplicateReap.complete) return failedReconcileResult(desiredHeight, duplicateCount);
+      const freshPanes = listPanes(currentPaneId);
+      const freshKeeperPane = freshPanes.find((pane) => pane.paneId === keeperPane.paneId);
+      if (
+        !isStrictLivePaneSnapshot(freshPanes, currentPaneId)
+        || !sameLeaderIncarnation(expectedLeaderPane, freshPanes)
+        || !freshKeeperPane
+        || !matchesOwnedHudScope(freshKeeperPane, freshPanes, currentPaneId, owner)
+      ) return failedReconcileResult(desiredHeight, duplicateCount);
+      const keeperForResize = matchesFreshHudPane(freshKeeperPane.paneId, freshKeeperPane, expectedLeaderPane, currentPaneId, owner, listPanes);
+      if (!keeperForResize) return failedReconcileResult(desiredHeight, duplicateCount);
+      const resized = resizePane(keeperForResize.paneId, desiredHeight);
+      const keeperForHook = resized
+        ? matchesFreshHudPane(keeperForResize.paneId, keeperForResize, expectedLeaderPane, currentPaneId, owner, listPanes)
+        : null;
+      if (keeperForHook) ensureHudResizeHook(keeperForHook.paneId, currentPaneId, desiredHeight, cwd, deps);
       return {
-        status: resized ? 'replaced_duplicates' : 'failed',
-        paneId: keeperPane.paneId,
+        status: resized && keeperForHook ? 'replaced_duplicates' : 'failed',
+        paneId: keeperForHook?.paneId ?? null,
         desiredHeight,
         duplicateCount,
       };
     }
+
   }
   const createFullWidth = hudPaneIds
     .map((paneId) => panes.find((pane) => pane.paneId === paneId))
@@ -552,17 +735,28 @@ export async function reconcileHudForPromptSubmit(
   }
 
   const unregisterHook = deps.unregisterHudResizeHook ?? unregisterHudResizeHook;
+  if (!readFreshLeaderPane(expectedLeaderPane, currentPaneId, listPanes)) return failedReconcileResult(desiredHeight, duplicateCount);
   unregisterHook(currentPaneId);
 
-  const removedHudPaneIds = new Set<string>();
-  for (const paneId of hudPaneIds) {
-    if (killPane(paneId)) removedHudPaneIds.add(paneId);
-  }
+  const initialHudRemoval = killFreshHudPanes(
+    hudPaneIds,
+    panes,
+    expectedLeaderPane,
+    currentPaneId,
+    listPanes,
+    killPane,
+    (pane, freshPanes) => matchesOwnedHudScope(pane, freshPanes, currentPaneId, owner),
+  );
+  if (!initialHudRemoval.complete) return failedReconcileResult(desiredHeight, duplicateCount);
+  const removedHudPaneIds = new Set(initialHudRemoval.reaped);
+
 
   const createOptions: { heightLines: number; fullWidth?: boolean; targetPaneId?: string } = {
     heightLines: desiredHeight,
     targetPaneId: currentPaneId,
   };
+  if (!readFreshLeaderPane(expectedLeaderPane, currentPaneId, listPanes)) return failedReconcileResult(desiredHeight, duplicateCount);
+
   if (createFullWidth) createOptions.fullWidth = true;
   const paneId = createPane(cwd, hudCmd, createOptions);
   if (!paneId) {
@@ -578,25 +772,79 @@ export async function reconcileHudForPromptSubmit(
   // "no HUD" before either split-window has materialized. Re-scan after create
   // and collapse same-owner panes so the second creator cleans up the race
   // instead of leaving a duplicate HUD in the user window.
+  const postCreatePanes = listPanes(currentPaneId).filter((pane) => !removedHudPaneIds.has(pane.paneId));
+  const createdBySharedPrimitive = !deps.createHudWatchPane;
+  if (!isStrictLivePaneSnapshot(postCreatePanes, currentPaneId) || !sameLeaderIncarnation(expectedLeaderPane, postCreatePanes) || (createdBySharedPrimitive && !verifyHudWatchPaneAuthority(paneId))) {
+    if (createdBySharedPrimitive) rollbackHudWatchPaneAuthority(paneId);
+    return {
+      status: 'failed',
+      paneId: null,
+      desiredHeight,
+      duplicateCount,
+    };
+  }
   const postCreate = planOwnedHudPaneDedupe(
-    listPanes(currentPaneId).filter((pane) => !removedHudPaneIds.has(pane.paneId)),
+    postCreatePanes,
     currentPaneId,
     owner,
     paneId,
   );
-  for (const duplicatePaneId of postCreate.duplicatePaneIds) {
-    killPane(duplicatePaneId);
+  const postCreateDuplicateReap = killFreshHudPanes(
+    postCreate.duplicatePaneIds,
+    postCreatePanes,
+    expectedLeaderPane,
+    currentPaneId,
+    listPanes,
+    killPane,
+    (pane, freshPanes) => pane.paneId !== postCreate.paneId
+      && matchesOwnedHudScope(pane, freshPanes, currentPaneId, owner),
+  );
+  if (!postCreateDuplicateReap.complete) {
+    if (createdBySharedPrimitive) rollbackHudWatchPaneAuthority(paneId);
+    return failedReconcileResult(desiredHeight, postCreate.duplicatePaneIds.length);
   }
-  const resized = resizePane(postCreate.paneId, desiredHeight);
-  if (!resized) {
+  if (createdBySharedPrimitive && !verifyHudWatchPaneAuthority(postCreate.paneId)) {
+    rollbackHudWatchPaneAuthority(postCreate.paneId);
     return {
       status: 'failed',
-      paneId: postCreate.paneId,
+      paneId: null,
       desiredHeight,
       duplicateCount: postCreate.duplicatePaneIds.length,
     };
   }
-  ensureHudResizeHook(postCreate.paneId, currentPaneId, desiredHeight, cwd, deps);
+  const postCreatePane = postCreatePanes.find((pane) => pane.paneId === postCreate.paneId);
+  const paneForResize = postCreatePane
+    ? matchesFreshHudPane(postCreate.paneId, postCreatePane, expectedLeaderPane, currentPaneId, owner, listPanes)
+    : null;
+  if (!paneForResize) {
+    if (createdBySharedPrimitive) rollbackHudWatchPaneAuthority(paneId);
+    return failedReconcileResult(desiredHeight, postCreate.duplicatePaneIds.length);
+  }
+  const resized = resizePane(paneForResize.paneId, desiredHeight);
+  if (!resized) {
+    if (createdBySharedPrimitive) rollbackHudWatchPaneAuthority(paneId);
+    return {
+      status: 'failed',
+      paneId: paneForResize.paneId,
+      desiredHeight,
+      duplicateCount: postCreate.duplicatePaneIds.length,
+    };
+  }
+  const paneForHook = matchesFreshHudPane(paneForResize.paneId, paneForResize, expectedLeaderPane, currentPaneId, owner, listPanes);
+  if (!paneForHook) {
+    if (createdBySharedPrimitive) rollbackHudWatchPaneAuthority(paneId);
+    return failedReconcileResult(desiredHeight, postCreate.duplicatePaneIds.length);
+  }
+  if (createdBySharedPrimitive && !verifyHudWatchPaneAuthority(paneForHook.paneId)) {
+    rollbackHudWatchPaneAuthority(paneForHook.paneId);
+    return {
+      status: 'failed',
+      paneId: null,
+      desiredHeight,
+      duplicateCount: postCreate.duplicatePaneIds.length,
+    };
+  }
+  ensureHudResizeHook(paneForHook.paneId, currentPaneId, desiredHeight, cwd, deps);
 
   return {
     status: postCreate.duplicatePaneIds.length > 0 || hudPaneIds.length > 1 ? 'replaced_duplicates' : 'recreated',

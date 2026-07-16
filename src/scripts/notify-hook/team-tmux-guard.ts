@@ -99,7 +99,10 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   try {
     const capture = await runProcess('tmux', buildCapturePaneArgv(target, captureLines), 3000);
     const paneCapture = safeString(capture.stdout);
-    const hasCaptureEvidence = paneCapture.trim() !== '';
+    if (!paneCapture || paneCapture.includes('\r') || !paneCapture.endsWith('\n') || paneCapture.endsWith('\n\n')) {
+      return buildReadinessResult(false, 'capture_evidence_invalid', '', 'capture_invalid');
+    }
+    const hasCaptureEvidence = paneCapture.slice(0, -1).trim() !== '';
     if (hasCaptureEvidence) {
       const paneShowsLiveAgent = paneLooksReady(paneCapture) || paneHasActiveTask(paneCapture);
       if (paneRunningShell && !paneShowsLiveAgent) {
@@ -150,6 +153,60 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   }
 }
 
+function parseExactPaneAuthoritySnapshot(value: any): { paneId: string; panePid: string } | null {
+  const raw = safeString(value);
+  if (!raw || raw.includes('\r') || !raw.endsWith('\n') || raw.endsWith('\n\n')) return null;
+  const [paneId, paneDead, panePid, ...extra] = raw.slice(0, -1).split('\t');
+  if (extra.length > 0 || !/^%(?:0|[1-9][0-9]*)$/.test(paneId) || paneDead !== '0' || !/^[1-9][0-9]*$/.test(panePid)) return null;
+  return { paneId, panePid };
+}
+
+function paneAuthorityFormat(paneId: string, panePid: string): string {
+  return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
+}
+
+async function runPaneMutationAtomically(paneId: string, panePid: string, command: string[]): Promise<boolean> {
+  const quoted = `${command.map((arg) => `'${arg.replace(/'/g, "\\'")}'`).join(' ')} ; display-message -p __OMX_PANE_MUTATION_OK__`;
+
+  const result = await runProcess('tmux', [
+    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid), quoted, '',
+  ], 3000);
+  return result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+}
+
+async function confirmPaneAuthorityAtomically(paneId: string, panePid: string): Promise<boolean> {
+  const result = await runProcess('tmux', [
+    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid), 'display-message -p __OMX_PANE_MUTATION_OK__', '',
+  ], 3000);
+  return result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+}
+
+
+export async function capturePaneInputAuthority(paneTarget: any): Promise<{ paneTarget: string; panePid: string; assertPaneAuthority: () => Promise<boolean> } | null> {
+  const requestedTarget = safeString(paneTarget).trim();
+  if (!requestedTarget) return null;
+  try {
+    const initial = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', requestedTarget, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 3000)).stdout);
+    if (!initial) return null;
+    return {
+      panePid: initial.panePid,
+
+      paneTarget: initial.paneId,
+      assertPaneAuthority: async () => {
+        try {
+          const current = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', initial.paneId, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 3000)).stdout);
+          return current?.paneId === initial.paneId && current.panePid === initial.panePid;
+        } catch {
+          return false;
+        }
+      },
+
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function sendPaneInput({
   paneTarget,
   prompt,
@@ -157,11 +214,27 @@ export async function sendPaneInput({
   submitDelayMs = 0,
   typePrompt = true,
   queueFirstSubmit = false,
+  assertPaneAuthority,
 }: any): Promise<any> {
   const target = safeString(paneTarget).trim();
   if (!target) {
     return { ok: false, sent: false, reason: 'missing_pane_target', paneTarget: '' };
   }
+  const capturedAuthority = await capturePaneInputAuthority(target);
+  if (!capturedAuthority) {
+    return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target };
+  }
+  const authoritativeTarget = capturedAuthority.paneTarget;
+
+  const requirePaneAuthority = async () => {
+    try {
+      if (!(await capturedAuthority.assertPaneAuthority())) return false;
+      return typeof assertPaneAuthority !== 'function' || (await assertPaneAuthority()) === true;
+    } catch {
+      return false;
+    }
+  };
+  const authorityFailure = () => ({ ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: authoritativeTarget });
 
   const normalizedSubmitKeyPresses = Number.isFinite(submitKeyPresses)
     ? Math.max(0, Math.floor(submitKeyPresses))
@@ -170,15 +243,15 @@ export async function sendPaneInput({
   const submitArgv = normalizedSubmitKeyPresses === 0
     ? [] as string[][]
     : buildSendKeysArgv({
-      paneTarget: target,
+      paneTarget: authoritativeTarget,
       prompt: literalPrompt,
       dryRun: false,
       submitKeyPresses: normalizedSubmitKeyPresses,
     })?.submitArgv;
   if (!submitArgv) {
-    return { ok: false, sent: false, reason: 'send_failed', paneTarget: target };
+    return { ok: false, sent: false, reason: 'send_failed', paneTarget: authoritativeTarget };
   }
-  const pasteArgv = buildSafePasteArgv(target, literalPrompt);
+  const pasteArgv = buildSafePasteArgv(authoritativeTarget, literalPrompt);
   const argv = {
     typeArgv: pasteArgv.pasteBufferArgv,
     submitArgv,
@@ -197,79 +270,50 @@ export async function sendPaneInput({
         await runProcess('tmux', pasteArgv.setBufferArgv, 3000);
         bufferSet = true;
       } catch (error) {
-        return {
-          ok: false,
-          sent: false,
-          reason: 'buffer_set_failed',
-          paneTarget: target,
-          argv,
-          error: error instanceof Error ? error.message : safeString(error),
-        };
+        return { ok: false, sent: false, reason: 'buffer_set_failed', paneTarget: target, argv, error: error instanceof Error ? error.message : safeString(error) };
       }
       let verifiedBuffer;
       try {
         verifiedBuffer = await runProcess('tmux', pasteArgv.showBufferArgv, 3000);
       } catch (error) {
-        return {
-          ok: false,
-          sent: false,
-          reason: 'buffer_show_failed',
-          paneTarget: target,
-          argv,
-          error: error instanceof Error ? error.message : safeString(error),
-        };
+        return { ok: false, sent: false, reason: 'buffer_show_failed', paneTarget: target, argv, error: error instanceof Error ? error.message : safeString(error) };
       }
       if (verifiedBuffer.stdout !== literalPrompt) {
-        return {
-          ok: false,
-          sent: false,
-          reason: 'buffer_verify_failed',
-          paneTarget: target,
-          argv,
-          expectedBytes: literalPrompt.length,
-          actualBytes: verifiedBuffer.stdout.length,
-        };
+        return { ok: false, sent: false, reason: 'buffer_verify_failed', paneTarget: target, argv, expectedBytes: literalPrompt.length, actualBytes: verifiedBuffer.stdout.length };
       }
+      if (!(await requirePaneAuthority())) return authorityFailure();
       try {
-        await runProcess('tmux', pasteArgv.clearComposerArgv, 3000);
-        await runProcess('tmux', pasteArgv.pasteBufferArgv, 3000);
+        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.clearComposerArgv))) return authorityFailure();
+
+        if (!(await requirePaneAuthority())) return authorityFailure();
+        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.pasteBufferArgv))) return authorityFailure();
+
+
       } catch (error) {
-        return {
-          ok: false,
-          sent: false,
-          reason: 'buffer_paste_failed',
-          paneTarget: target,
-          argv,
-          error: error instanceof Error ? error.message : safeString(error),
-        };
+        return { ok: false, sent: false, reason: 'buffer_paste_failed', paneTarget: target, argv, error: error instanceof Error ? error.message : safeString(error) };
       }
     }
     if (queueFirstSubmit && argv.submitArgv.length > 0) {
-      await runProcess('tmux', ['send-keys', '-t', target, 'Tab'], 3000);
-      if (submitDelayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
-      }
+      if (!(await requirePaneAuthority())) return authorityFailure();
+      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, ['send-keys', '-t', authoritativeTarget, 'Tab']))) return authorityFailure();
+
+
+      if (submitDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
     }
     for (const submit of argv.submitArgv) {
-      if (submitDelayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
-      }
-      await runProcess('tmux', submit, 3000);
+      if (submitDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
+      if (!(await requirePaneAuthority())) return authorityFailure();
+      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, submit))) return authorityFailure();
+
+
     }
-    return { ok: true, sent: true, reason: 'sent', paneTarget: target, argv };
+    if (!(await confirmPaneAuthorityAtomically(authoritativeTarget, capturedAuthority.panePid))) return authorityFailure();
+
+    return { ok: true, sent: true, reason: 'sent', paneTarget: authoritativeTarget, argv };
   } catch (error) {
-    return {
-      ok: false,
-      sent: false,
-      reason: 'send_failed',
-      paneTarget: target,
-      argv,
-      error: error instanceof Error ? error.message : safeString(error),
-    };
+    return { ok: false, sent: false, reason: 'send_failed', paneTarget: authoritativeTarget, argv, error: error instanceof Error ? error.message : safeString(error) };
   } finally {
-    if (bufferSet) {
-      await runProcess('tmux', pasteArgv.deleteBufferArgv, 3000).catch(() => {});
-    }
+    if (bufferSet) await runProcess('tmux', pasteArgv.deleteBufferArgv, 3000).catch(() => {});
   }
 }
 
@@ -277,25 +321,38 @@ export async function queuePaneInput({
   paneTarget,
   prompt,
   submitDelayMs = 80,
+  assertPaneAuthority,
 }: any): Promise<any> {
+  const requestedTarget = safeString(paneTarget).trim();
+  const capturedAuthority = await capturePaneInputAuthority(requestedTarget);
+  const paneAuthority = assertPaneAuthority || capturedAuthority?.assertPaneAuthority;
+  if (!capturedAuthority || !paneAuthority) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: requestedTarget };
+  const authoritativeTarget = capturedAuthority.paneTarget;
+
   const sendResult = await sendPaneInput({
-    paneTarget,
+    paneTarget: authoritativeTarget,
     prompt,
     submitKeyPresses: 0,
+    assertPaneAuthority: paneAuthority,
   });
   if (!sendResult.ok) return sendResult;
 
-  const target = safeString(paneTarget).trim();
+  const target = authoritativeTarget;
   const submitArgv = [
     ['send-keys', '-t', target, 'Tab'],
     ['send-keys', '-t', target, 'C-m'],
   ];
   try {
-    await runProcess('tmux', submitArgv[0], 3000);
+    if (!(await paneAuthority()) || !(await capturedAuthority.assertPaneAuthority())) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
+    if (!(await runPaneMutationAtomically(target, capturedAuthority.panePid, submitArgv[0]))) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
+
+
     if (submitDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
     }
-    await runProcess('tmux', submitArgv[1], 3000);
+    if (!(await paneAuthority()) || !(await capturedAuthority.assertPaneAuthority())) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
+    if (!(await runPaneMutationAtomically(target, capturedAuthority.panePid, submitArgv[1]))) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
+    if (!(await confirmPaneAuthorityAtomically(target, capturedAuthority.panePid))) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
     return {
       ok: true,
       sent: true,

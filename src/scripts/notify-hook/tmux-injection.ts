@@ -36,9 +36,15 @@ import {
   buildSendKeysArgv,
 } from '../tmux-hook-engine.js';
 import type { ResolvedPromptTurnContext } from '../../hooks/prompt-session-provenance.js';
+import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
 
 function isHudPaneStartCommand(startCommand: any): boolean {
   return /\bomx\b.*\bhud\b.*--watch/i.test(safeString(startCommand));
+}
+function parseExactCanonicalPaneId(value: any): string | null {
+  const raw = safeString(value);
+  const paneId = parseCanonicalTmuxPaneId(raw);
+  return paneId === raw ? paneId : null;
 }
 
 async function resolvePaneCwdMismatch(paneId: string, expectedCwd: any): Promise<any | null> {
@@ -78,30 +84,31 @@ async function finalizeResolvedPane(paneId: string, reason: string, expectedCwd:
 }
 
 async function resolveCanonicalPaneFromPaneTarget(paneTarget: any, expectedCwd: any): Promise<any> {
-  const paneResult = await runProcess('tmux', ['display-message', '-p', '-t', paneTarget, '#{pane_id}']);
-  const paneId = safeString(paneResult.stdout).trim() || (safeString(paneTarget).trim().match(/^%\d+$/) ? safeString(paneTarget).trim() : '');
-  if (!paneId) return { paneTarget: null, reason: 'target_not_found' };
+  const requestedPaneId = parseExactCanonicalPaneId(paneTarget);
+  if (!requestedPaneId) return { paneTarget: null, reason: 'target_not_found' };
+  const paneResult = await runProcess('tmux', ['display-message', '-p', '-t', requestedPaneId, '#{pane_id}']);
+  const observedPaneId = parseExactCanonicalPaneId(safeString(paneResult.stdout).replace(/\r?\n$/, ''));
+  if (!observedPaneId || observedPaneId !== requestedPaneId) return { paneTarget: null, reason: 'target_not_found' };
 
   let startCommand = '';
   try {
-    const startResult = await runProcess('tmux', ['display-message', '-p', '-t', paneId, '#{pane_start_command}']);
-    startCommand = safeString(startResult.stdout).trim();
+    const startResult = await runProcess('tmux', ['display-message', '-p', '-t', observedPaneId, '#{pane_start_command}']);
+    startCommand = safeString(startResult.stdout).replace(/\r?\n$/, '');
   } catch {
     startCommand = '';
   }
   if (!startCommand || !isHudPaneStartCommand(startCommand)) {
-    return finalizeResolvedPane(paneId, 'ok', expectedCwd);
+    return finalizeResolvedPane(observedPaneId, 'ok', expectedCwd);
   }
 
   let sessionName = '';
   try {
-    const sessionResult = await runProcess('tmux', ['display-message', '-p', '-t', paneId, '#S']);
-    sessionName = safeString(sessionResult.stdout).trim();
+    const sessionResult = await runProcess('tmux', ['display-message', '-p', '-t', observedPaneId, '#S']);
+    sessionName = safeString(sessionResult.stdout).replace(/\r?\n$/, '');
   } catch {
     sessionName = '';
   }
   if (!sessionName) return { paneTarget: null, reason: 'target_is_hud_pane' };
-
   const healedPaneId = await resolveSessionToPane(sessionName);
   if (!healedPaneId) return { paneTarget: null, reason: 'target_is_hud_pane' };
   return finalizeResolvedPane(healedPaneId, 'healed_hud_pane_target', expectedCwd);
@@ -119,7 +126,7 @@ async function resolvePreferredModePane(
     for (const mode of allowedModes || []) {
       const path = join(dir, `${mode}-state.json`);
       const parsed = await readJsonIfExists(path, null);
-      const pane = safeString(parsed?.tmux_pane_id || '').trim();
+      const pane = parseExactCanonicalPaneId(parsed?.tmux_pane_id);
       if (parsed?.active && pane) {
         return { mode, state: parsed, pane, stateDir: dir };
       }
@@ -172,9 +179,10 @@ async function validateResolvedInjectionOwnership({
   const modeOwner = modeStateMatchesInvocationOwner(modeState, payload, ownership.managedContext);
   if (!modeOwner.ok) return { ...modeOwner, managedContext: ownership.managedContext };
 
-  const statePane = safeString(modePane || modeState?.tmux_pane_id).trim();
-  const currentPane = safeString(managedCurrentPane).trim();
-  if (statePane && currentPane && statePane !== currentPane) {
+  const rawStatePane = modePane || modeState?.tmux_pane_id;
+  const statePane = rawStatePane ? parseExactCanonicalPaneId(rawStatePane) : null;
+  const currentPane = managedCurrentPane ? parseExactCanonicalPaneId(managedCurrentPane) : null;
+  if ((rawStatePane && !statePane) || (managedCurrentPane && !currentPane) || (statePane && currentPane && statePane !== currentPane)) {
     return { ok: false, reason: 'mode_pane_current_pane_mismatch', managedContext: ownership.managedContext };
   }
 
@@ -266,35 +274,38 @@ export async function readVisibleAllowedModes(
 }
 
 export async function resolveSessionToPane(sessionName: any): Promise<string | null> {
-  const result = await runProcess('tmux', ['list-panes', '-t', sessionName, '-F', '#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_start_command}']);
-  const rows = result.stdout
-    .split('\n')
-    .map((line: string) => line.trim())
-    .filter(Boolean)
-    .map((line: string) => {
-      const parts = line.includes('\t')
-        ? line.split('\t')
-        : line.split(/\s+/, 4);
-      const [paneId = '', activeRaw = '0', currentCommand = '', startCommand = ''] = parts;
-      return {
-        paneId,
-        active: activeRaw === '1',
-        currentCommand: safeString(currentCommand).trim().toLowerCase(),
-        startCommand: safeString(startCommand).trim(),
-      };
-    })
-    .filter((row: any) => row.paneId.startsWith('%'));
-  if (rows.length === 0) return null;
+  const detailedResult = await runProcess('tmux', ['list-panes', '-t', sessionName, '-F', '#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_start_command}']);
+  const idOnlyResult = await runProcess('tmux', ['list-panes', '-t', sessionName, '-F', '#{pane_id}']);
+  const detailedPaneIds = new Set<string>();
+  const rows: Array<{ paneId: string; active: boolean; currentCommand: string; startCommand: string }> = [];
+  for (const rawLine of detailedResult.stdout.replace(/\r?\n$/, '').split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const parts = line.split('\t');
+    const paneId = parseExactCanonicalPaneId(parts[0]);
+    if (parts.length !== 4 || !paneId || paneId !== parts[0] || detailedPaneIds.has(paneId) || (parts[1] !== '0' && parts[1] !== '1')) return null;
+    detailedPaneIds.add(paneId);
+    rows.push({ paneId, active: parts[1] === '1', currentCommand: parts[2]!.toLowerCase(), startCommand: parts[3]! });
+  }
+  const idOnlyPaneIds = new Set<string>();
+  for (const rawLine of idOnlyResult.stdout.replace(/\r?\n$/, '').split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const paneId = parseExactCanonicalPaneId(line);
+    if (!paneId || paneId !== line || idOnlyPaneIds.has(paneId)) return null;
+    idOnlyPaneIds.add(paneId);
+  }
+  if (rows.length === 0 || detailedPaneIds.size !== idOnlyPaneIds.size || [...detailedPaneIds].some((paneId) => !idOnlyPaneIds.has(paneId))) return null;
 
-  const nonHudRows = rows.filter((row: any) => !isHudPaneStartCommand(row.startCommand));
-  const canonicalRows = nonHudRows.filter((row: any) => /\bcodex\b/i.test(row.startCommand));
-  const activeCanonical = canonicalRows.find((row: any) => row.active);
-  if (activeCanonical) return activeCanonical.paneId;
-  if (canonicalRows[0]) return canonicalRows[0].paneId;
-
-  const activeNonHud = nonHudRows.find((row: any) => row.active);
-  if (activeNonHud) return activeNonHud.paneId;
-  return nonHudRows[0]?.paneId || null;
+  const nonHudRows = rows.filter((row) => !isHudPaneStartCommand(row.startCommand));
+  const canonicalRows = nonHudRows.filter((row) => /\bcodex\b/i.test(row.startCommand));
+  const activeCanonical = canonicalRows.filter((row) => row.active);
+  if (activeCanonical.length === 1) return activeCanonical[0]!.paneId;
+  if (activeCanonical.length > 1) return null;
+  if (canonicalRows.length === 1) return canonicalRows[0]!.paneId;
+  if (canonicalRows.length > 1) return null;
+  const activeNonHud = nonHudRows.filter((row) => row.active);
+  if (activeNonHud.length === 1) return activeNonHud[0]!.paneId;
+  if (activeNonHud.length > 1) return null;
+  return nonHudRows.length === 1 ? nonHudRows[0]!.paneId : null;
 }
 
 export async function resolvePaneTarget(target: any, expectedCwd: any, modePane: any, cwd: string, payload: any): Promise<any> {
@@ -328,7 +339,8 @@ export async function resolvePaneTarget(target: any, expectedCwd: any, modePane:
     }
   }
 
-  const canonicalModePane = safeString(modePane).trim();
+  const canonicalModePane = parseExactCanonicalPaneId(modePane);
+  if (modePane && !canonicalModePane) return { paneTarget: null, reason: 'invalid_target' };
   if (canonicalModePane) {
     try {
       const resolved = await resolveCanonicalPaneFromPaneTarget(canonicalModePane, expectedCwd);
@@ -517,7 +529,8 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
     ? canonicalModeState.preferredMode
     : (preferredModePane?.mode || pickActiveMode(activeModes, config.allowed_modes));
   const modeState = preferredModePane?.state || (mode ? (activeModeStates[mode] || {}) : {});
-  const modePane = preferredModePane?.pane || safeString(modeState.tmux_pane_id || '');
+  const rawModePane = preferredModePane?.pane || safeString(modeState.tmux_pane_id || '');
+  const modePane = rawModePane ? parseExactCanonicalPaneId(rawModePane) || '' : '';
   const preGuard = evaluateInjectionGuards({
     config,
     mode,
@@ -563,7 +576,8 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
   const managedCurrentPane = context
     ? await resolveManagedCurrentPaneAtPromptContext(cwd, context)
     : await resolveManagedCurrentPane(cwd, payload, { allowTeamWorker: false });
-  if (modePane && managedCurrentPane && modePane !== managedCurrentPane) {
+  const canonicalManagedCurrentPane = managedCurrentPane ? parseExactCanonicalPaneId(managedCurrentPane) : null;
+  if ((rawModePane && !modePane) || (managedCurrentPane && !canonicalManagedCurrentPane) || (modePane && canonicalManagedCurrentPane && modePane !== canonicalManagedCurrentPane)) {
     state.last_reason = 'mode_pane_current_pane_mismatch';
     state.last_event_at = nowIso;
     await writeFile(hookStatePath, JSON.stringify(state, null, 2)).catch(() => {});
@@ -571,7 +585,7 @@ export async function handleTmuxInjection({ payload, cwd, stateDir, logsDir, con
       ...baseLog,
       event: 'injection_skipped',
       reason: 'mode_pane_current_pane_mismatch',
-      mode_pane: modePane,
+      mode_pane: rawModePane,
       current_pane: managedCurrentPane,
     });
     return;

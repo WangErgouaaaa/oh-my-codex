@@ -11,6 +11,7 @@
  */
 
 import { join, resolve } from 'path';
+import { randomUUID } from 'crypto';
 import { mkdir, rm } from 'fs/promises';
 import {
   sanitizeTeamName,
@@ -19,7 +20,6 @@ import {
   dismissTrustPromptIfPresent,
   sendToWorker,
   isWorkerAlive,
-  getWorkerPanePid,
   teardownWorkerPanes,
   buildWorkerStartupCommand,
   trustWorkerMiseConfigIfAvailable,
@@ -27,6 +27,7 @@ import {
   resolveTeamWorkerCliForResolvedLaunchArgs,
   assertTeamWorkerCliPolicyCompatibility,
   tagPaneTeamOwner,
+  isNativeWindows,
   type TeamWorkerCli,
 } from './tmux-session.js';
 import { execFileSync, spawnSync } from 'child_process';
@@ -93,6 +94,7 @@ import {
   readPersistedTeamUltragoalContext,
   renderLeaderOwnedUltragoalContextSection,
 } from './ultragoal-context.js';
+import { parseCanonicalTmuxPaneId } from '../hud/tmux.js';
 
 // ── Environment gate ──────────────────────────────────────────────────────────
 
@@ -117,6 +119,264 @@ function assertScalingEnabled(env: NodeJS.ProcessEnv = process.env): void {
 function joinContextSections(...sections: Array<string | undefined>): string | undefined {
   const present = sections.filter((section): section is string => Boolean(section?.trim()));
   return present.length > 0 ? present.join('\n\n') : undefined;
+}
+
+interface PersistedTeamPaneIds {
+  leaderPaneId: string | null;
+  hudPaneId: string | null;
+  paneIds: Set<string>;
+  workerPaneIds: Map<WorkerInfo, string>;
+}
+
+function parsePersistedTmuxPaneId(rawPaneId: unknown): string | null | undefined {
+  if (rawPaneId === null || rawPaneId === undefined) return null;
+  if (typeof rawPaneId !== 'string') return undefined;
+  if (rawPaneId.trim() === '') return null;
+  return parseCanonicalTmuxPaneId(rawPaneId) ?? undefined;
+}
+
+function canonicalizePersistedTeamPaneIds(config: TeamConfig): PersistedTeamPaneIds | null {
+  const leaderPaneId = parsePersistedTmuxPaneId(config.leader_pane_id);
+  const hudPaneId = parsePersistedTmuxPaneId(config.hud_pane_id);
+  if (leaderPaneId === undefined || hudPaneId === undefined) return null;
+
+  const paneIds = new Set<string>();
+  const addPaneId = (paneId: string | null): boolean => {
+    if (!paneId) return true;
+    if (paneIds.has(paneId)) return false;
+    paneIds.add(paneId);
+    return true;
+  };
+  if (!addPaneId(leaderPaneId) || !addPaneId(hudPaneId)) return null;
+
+  const workerPaneIds = new Map<WorkerInfo, string>();
+  for (const worker of config.workers) {
+    const paneId = parsePersistedTmuxPaneId(worker.pane_id);
+    if (paneId === undefined || !addPaneId(paneId)) return null;
+    if (paneId) workerPaneIds.set(worker, paneId);
+  }
+
+  return { leaderPaneId, hudPaneId, paneIds, workerPaneIds };
+}
+
+function parseFreshTmuxPaneId(rawOutput: string | null | undefined): string | null {
+  if (typeof rawOutput !== 'string') return null;
+  const withoutTerminalNewline = rawOutput.endsWith('\n') ? rawOutput.slice(0, -1) : rawOutput;
+  const paneId = withoutTerminalNewline.endsWith('\r')
+    ? withoutTerminalNewline.slice(0, -1)
+    : withoutTerminalNewline;
+  if (!paneId || paneId.includes('\n')) return null;
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  return canonicalPaneId === paneId ? canonicalPaneId : null;
+}
+
+function deriveSingleScaleSplitPaneId(
+  before: ReadonlySet<string>,
+  after: ReadonlySet<string>,
+): string | null {
+  if (after.size !== before.size + 1 || ![...before].every((paneId) => after.has(paneId))) return null;
+  const created = [...after].filter((paneId) => !before.has(paneId));
+  return created.length === 1 ? created[0] ?? null : null;
+}
+
+
+function readGlobalTmuxPaneIdSnapshot(): Set<string> | null {
+  const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf-8' });
+  if (result.status !== 0 || result.error) return null;
+
+  const rawOutput = result.stdout || '';
+  const output = rawOutput.endsWith('\n') ? rawOutput.slice(0, -1) : rawOutput;
+  if (!output) return null;
+
+  const paneIds = new Set<string>();
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const paneId = parseCanonicalTmuxPaneId(line);
+    if (!paneId || paneIds.has(paneId)) return null;
+    paneIds.add(paneId);
+  }
+  return paneIds;
+}
+
+type TeamPaneOwnerSnapshot = Map<string, string>;
+
+function readTeamPaneOwnerSnapshot(sessionName: string): TeamPaneOwnerSnapshot | null {
+  const targetSessionName = sessionName.trim();
+  if (!targetSessionName) return null;
+
+  const result = spawnSync(
+    'tmux',
+    ['list-panes', '-t', targetSessionName, '-F', '#{pane_id}\t#{@omx_team_pane_owner_id}'],
+    { encoding: 'utf-8' },
+  );
+  if (result.status !== 0 || result.error) return null;
+
+  const rawOutput = result.stdout || '';
+  const output = rawOutput.endsWith('\n') ? rawOutput.slice(0, -1) : rawOutput;
+  if (!output) return null;
+
+  const paneOwners: TeamPaneOwnerSnapshot = new Map();
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const fields = line.split('\t');
+    if (fields.length !== 2) return null;
+    const paneId = parseCanonicalTmuxPaneId(fields[0]);
+    if (!paneId || paneOwners.has(paneId)) return null;
+    paneOwners.set(paneId, fields[1]!);
+  }
+  return paneOwners;
+}
+
+function isConsistentTeamPaneSnapshot(
+  globalPaneIds: ReadonlySet<string> | null,
+  sessionPaneOwners: TeamPaneOwnerSnapshot | null,
+): boolean {
+  if (!globalPaneIds || !sessionPaneOwners) return false;
+  for (const paneId of sessionPaneOwners.keys()) {
+    if (!globalPaneIds.has(paneId)) return false;
+  }
+  return true;
+}
+
+function validatePersistedTeamPaneAuthority(
+  config: TeamConfig,
+  persistedPaneIds: PersistedTeamPaneIds,
+  globalPaneIds: ReadonlySet<string>,
+): string | null {
+  if (persistedPaneIds.paneIds.size === 0) return '';
+
+  const expectedOwnerId = `team:${config.name}`;
+  if (config.tmux_pane_owner_id?.trim() !== expectedOwnerId) return null;
+
+  const sessionPaneOwners = readTeamPaneOwnerSnapshot(config.tmux_session);
+  if (!sessionPaneOwners || !isConsistentTeamPaneSnapshot(globalPaneIds, sessionPaneOwners)) return null;
+  for (const paneId of persistedPaneIds.paneIds) {
+    if (!globalPaneIds.has(paneId) || sessionPaneOwners.get(paneId) !== expectedOwnerId) {
+      return null;
+    }
+  }
+  return expectedOwnerId;
+}
+
+function isFreshOwnedTeamPane(
+  paneId: string,
+  sessionName: string,
+  expectedOwnerId: string,
+): boolean {
+  const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
+  const sessionPaneOwners = readTeamPaneOwnerSnapshot(sessionName);
+  if (!globalPaneIds || !sessionPaneOwners) return false;
+  if (!isConsistentTeamPaneSnapshot(globalPaneIds, sessionPaneOwners)) return false;
+  return globalPaneIds.has(paneId)
+    && sessionPaneOwners.has(paneId)
+    && sessionPaneOwners.get(paneId) === expectedOwnerId;
+}
+
+type VerifiedScaleSplitPane = {
+  paneId: string;
+  panePid: string;
+  sessionName: string;
+  ownerId: string;
+  ownerOption: string;
+  ownerProof: string;
+  ownerTagged: boolean;
+  operationMarker: string;
+};
+
+const OMX_TMUX_SPLIT_OPERATION_MARKER_ENV = 'OMX_TMUX_SPLIT_OPERATION_MARKER';
+
+function writeScaleSplitOperationMarkedCommand(command: string, marker: string): string {
+  if (isNativeWindows()) return `$env:${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV} = '${marker}'; ${command}`;
+  return `${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV}='${marker}'; export ${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV}; ${command}`;
+}
+
+function hasScaleSplitOperationMarker(command: string, marker: string): boolean {
+  const posixMarker = `${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV}='${marker}'`;
+  const powerShellMarker = `$env:${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV} = '${marker}'`;
+  return command === posixMarker
+    || command.startsWith(`${posixMarker};`)
+    || command === powerShellMarker
+    || command.startsWith(`${powerShellMarker};`);
+}
+
+function findScaleSplitOperationMarkerPaneId(marker: string): string | null {
+  const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_start_command}'], { encoding: 'utf-8' });
+  if (result.status !== 0 || result.error) return null;
+  const output = result.stdout || '';
+  if (output.includes('\r') && !output.endsWith('\r\n')) return null;
+  let candidate: string | null = null;
+  const seen = new Set<string>();
+  for (const rawLine of output.replace(/\r?\n$/, '').split('\n')) {
+    if (!rawLine) continue;
+    const fields = rawLine.split('\t');
+    if (fields.length !== 2) return null;
+    const paneId = parseCanonicalTmuxPaneId(fields[0]);
+    if (!paneId || paneId !== fields[0] || seen.has(paneId)) return null;
+    seen.add(paneId);
+    if (!hasScaleSplitOperationMarker(fields[1] ?? '', marker)) continue;
+    if (candidate) return null;
+    candidate = paneId;
+  }
+  return candidate;
+}
+function readTmuxOptionExactly(option: string): string | null {
+  const result = spawnSync('tmux', ['show-options', '-g', '-v', option], { encoding: 'utf-8' });
+  if (result.status !== 0 || result.error) return null;
+  const rawOutput = result.stdout || '';
+  if (!rawOutput.endsWith('\n') || rawOutput.includes('\r')) return null;
+  const output = rawOutput.slice(0, -1);
+  return output.includes('\n') || output === '' ? null : output;
+}
+
+function readScalePaneIncarnation(paneId: string): { paneDead: boolean; panePid: string } | null {
+  const result = spawnSync('tmux', ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}'], { encoding: 'utf-8' });
+  if (result.status !== 0 || result.error) return null;
+  const rawOutput = result.stdout || '';
+  if (!rawOutput.endsWith('\n') || rawOutput.includes('\r')) return null;
+  const seen = new Set<string>();
+  let incarnation: { paneDead: boolean; panePid: string } | null = null;
+  for (const line of rawOutput.slice(0, -1).split('\n')) {
+    const match = /^(%0|%[1-9][0-9]*) ([01]) ([1-9][0-9]*)$/.exec(line);
+    if (!match || seen.has(match[1]!) || !Number.isSafeInteger(Number(match[3]))) return null;
+    seen.add(match[1]!);
+    if (match[1] === paneId) incarnation = { paneDead: match[2] === '1', panePid: match[3]! };
+  }
+  return incarnation;
+}
+
+function isScalePaneLiveInStrictGlobalProbe(paneId: string, expectedPid?: string): boolean {
+  const incarnation = readScalePaneIncarnation(paneId);
+  return Boolean(incarnation && !incarnation.paneDead && (!expectedPid || incarnation.panePid === expectedPid));
+}
+
+function isScalePaneStablyLive(paneId: string, expectedPid: string): boolean {
+  for (let probe = 0; probe < 3; probe += 1) {
+    if (!isScalePaneLiveInStrictGlobalProbe(paneId, expectedPid)) return false;
+    if (probe < 2) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  return true;
+}
+
+function hasScaleSplitRollbackAuthority(authority: VerifiedScaleSplitPane): boolean {
+  const paneId = parseCanonicalTmuxPaneId(authority.paneId);
+  const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
+  const sessionPaneOwners = readTeamPaneOwnerSnapshot(authority.sessionName);
+  return Boolean(
+    paneId
+      && paneId === authority.paneId
+      && findScaleSplitOperationMarkerPaneId(authority.operationMarker) === paneId
+      && globalPaneIds?.has(paneId)
+      && sessionPaneOwners?.has(paneId)
+      && isConsistentTeamPaneSnapshot(globalPaneIds, sessionPaneOwners)
+      && readScalePaneIncarnation(paneId)?.panePid === authority.panePid
+      && readTmuxOptionExactly(authority.ownerOption) === authority.ownerProof,
+  );
+}
+
+function revalidateScaleSplitAuthority(authority: VerifiedScaleSplitPane): boolean {
+  if (!hasScaleSplitRollbackAuthority(authority) || !isScalePaneLiveInStrictGlobalProbe(authority.paneId, authority.panePid)) return false;
+  const owners = readTeamPaneOwnerSnapshot(authority.sessionName);
+  return Boolean(!authority.ownerTagged || owners?.get(authority.paneId) === authority.ownerId);
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -300,11 +560,22 @@ async function notifyWorkerPaneOutcome(
   sessionName: string,
   workerIndex: number,
   message: string,
-  paneId?: string,
+  authority: VerifiedScaleSplitPane,
   workerCli?: 'codex' | 'claude' | 'gemini',
 ): Promise<DispatchOutcome> {
+  if (!revalidateScaleSplitAuthority(authority)) {
+    return { ok: false, transport: 'tmux_send_keys', reason: 'tmux_pane_authority_lost' };
+  }
   try {
-    await sendToWorker(sessionName, workerIndex, message, paneId, workerCli);
+    await sendToWorker(
+      sessionName,
+      workerIndex,
+      message,
+      authority.paneId,
+      workerCli,
+      authority.panePid,
+      () => revalidateScaleSplitAuthority(authority),
+    );
     return { ok: true, transport: 'tmux_send_keys', reason: 'tmux_send_keys_sent' };
   } catch (error) {
     return {
@@ -348,6 +619,10 @@ export async function scaleUp(
     const config = await readTeamConfig(sanitized, leaderCwd);
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
+    }
+    const persistedPaneIds = canonicalizePersistedTeamPaneIds(config);
+    if (!persistedPaneIds) {
+      return { ok: false, error: 'invalid_persisted_tmux_pane_ids' };
     }
 
     const maxWorkers = config.max_workers;
@@ -414,6 +689,24 @@ export async function scaleUp(
       approvedExecutionGate.approvedContextSection,
       renderLeaderOwnedUltragoalContextSection(persistedUltragoalContext),
     );
+    const initialSplitSourceWorker = config.workers[config.workers.length - 1];
+    const initialSplitTarget = initialSplitSourceWorker
+      ? (persistedPaneIds.workerPaneIds.get(initialSplitSourceWorker) ?? persistedPaneIds.leaderPaneId)
+      : persistedPaneIds.leaderPaneId;
+    if (!initialSplitTarget) {
+      return { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' };
+    }
+    const preSplitPaneIds = readGlobalTmuxPaneIdSnapshot();
+    const teamPaneOwnerId = preSplitPaneIds
+      ? validatePersistedTeamPaneAuthority(config, persistedPaneIds, preSplitPaneIds)
+      : null;
+    if (!preSplitPaneIds || !teamPaneOwnerId) {
+      return { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' };
+    }
+    if (new Set(config.workers.map((worker) => worker.name)).size !== config.workers.length) {
+      return { ok: false, error: 'duplicate_worker_names_in_team_config' };
+    }
+
     const effectiveWorktreeMode = config.worktree_mode ?? resolveScaleUpWorktreeMode(config);
     if (!config.worktree_mode && effectiveWorktreeMode.enabled) {
       config.worktree_mode = effectiveWorktreeMode;
@@ -422,23 +715,41 @@ export async function scaleUp(
 
     const addedWorkers: WorkerInfo[] = [];
     const createdTaskIds: string[] = [];
+    const initialPaneIds = new Set(preSplitPaneIds);
+    const knownPaneIds = new Set(initialPaneIds);
+    const operationPaneIds = new Set<string>();
+    const operationPaneAuthorities = new Map<string, VerifiedScaleSplitPane>();
+    const rollbackPaneIds = new Set<string>();
 
     const rollbackScaleUp = async (
       error: string,
       context: { paneId?: string; workerName?: string; worktreePath?: string } = {},
     ): Promise<ScaleError> => {
+      const killOperationPane = (paneId: string | undefined): void => {
+        const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+        const authority = canonicalPaneId ? operationPaneAuthorities.get(canonicalPaneId) : undefined;
+        if (
+          !canonicalPaneId
+          || !authority
+          || !operationPaneIds.has(canonicalPaneId)
+          || initialPaneIds.has(canonicalPaneId)
+          || rollbackPaneIds.has(canonicalPaneId)
+          || !revalidateScaleSplitAuthority(authority)
+        ) return;
+        rollbackPaneIds.add(canonicalPaneId);
+        try {
+          execFileSync('tmux', ['kill-pane', '-t', canonicalPaneId], { stdio: 'pipe',
+            windowsHide: true,
+          });
+        } catch {}
+      };
+
       for (const w of addedWorkers) {
         const idx = config.workers.findIndex((worker) => worker.name === w.name);
         if (idx >= 0) {
           config.workers.splice(idx, 1);
         }
-        try {
-          if (w.pane_id) {
-            execFileSync('tmux', ['kill-pane', '-t', w.pane_id], { stdio: 'pipe',
-      windowsHide: true,
-    });
-          }
-        } catch {}
+        killOperationPane(w.pane_id);
         if (w.worktree_path) {
           await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, teamStateRoot, w.worktree_path).catch(() => {});
         }
@@ -457,13 +768,7 @@ export async function scaleUp(
         ).catch(() => {});
       }
 
-      if (context.paneId) {
-        try {
-          execFileSync('tmux', ['kill-pane', '-t', context.paneId], { stdio: 'pipe',
-      windowsHide: true,
-    });
-        } catch {}
-      }
+      killOperationPane(context.paneId);
 
       for (const taskId of createdTaskIds) {
         await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
@@ -579,13 +884,55 @@ export async function scaleUp(
       // Find the right-most worker pane to split from, or fall back to leader pane.
       // Keep the initial split from leader horizontal to preserve the leader-left
       // / workers-right composition.
-      const splitTarget = config.workers.length > 0
-        ? (config.workers[config.workers.length - 1]?.pane_id ?? config.leader_pane_id ?? '')
-        : (config.leader_pane_id ?? '');
-      const splitDirection = splitTarget === (config.leader_pane_id ?? '') ? '-h' : '-v';
+      const splitSourceWorker = config.workers[config.workers.length - 1];
+      const rawSplitTarget = splitSourceWorker
+        ? (persistedPaneIds.workerPaneIds.get(splitSourceWorker) ?? persistedPaneIds.leaderPaneId)
+        : persistedPaneIds.leaderPaneId;
+      const splitTarget = parseCanonicalTmuxPaneId(rawSplitTarget);
+      if (!splitTarget || !knownPaneIds.has(splitTarget)) {
+        return await rollbackScaleUp(`Failed to validate tmux split target for ${workerName}`, {
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      if (!isFreshOwnedTeamPane(splitTarget, sessionName, teamPaneOwnerId)) {
+        return await rollbackScaleUp(`Failed to revalidate tmux split target for ${workerName}`, {
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
 
+      const splitDirection = splitTarget === persistedPaneIds.leaderPaneId ? '-h' : '-v';
+      const preSplitGlobalPaneIds = readGlobalTmuxPaneIdSnapshot();
+      const preSplitSessionPaneOwners = readTeamPaneOwnerSnapshot(sessionName);
+      if (
+        !preSplitGlobalPaneIds
+        || !preSplitSessionPaneOwners
+        || !isConsistentTeamPaneSnapshot(preSplitGlobalPaneIds, preSplitSessionPaneOwners)
+        || !preSplitGlobalPaneIds.has(splitTarget)
+        || preSplitSessionPaneOwners.get(splitTarget) !== teamPaneOwnerId
+      ) {
+        return await rollbackScaleUp(`Failed to capture pre-split tmux authority for ${workerName}`, {
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      const ownerOption = `@omx_scale_split_owner_nonce_${randomUUID().replaceAll('-', '')}`;
+      const ownerNonce = `scale-split:${randomUUID()}`;
+      const operationMarker = randomUUID();
+      const provisionalProof = `pending:${ownerNonce}`;
+      if (
+        spawnSync('tmux', ['set-option', '-g', ownerOption, provisionalProof], { encoding: 'utf-8' }).status !== 0
+        || readTmuxOptionExactly(ownerOption) !== provisionalProof
+      ) {
+        return await rollbackScaleUp(`Failed to establish tmux split operation proof for ${workerName}`, {
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
       const result = spawnSync('tmux', [
-        'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
+        'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd,
+        writeScaleSplitOperationMarkedCommand(cmd, operationMarker),
       ], { encoding: 'utf-8' });
 
       if (result.status !== 0) {
@@ -595,38 +942,147 @@ export async function scaleUp(
         );
       }
 
-      const paneId = (result.stdout || '').trim().split('\n')[0]?.trim();
-      if (!paneId || !paneId.startsWith('%')) {
-        return await rollbackScaleUp(`Failed to capture pane ID for ${workerName}`, {
+      let postSplitGlobalPaneIds: Set<string> | null = null;
+      let postSplitSessionPaneOwners: TeamPaneOwnerSnapshot | null = null;
+      let paneId: string | null = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        postSplitGlobalPaneIds = readGlobalTmuxPaneIdSnapshot();
+        postSplitSessionPaneOwners = readTeamPaneOwnerSnapshot(sessionName);
+        const globalCandidate = postSplitGlobalPaneIds
+          ? deriveSingleScaleSplitPaneId(preSplitGlobalPaneIds, postSplitGlobalPaneIds)
+          : null;
+        const sessionCandidate = postSplitSessionPaneOwners
+          ? deriveSingleScaleSplitPaneId(new Set(preSplitSessionPaneOwners.keys()), new Set(postSplitSessionPaneOwners.keys()))
+          : null;
+        const markerCandidate = findScaleSplitOperationMarkerPaneId(operationMarker);
+        if (globalCandidate && globalCandidate === sessionCandidate && markerCandidate === globalCandidate) {
+          paneId = globalCandidate;
+          break;
+        }
+        if (markerCandidate && !preSplitGlobalPaneIds.has(markerCandidate)) {
+          const recoveredGlobalPaneIds = readGlobalTmuxPaneIdSnapshot();
+          const recoveredSessionPaneOwners = readTeamPaneOwnerSnapshot(sessionName);
+          const recoveredGlobalCandidate = recoveredGlobalPaneIds
+            ? deriveSingleScaleSplitPaneId(preSplitGlobalPaneIds, recoveredGlobalPaneIds)
+            : null;
+          const recoveredSessionCandidate = recoveredSessionPaneOwners
+            ? deriveSingleScaleSplitPaneId(
+              new Set(preSplitSessionPaneOwners.keys()),
+              new Set(recoveredSessionPaneOwners.keys()),
+            )
+            : null;
+          if (
+            recoveredGlobalPaneIds
+            && recoveredSessionPaneOwners
+            && isConsistentTeamPaneSnapshot(recoveredGlobalPaneIds, recoveredSessionPaneOwners)
+            && recoveredGlobalCandidate === markerCandidate
+            && recoveredSessionCandidate === markerCandidate
+            && findScaleSplitOperationMarkerPaneId(operationMarker) === markerCandidate
+          ) {
+            postSplitGlobalPaneIds = recoveredGlobalPaneIds;
+            postSplitSessionPaneOwners = recoveredSessionPaneOwners;
+            paneId = markerCandidate;
+            break;
+          }
+        }
+        if (attempt < 2) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      }
+      if (!paneId) {
+        return await rollbackScaleUp(`Failed to derive exact tmux pane delta for ${workerName}`, {
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      const incarnation = readScalePaneIncarnation(paneId);
+      if (!incarnation) {
+        return await rollbackScaleUp(`Failed to capture tmux pane incarnation for ${workerName}`, {
+          paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      operationPaneIds.add(paneId);
+      const provisionalAuthority: VerifiedScaleSplitPane = {
+        paneId,
+        panePid: incarnation.panePid,
+        sessionName,
+        ownerId: teamPaneOwnerId,
+        ownerOption,
+        ownerProof: provisionalProof,
+        ownerTagged: false,
+        operationMarker,
+      };
+      operationPaneAuthorities.set(paneId, provisionalAuthority);
+      const boundProof = `${paneId}:${ownerNonce}`;
+      if (
+        spawnSync('tmux', ['set-option', '-g', ownerOption, boundProof], { encoding: 'utf-8' }).status !== 0
+        || readTmuxOptionExactly(ownerOption) !== boundProof
+      ) {
+        return await rollbackScaleUp(`Failed to bind tmux split operation proof for ${workerName}`, {
           paneId,
           workerName,
           worktreePath: workerWorkspace?.worktreePath,
         });
       }
-      if (config.tmux_pane_owner_id) {
-        try {
-          tagPaneTeamOwner(paneId, config.tmux_pane_owner_id);
-        } catch (error) {
-          return await rollbackScaleUp(
-            `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}`,
-            { paneId, workerName, worktreePath: workerWorkspace?.worktreePath },
-          );
-        }
+      provisionalAuthority.ownerProof = boundProof;
+      if (
+        typeof result.stdout !== 'string'
+        || !/^(%0|%[1-9][0-9]*)\n$/.test(result.stdout)
+        || parseFreshTmuxPaneId(result.stdout) !== paneId
+      ) {
+        return await rollbackScaleUp(`Failed to validate tmux split output for ${workerName}`, {
+          paneId,
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
       }
+      if (
+        !postSplitGlobalPaneIds
+        || !postSplitSessionPaneOwners
+        || !isConsistentTeamPaneSnapshot(postSplitGlobalPaneIds, postSplitSessionPaneOwners)
+      ) {
+        return await rollbackScaleUp(`Failed to validate exact tmux pane delta for ${workerName}`, {
+          paneId,
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+
+      try {
+        if (!revalidateScaleSplitAuthority(provisionalAuthority)) {
+          return await rollbackScaleUp(`Failed to revalidate tmux pane authority before owner tagging for ${workerName}`, {
+            paneId,
+            workerName,
+            worktreePath: workerWorkspace?.worktreePath,
+          });
+        }
+        tagPaneTeamOwner(paneId, teamPaneOwnerId);
+        provisionalAuthority.ownerTagged = true;
+      } catch (error) {
+        return await rollbackScaleUp(
+          `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}`,
+          { paneId, workerName, worktreePath: workerWorkspace?.worktreePath },
+        );
+      }
+      if (!revalidateScaleSplitAuthority(provisionalAuthority) || !isScalePaneStablyLive(paneId, provisionalAuthority.panePid)) {
+        return await rollbackScaleUp(`Failed to validate sustained tmux pane authority for ${workerName}`, {
+          paneId,
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      knownPaneIds.add(paneId);
 
       // Intentionally avoid forcing `select-layout tiled` here.
       // Tiled relayout reflows leader/HUD panes and breaks team window layout.
 
-      // Get PID
-      const panePid = getWorkerPanePid(sessionName, workerIndex, paneId);
-
+      // The atomic split snapshot is the sole PID authority. A scalar PID read
+      // here could accept a same-ID respawn that happened between probes.
       const workerInfo: WorkerInfo = {
         name: workerName,
         index: workerIndex,
         role: runtimeRole,
         worker_cli: workerCli,
         assigned_tasks: [],
-        pid: panePid ?? undefined,
+        pid: Number(provisionalAuthority.panePid),
         pane_id: paneId,
         working_dir: workerCwd,
         worktree_repo_root: workerWorkspace ? workerWorkspace.repoRoot : undefined,
@@ -637,16 +1093,31 @@ export async function scaleUp(
         team_state_root: teamStateRoot,
       };
 
-      await writeWorkerIdentity(sanitized, workerName, workerInfo, leaderCwd);
-
-      // Wait for worker readiness
+      // Readiness can block while a pane is recycled under the same ID.
       const readyTimeoutMs = resolveWorkerReadyTimeoutMs(env);
       const skipReadyWait = env.OMX_TEAM_SKIP_READY_WAIT === '1';
       if (!skipReadyWait) {
-        const ready = waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId);
+        if (!revalidateScaleSplitAuthority(provisionalAuthority)) {
+          return await rollbackScaleUp(`Failed to revalidate tmux pane authority before readiness for ${workerName}`, {
+            paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
+          });
+        }
+        const ready = waitForWorkerReady(
+          sessionName,
+          workerIndex,
+          readyTimeoutMs,
+          paneId,
+          provisionalAuthority.panePid,
+          () => revalidateScaleSplitAuthority(provisionalAuthority),
+        );
         if (!ready) {
           console.log(`[omx:scaling] Warning: worker ${workerName} did not become ready within timeout`);
         }
+      }
+      if (!revalidateScaleSplitAuthority(provisionalAuthority)) {
+        return await rollbackScaleUp(`Failed to revalidate tmux pane authority after readiness for ${workerName}`, {
+          paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
+        });
       }
 
       // Get assigned tasks for this worker
@@ -683,7 +1154,7 @@ export async function scaleUp(
           if (dispatchPolicy.dispatch_mode === 'hook_preferred_with_fallback') {
             return { ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' };
           }
-          return await notifyWorkerPaneOutcome(sessionName, workerIndex, message, paneId, workerCli);
+          return await notifyWorkerPaneOutcome(sessionName, workerIndex, message, provisionalAuthority, workerCli);
         },
       });
       let outcome = queued;
@@ -695,7 +1166,7 @@ export async function scaleUp(
         if (receipt && (receipt.status === 'notified' || receipt.status === 'delivered')) {
           outcome = { ok: true, transport: 'hook', reason: `hook_receipt_${receipt.status}`, request_id: queued.request_id };
         } else {
-          const fallback = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli);
+          const fallback = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, provisionalAuthority, workerCli);
           if (receipt?.status === 'failed') {
             if (fallback.ok) {
               await transitionDispatchRequest(
@@ -773,9 +1244,33 @@ export async function scaleUp(
         }
       }
       // Retry dispatch once if a trust prompt is blocking the worker pane (fixes #393).
-      if (!outcome.ok && dismissTrustPromptIfPresent(sessionName, workerIndex, paneId)) {
-        waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId);
-        const retry = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli);
+      if (
+        !outcome.ok
+        && revalidateScaleSplitAuthority(provisionalAuthority)
+        && dismissTrustPromptIfPresent(
+          sessionName,
+          workerIndex,
+          paneId,
+          provisionalAuthority.panePid,
+          () => revalidateScaleSplitAuthority(provisionalAuthority),
+        )
+        && revalidateScaleSplitAuthority(provisionalAuthority)
+      ) {
+        waitForWorkerReady(
+          sessionName,
+          workerIndex,
+          readyTimeoutMs,
+          paneId,
+          provisionalAuthority.panePid,
+          () => revalidateScaleSplitAuthority(provisionalAuthority),
+        );
+        const retry = await notifyWorkerPaneOutcome(
+          sessionName,
+          workerIndex,
+          triggerDirective.text,
+          provisionalAuthority,
+          workerCli,
+        );
         if (retry.ok) {
           outcome = retry;
         }
@@ -788,8 +1283,20 @@ export async function scaleUp(
         });
       }
 
+      if (!revalidateScaleSplitAuthority(provisionalAuthority)) {
+        return await rollbackScaleUp(`Failed to revalidate tmux pane authority before saving ${workerName}`, {
+          paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      await writeWorkerIdentity(sanitized, workerName, workerInfo, leaderCwd);
+      if (!revalidateScaleSplitAuthority(provisionalAuthority)) {
+        return await rollbackScaleUp(`Failed to revalidate tmux pane authority immediately before saving ${workerName}`, {
+          paneId, workerName, worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
       addedWorkers.push(workerInfo);
       config.workers.push(workerInfo);
+      persistedPaneIds.workerPaneIds.set(workerInfo, paneId);
       config.worker_count = config.workers.length;
       config.next_worker_index = nextIndex;
       await saveTeamConfig(config, leaderCwd);
@@ -847,6 +1354,10 @@ export async function scaleDown(
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
     }
+    const persistedPaneIds = canonicalizePersistedTeamPaneIds(config);
+    if (!persistedPaneIds) {
+      return { ok: false, error: 'invalid_persisted_tmux_pane_ids' };
+    }
 
     // Determine which workers to remove
     let targetWorkers: WorkerInfo[];
@@ -859,6 +1370,10 @@ export async function scaleDown(
         }
         targetWorkers.push(w);
       }
+      if (new Set(options.workerNames).size !== options.workerNames.length) {
+        return { ok: false, error: 'duplicate_worker_names_requested_for_scale_down' };
+      }
+
     } else {
       const count = options.count ?? 1;
       if (!Number.isInteger(count) || count < 1) {
@@ -897,6 +1412,13 @@ export async function scaleDown(
       return { ok: false, error: 'Cannot remove all workers — at least 1 must remain' };
     }
 
+    if (persistedPaneIds.paneIds.size > 0) {
+      const globalPaneIds = readGlobalTmuxPaneIdSnapshot();
+      if (!globalPaneIds || validatePersistedTeamPaneAuthority(config, persistedPaneIds, globalPaneIds) === null) {
+        return { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' };
+      }
+    }
+
     const sessionName = config.tmux_session;
     const removedNames: string[] = [];
 
@@ -918,7 +1440,7 @@ export async function scaleDown(
           targetWorkers.map(async (w) => {
             const status = await readWorkerStatus(sanitized, w.name, leaderCwd);
             return status.state === 'idle' || status.state === 'done' ||
-                   status.state === 'draining' || !isWorkerAlive(sessionName, w.index, w.pane_id);
+                   status.state === 'draining' || !isWorkerAlive(sessionName, w.index, persistedPaneIds.workerPaneIds.get(w));
           }),
         );
         if (allDrained.every(Boolean)) break;
@@ -927,15 +1449,51 @@ export async function scaleDown(
     }
 
     // Phase 3: Kill tmux panes and remove from config
-    const leaderPaneId = config.leader_pane_id;
-    const hudPaneId = config.hud_pane_id;
-    const targetPaneIds = targetWorkers
-      .map((w) => w.pane_id)
-      .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    await teardownWorkerPanes(targetPaneIds, {
-      leaderPaneId,
-      hudPaneId,
+    const expectedTargetPanePids = new Map<string, number>();
+    const targetPaneIds: string[] = [];
+    for (const worker of targetWorkers) {
+      const paneId = persistedPaneIds.workerPaneIds.get(worker);
+      if (!paneId) continue;
+      const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+      if (!canonicalPaneId || canonicalPaneId !== paneId) {
+        return { ok: false, error: 'invalid_persisted_tmux_pane_ids' };
+      }
+      const panePid = worker.pid;
+      if (typeof panePid !== 'number' || !Number.isSafeInteger(panePid) || panePid <= 0) {
+        return { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' };
+      }
+      targetPaneIds.push(canonicalPaneId);
+      expectedTargetPanePids.set(canonicalPaneId, panePid);
+    }
+    if (new Set(targetPaneIds).size !== targetPaneIds.length) {
+      return { ok: false, error: 'duplicate_target_tmux_pane_ids' };
+    }
+    const freshGlobalPaneIds = readGlobalTmuxPaneIdSnapshot();
+    const freshSessionPaneOwners = readTeamPaneOwnerSnapshot(sessionName);
+    if (
+      !isConsistentTeamPaneSnapshot(freshGlobalPaneIds, freshSessionPaneOwners)
+      || targetPaneIds.some((paneId) => !freshGlobalPaneIds?.has(paneId) || freshSessionPaneOwners?.get(paneId) !== `team:${config.name}`)
+    ) {
+      return { ok: false, error: 'failed_to_revalidate_target_tmux_pane_authority' };
+    }
+
+    const teardown = await teardownWorkerPanes(targetPaneIds, {
+      leaderPaneId: persistedPaneIds.leaderPaneId,
+      hudPaneId: persistedPaneIds.hudPaneId,
+      authority: {
+        sessionName,
+        expectedOwnerId: `team:${config.name}`,
+        expectedPanePids: expectedTargetPanePids,
+        revalidate: (paneId) => isFreshOwnedTeamPane(paneId, sessionName, `team:${config.name}`),
+      },
     });
+    if (
+      teardown.kill.attempted !== targetPaneIds.length
+      || teardown.kill.succeeded !== targetPaneIds.length
+      || teardown.kill.failed !== 0
+    ) {
+      return { ok: false, error: 'scale_down_tmux_teardown_failed' };
+    }
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
       .filter((worker) =>
         worker.worktree_created === true

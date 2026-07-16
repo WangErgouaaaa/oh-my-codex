@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { safeString } from './utils.js';
 import { resolveBridgeStateDir, resolveRuntimeBinaryPath } from '../../runtime/bridge.js';
 import { appendTeamDeliveryLog } from '../../team/delivery-log.js';
+import { migrateV1ToV2, readTeamStateOutcome } from '../../team/state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -19,6 +20,8 @@ import {
   paneHasActiveTask,
   paneLooksReady,
 } from '../tmux-hook-engine.js';
+import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
+
 
 /**
  * Route dispatch state transitions through the Rust runtime binary.
@@ -463,16 +466,62 @@ function defaultInjectTarget(request, config) {
     if (leaderPaneId) return { type: 'pane', value: leaderPaneId };
     return null;
   }
-  if (request.pane_id) return { type: 'pane', value: request.pane_id };
-  if (typeof request.worker_index === 'number' && Array.isArray(config?.workers)) {
-    const worker = config.workers.find((candidate) => Number(candidate?.index) === request.worker_index);
-    if (worker?.pane_id) return { type: 'pane', value: worker.pane_id };
+  const worker = resolvePersistedWorkerTarget(request, config);
+  return worker ? { type: 'pane', value: worker.paneId } : null;
+}
+
+function resolvePersistedWorkerTarget(request, config) {
+  const workers = Array.isArray(config?.workers) ? config.workers : [];
+  const requestedIndex = Number.isSafeInteger(request?.worker_index) ? request.worker_index : null;
+  const byIndex = requestedIndex === null ? null : workers.find((worker) => worker?.index === requestedIndex);
+  const byName = safeString(request?.to_worker);
+  const namedWorker = byName ? workers.find((worker) => worker?.name === byName) : null;
+  if (!byIndex && !namedWorker) return null;
+  if (byIndex && namedWorker && byIndex !== namedWorker) return null;
+  const worker = byIndex || namedWorker;
+  const paneId = parseCanonicalTmuxPaneId(worker?.pane_id);
+  const panePid = worker?.pid;
+  if (!paneId || paneId !== worker?.pane_id || !Number.isSafeInteger(panePid) || panePid < 1) return null;
+  if (request?.pane_id !== undefined && safeString(request.pane_id) !== paneId) return null;
+  return { paneId, panePid: String(panePid) };
+}
+
+function resolvePersistedLeaderTarget(config) {
+  const paneId = parseCanonicalTmuxPaneId(config?.leader_pane_id);
+  return paneId && paneId === config?.leader_pane_id ? { paneId } : null;
+}
+
+function parseStrictTeamPaneSnapshot(output) {
+  const raw = safeString(output);
+  const framed = raw.endsWith('\n') ? raw.slice(0, -1) : null;
+  if (!framed || raw.includes('\r')) return null;
+  const rows = new Map();
+  for (const line of framed.split('\n')) {
+    const fields = line.split('\t');
+    if (fields.length !== 5) return null;
+    const [paneId, paneDead, panePid, sessionName, ownerId] = fields;
+    if (!paneId || parseCanonicalTmuxPaneId(paneId) !== paneId || (paneDead !== '0' && paneDead !== '1') || !/^[1-9][0-9]*$/.test(panePid) || !Number.isSafeInteger(Number(panePid)) || sessionName === '' || ownerId === '' || rows.has(paneId)) return null;
+    rows.set(paneId, { paneDead, panePid, sessionName, ownerId });
   }
-  if (typeof request.worker_index === 'number' && config.tmux_session) {
-    return { type: 'pane', value: `${config.tmux_session}.${request.worker_index}` };
+  return rows;
+}
+
+async function provePersistedPaneAuthority(target, config, expectedPanePid = '') {
+  const teamSession = safeString(config?.tmux_session);
+  const teamOwnerId = safeString(config?.tmux_pane_owner_id);
+  if (!target || !teamSession || !teamOwnerId) return null;
+  try {
+    const result = await runProcess('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}\t#{@omx_team_pane_owner_id}'], 2000);
+    const observed = parseStrictTeamPaneSnapshot(result.stdout)?.get(target.paneId);
+    if (!observed || observed.paneDead !== '0' || observed.sessionName !== teamSession || observed.ownerId !== teamOwnerId || (target.panePid && observed.panePid !== target.panePid) || (expectedPanePid && observed.panePid !== expectedPanePid)) return null;
+    return { ...target, panePid: observed.panePid };
+  } catch {
+    return null;
   }
-  if (config.tmux_session) return { type: 'session', value: config.tmux_session };
-  return null;
+}
+
+async function provePersistedWorkerPaneAuthority(request, config, expectedPanePid = '') {
+  return provePersistedPaneAuthority(resolvePersistedWorkerTarget(request, config), config, expectedPanePid);
 }
 
 async function appendLeaderNotificationDeferredEvent({
@@ -750,13 +799,37 @@ function buildJoinedCapturePaneArgv(paneTarget, tailLines = 80) {
   return ['capture-pane', '-J', '-t', paneTarget, '-p', '-S', `-${tailLines}`];
 }
 
+function isExactLfCaptureFrame(capture) {
+  const raw = safeString(capture);
+  return raw.length > 0 && !raw.includes('\r') && raw.endsWith('\n') && !raw.endsWith('\n\n');
+}
+
+async function clearPaneInputAtomically(paneTarget, panePid) {
+  const target = parseCanonicalTmuxPaneId(paneTarget);
+  const pid = safeString(panePid);
+  if (!target || !/^[1-9][0-9]*$/.test(pid)) return false;
+  const authority = `#{&&:#{==:#{pane_id},${target}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${pid}}}}`;
+  try {
+    const result = await runProcess('tmux', [
+      'if-shell', '-t', target, '-F', authority,
+      `send-keys -t ${target} C-u; display-message -p __OMX_PANE_MUTATION_OK__`,
+      '',
+    ], 1000);
+    return result.stdout.includes('__OMX_PANE_MUTATION_OK__');
+  } catch {
+    return false;
+  }
+}
+
+
 const INJECT_VERIFY_DELAY_MS = 250;
 const INJECT_VERIFY_ROUNDS = 3;
 
 async function injectDispatchRequest(request, config, cwd, stateDir) {
+  const workerTargeted = request.to_worker !== 'leader-fixed';
   const target = defaultInjectTarget(request, config);
   if (!target) {
-    return { ok: false, reason: 'missing_tmux_target' };
+    return { ok: false, reason: workerTargeted ? 'persisted_worker_target_invalid' : 'missing_tmux_target' };
   }
   const leaderTargeted = request.to_worker === 'leader-fixed';
   let resolution;
@@ -770,6 +843,27 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   }
   if (!resolution.paneTarget) {
     return { ok: false, reason: `target_resolution_failed:${resolution.reason}` };
+  }
+
+  const teamName = safeString(request.team_name) || safeString(config?.name);
+  const authorityInvalidReason = workerTargeted ? 'persisted_worker_authority_invalid' : 'persisted_leader_authority_invalid';
+  const initialAuthority = workerTargeted
+    ? await provePersistedWorkerPaneAuthority(request, config)
+    : await provePersistedPaneAuthority(resolvePersistedLeaderTarget(config), config);
+  if (!initialAuthority || initialAuthority.paneId !== resolution.paneTarget) {
+    return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: false };
+  }
+  const provePaneSendAuthority = async () => {
+    const currentConfig = teamName ? await readDispatchTeamAuthority(teamName, cwd) : null;
+    const authority = currentConfig
+      ? (workerTargeted
+        ? await provePersistedWorkerPaneAuthority(request, currentConfig, initialAuthority.panePid)
+        : await provePersistedPaneAuthority(resolvePersistedLeaderTarget(currentConfig), currentConfig, initialAuthority.panePid))
+      : null;
+    return authority?.paneId === resolution.paneTarget && authority.panePid === initialAuthority.panePid;
+  };
+  if (!(await provePaneSendAuthority())) {
+    return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: false };
   }
   const isLeaderMailboxDispatch = request.to_worker === 'leader-fixed';
   const paneGuard = await evaluatePaneInjectionReadiness(resolution.paneTarget, {
@@ -797,12 +891,18 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   const submitKeyPresses = resolveWorkerCliForRequest(request, config) === 'claude' ? 1 : 2;
   let preCaptureHasTrigger = false;
   if (attemptCountAtStart >= 1) {
+    if (!(await provePaneSendAuthority())) {
+      return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: false };
+    }
     try {
-      // Narrow capture (8 lines) to scope check to input area, not scrollback output
+      // Narrow capture (8 lines) to scope check to input area, not scrollback output.
       const preCapture = await runProcess('tmux', buildJoinedCapturePaneArgv(resolution.paneTarget, 8), 2000);
+      if (!isExactLfCaptureFrame(preCapture.stdout) || !(await provePaneSendAuthority())) {
+        return { ok: false, reason: 'capture_evidence_invalid', pane: resolution.paneTarget, tmux_injection_attempted: false };
+      }
       preCaptureHasTrigger = capturedPaneContainsTrigger(preCapture.stdout, request.trigger_message);
     } catch {
-      preCaptureHasTrigger = false;
+      return { ok: false, reason: 'capture_evidence_invalid', pane: resolution.paneTarget, tmux_injection_attempted: false };
     }
   }
 
@@ -811,18 +911,23 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   const shouldTypePrompt = attemptCountAtStart === 0 || !preCaptureHasTrigger;
   if (shouldTypePrompt) {
     if (attemptCountAtStart >= 1) {
-      // Clear stale text in input buffer before retyping (mirrors sync path tmux-session.ts:1270)
-      await runProcess('tmux', ['send-keys', '-t', resolution.paneTarget, 'C-u'], 1000).catch(() => {});
+      // Clear stale text only in the original, live pane incarnation.
+      if (!(await provePaneSendAuthority()) || !await clearPaneInputAtomically(resolution.paneTarget, initialAuthority.panePid)) {
+        return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: false };
+      }
       await new Promise((r) => setTimeout(r, 50));
     }
   }
-
+  if (!(await provePaneSendAuthority())) {
+    return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: false };
+  }
   const sendResult = await sendPaneInput({
     paneTarget: resolution.paneTarget,
     prompt: request.trigger_message,
     submitKeyPresses,
     typePrompt: shouldTypePrompt,
     queueFirstSubmit: leaderTargeted,
+    assertPaneAuthority: provePaneSendAuthority,
   });
   if (!sendResult.ok) {
     return {
@@ -849,23 +954,39 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       // This avoids false confirmations when Codex leaves the unsent draft just
       // above a large blank area (narrow capture misses it) while still avoiding
       // full-scrollback false positives.
+      if (!(await provePaneSendAuthority())) {
+        return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: true };
+      }
       const narrowCap = await runProcess('tmux', verifyNarrowArgv, 2000);
+      if (!isExactLfCaptureFrame(narrowCap.stdout) || !(await provePaneSendAuthority())) {
+        return { ok: false, reason: 'capture_evidence_invalid', pane: resolution.paneTarget, tmux_injection_attempted: true };
+      }
       const wideCap = await runProcess('tmux', verifyWideArgv, 2000);
+      if (!isExactLfCaptureFrame(wideCap.stdout) || !(await provePaneSendAuthority())) {
+        return { ok: false, reason: 'capture_evidence_invalid', pane: resolution.paneTarget, tmux_injection_attempted: true };
+      }
       const triggerInNarrow = capturedPaneContainsTrigger(narrowCap.stdout, request.trigger_message);
       const triggerNearTail = capturedPaneContainsTriggerNearTail(wideCap.stdout, request.trigger_message);
       if (triggerInNarrow || triggerNearTail) {
         // Draft is still visible, so C-m has not actually submitted it yet.
         // Do not let transient spinner/active-task text mask an unsent draft.
+        if (!(await provePaneSendAuthority())) {
+          return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: true };
+        }
         await sendPaneInput({
           paneTarget: resolution.paneTarget,
           prompt: request.trigger_message,
           submitKeyPresses,
           typePrompt: false,
+          assertPaneAuthority: provePaneSendAuthority,
         }).catch(() => {});
         continue;
       }
       // Worker is actively processing (mirrors sync path tmux-session.ts:1292-1294)
       if (paneHasActiveTask(wideCap.stdout)) {
+        if (!(await provePaneSendAuthority())) {
+          return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: true };
+        }
         runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
         return {
           ok: true,
@@ -887,6 +1008,9 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
         continue;
       }
       if (!triggerInNarrow && !triggerNearTail) {
+        if (!(await provePaneSendAuthority())) {
+          return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: true };
+        }
         runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
         return {
           ok: true,
@@ -902,12 +1026,16 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       // capture failed; fall through to retry C-m
     }
     // Draft still visible and no active task — retry C-m
+    if (!(await provePaneSendAuthority())) {
+      return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: true };
+    }
     await sendPaneInput({
       paneTarget: resolution.paneTarget,
       prompt: request.trigger_message,
       submitKeyPresses,
       typePrompt: false,
       queueFirstSubmit: leaderTargeted,
+      assertPaneAuthority: provePaneSendAuthority,
     }).catch(() => {});
   }
 
@@ -969,6 +1097,21 @@ function buildDispatchAttemptEvidence(result, fallback = {}) {
   };
 }
 
+async function readDispatchTeamAuthority(teamName, cwd) {
+  let outcome = await readTeamStateOutcome(teamName, cwd);
+  if (outcome.status === 'valid') return outcome.config;
+
+  // The only compatibility exception is an explicit config-only v1 migration.
+  // Never migrate over a present-but-invalid or divergent manifest.
+  if (outcome.status === 'invalid' && outcome.source === 'manifest' && outcome.reason === 'incomplete') {
+    await migrateV1ToV2(teamName, cwd);
+    outcome = await readTeamStateOutcome(teamName, cwd);
+    if (outcome.status === 'valid') return outcome.config;
+  }
+
+  return null;
+}
+
 export async function drainPendingTeamDispatch({
   cwd,
   stateDir = resolveBridgeStateDir(cwd),
@@ -999,10 +1142,9 @@ export async function drainPendingTeamDispatch({
   for (const teamName of teams) {
     if (processed >= maxPerTick) break;
     const teamDirPath = join(teamRoot, teamName);
-    const manifestPath = join(teamDirPath, 'manifest.v2.json');
-    const configPath = join(teamDirPath, 'config.json');
     const requestsPath = join(teamDirPath, 'dispatch', 'requests.json');
-    const config = await readJson(existsSync(manifestPath) ? manifestPath : configPath, {});
+    const config = await readDispatchTeamAuthority(teamName, cwd);
+    if (!config) continue;
     const claims = [];
     await withDispatchLock(teamDirPath, async () => {
       const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);

@@ -566,8 +566,12 @@ case "$1" in
     printf '%%12\n'
     exit 0
     ;;
+  list-panes)
+    printf '%s\n' '%12 0 101' '%13 0 202'
+    exit 0
+    ;;
   split-window)
-    printf 'hud-pane\n'
+    printf '%%13\n'
     exit 0
     ;;
   display-message)
@@ -644,8 +648,12 @@ case "$1" in
     printf '%%12\n'
     exit 0
     ;;
+  list-panes)
+    printf '%s\n' '%12 0 101' '%13 0 202'
+    exit 0
+    ;;
   split-window)
-    printf 'hud-pane\n'
+    printf '%%13\n'
     exit 0
     ;;
   display-message)
@@ -739,6 +747,10 @@ case "$1" in
     ;;
   new-session)
     printf '%%77\n'
+    exit 0
+    ;;
+  list-panes)
+    printf '%s\n' '%77 0 101' '%78 0 202'
     exit 0
     ;;
   split-window)
@@ -907,7 +919,8 @@ case "$1" in
   -V) printf 'tmux 3.4\n'; exit 0 ;;
   has-session) exit 1 ;;
   new-session) printf '%%12\n'; exit 0 ;;
-  split-window) printf 'hud-pane\n'; exit 0 ;;
+  list-panes) printf '%s\n' '%12 0 101' '%13 0 202'; exit 0 ;;
+  split-window) printf '%%13\n'; exit 0 ;;
   display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; else printf '0\n'; fi; exit 0 ;;
   show-options) printf 'off\n'; exit 0 ;;
   set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
@@ -969,7 +982,8 @@ case "$1" in
   -V) printf 'tmux 3.4\n'; exit 0 ;;
   has-session) exit 1 ;;
   new-session) printf '%%12\n'; exit 0 ;;
-  split-window) printf 'hud-pane\n'; exit 0 ;;
+  list-panes) printf '%s\n' '%12 0 101' '%13 0 202'; exit 0 ;;
+  split-window) printf '%%13\n'; exit 0 ;;
   display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; else printf '0\n'; fi; exit 0 ;;
   show-options) printf 'off\n'; exit 0 ;;
   set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
@@ -1028,8 +1042,12 @@ case "$1" in
     printf '%%12\n'
     exit 0
     ;;
+  list-panes)
+    printf '%s\n' '%12 0 101' '%13 0 202'
+    exit 0
+    ;;
   split-window)
-    printf 'hud-pane\\n'
+    printf '%%13\n'
     exit 0
     ;;
   display-message)
@@ -1074,12 +1092,10 @@ exit 0
       assert.doesNotMatch(tmuxLog, /tmux:show-options -gv history-limit/);
       assert.doesNotMatch(tmuxLog, /tmux:set-option -g[q ]+history-limit/);
       assert.match(tmuxLog, /tmux:new-session .* -s /);
-      assert.match(tmuxLog, new RegExp(`tmux:set-option -q -t .* history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
-      assert.match(tmuxLog, new RegExp(`tmux:set-option -pq -t %12 history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
-      assert.match(
-        tmuxLog,
-        /tmux:set-hook -t .* client-detached\[[0-9]+\] if-shell -F '#\{==:#\{session_attached\},0\}' 'run-shell -b "tmux clear-history -t %12 >\/dev\/null 2>&1 \|\| true"'/,
-      );
+      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 #\\{&&:#\\{==:#\\{pane_id\\},%12\\},#\\{&&:#\\{==:#\\{pane_dead\\},0\\},#\\{==:#\\{pane_pid\\},101\\}\\}\\} set-option -q -t .* history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
+      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 #\\{&&:#\\{==:#\\{pane_id\\},%12\\},#\\{&&:#\\{==:#\\{pane_dead\\},0\\},#\\{==:#\\{pane_pid\\},101\\}\\}\\} set-option -pq -t %12 history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
+      assert.match(tmuxLog, /tmux:set-hook -t .* client-detached\[[0-9]+\] if-shell -F '#\{==:#\{session_attached\},0\}' .*if-shell -F -t %12 .*#\{pane_dead\},0.*#\{pane_pid\},101.*clear-history -t %12/);
+      assert.doesNotMatch(tmuxLog, /client-detached\[[^\n]*(?:list-panes|awk|Where-Object)/);
       assert.match(tmuxLog, new RegExp(`tmux:split-window -v -l ${HUD_TMUX_HEIGHT_LINES} .* -t `));
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
     } finally {
@@ -1336,10 +1352,41 @@ exit 0
 printf 'tmux:%s\n' "$*" >> "${tmuxLogPath}"
 case "$1" in
   list-panes)
+    case "$*" in
+      *"-a -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        if [ -f "${tmuxLogPath}.split" ]; then
+          printf '%s\n' '%1 0 101' '%2 0 202'
+        else
+          printf '%s\n' '%1 0 101'
+        fi
+        ;;
+      *"-a -F #{pane_id}"*)
+        if [ -f "${tmuxLogPath}.split" ]; then
+          printf '%s\n' '%1' '%2'
+        else
+          printf '%s\n' '%1'
+        fi
+        ;;
+      *"#{pane_current_command}"*)
+        if [ -f "${tmuxLogPath}.split" ]; then
+          printf '%s\n' '%1\tzsh\tzsh' '%2\tnode\tnode omx.js hud --watch'
+        else
+          printf '%s\n' '%1\tzsh\tzsh'
+        fi
+        ;;
+      *"-F #{pane_id}"*)
+        if [ -f "${tmuxLogPath}.split" ]; then
+          printf '%s\n' '%1' '%2'
+        else
+          printf '%s\n' '%1'
+        fi
+        ;;
+    esac
     exit 0
     ;;
   split-window)
-    printf '%s\n' '%hud'
+    : > "${tmuxLogPath}.split"
+    printf '%s\n' '%2'
     exit 0
     ;;
   display-message)
@@ -1351,10 +1398,21 @@ case "$1" in
     exit 0
     ;;
   show-options)
-    printf 'off\n'
+    if [ "$2" = '-g' ] && [ "$3" = '-v' ] && [ -f "${tmuxLogPath}.option.$4" ]; then
+      cat "${tmuxLogPath}.option.$4"
+    else
+      printf 'off\n'
+    fi
     exit 0
     ;;
-  set-option|kill-pane)
+  set-option)
+    if [ "$2" = '-g' ]; then
+      printf '%s\n' "$4" > "${tmuxLogPath}.option.$3"
+    fi
+    exit 0
+    ;;
+  kill-pane)
+    rm -f "${tmuxLogPath}.split"
     exit 0
     ;;
 esac
@@ -1565,11 +1623,15 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf 'leader-pane\n'
+    printf '%%1\n'
+    exit 0
+    ;;
+  list-panes)
+    printf '%s\n' '%1 0 101' '%2 0 202'
     exit 0
     ;;
   split-window)
-    printf 'hud-pane\n'
+    printf '%%2\n'
     exit 0
     ;;
   display-message)
@@ -1635,11 +1697,15 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf 'leader-pane\n'
+    printf '%%1\n'
+    exit 0
+    ;;
+  list-panes)
+    printf '%s\n' '%1 0 101' '%2 0 202'
     exit 0
     ;;
   split-window)
-    printf 'hud-pane\n'
+    printf '%%2\n'
     exit 0
     ;;
   display-message)

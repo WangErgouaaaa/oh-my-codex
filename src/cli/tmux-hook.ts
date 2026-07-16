@@ -6,6 +6,7 @@ import { omxRoot } from '../utils/paths.js';
 import { getPackageRoot } from '../utils/package.js';
 import { resolveCodexPane } from '../scripts/tmux-hook-engine.js';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
+import { parseCanonicalTmuxPaneId } from '../hud/tmux.js';
 
 type TmuxTargetType = 'session' | 'pane';
 
@@ -122,8 +123,11 @@ function parseConfig(raw: unknown): TmuxHookConfig {
   if (targetObj.type !== 'session' && targetObj.type !== 'pane') {
     throw new Error('`target.type` must be "session" or "pane"');
   }
-  if (typeof targetObj.value !== 'string' || targetObj.value.trim() === '') {
+  if (typeof targetObj.value !== 'string' || targetObj.value === '') {
     throw new Error('`target.value` must be a non-empty string');
+  }
+  if (targetObj.type === 'pane' && parseCanonicalTmuxPaneId(targetObj.value) !== targetObj.value) {
+    throw new Error('`target.value` must be a canonical tmux pane ID');
   }
 
   const allowedModes = parsed.allowed_modes;
@@ -218,111 +222,95 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
   if (result.status !== 0) {
     return { ok: false, stderr: (result.stderr || '').trim() || `tmux exited ${result.status}` };
   }
-  return { ok: true, stdout: (result.stdout || '').trim() };
+  return { ok: true, stdout: (result.stdout || '').replace(/\r?\n$/, '') };
 }
 
 function resolveValidateTarget(config: TmuxHookConfig): { ok: true; target: string } | { ok: false; reason: string } {
   if (config.target.type === 'pane') {
     const paneCheck = runTmux(['display-message', '-p', '-t', config.target.value, '#{pane_id}']);
-    if (!paneCheck.ok || paneCheck.stdout === '') {
+    const observedPane = paneCheck.ok ? parseCanonicalTmuxPaneId(paneCheck.stdout) : null;
+    if (!observedPane || observedPane !== config.target.value) {
       return { ok: false, reason: paneCheck.ok ? 'pane not found' : paneCheck.stderr };
     }
-    return { ok: true, target: paneCheck.stdout };
+    return { ok: true, target: observedPane };
   }
 
-  const paneList = runTmux(['list-panes', '-t', config.target.value, '-F', '#{pane_id} #{pane_active}']);
-  if (!paneList.ok) {
-    return { ok: false, reason: paneList.stderr };
+  const paneList = runTmux(['list-panes', '-t', config.target.value, '-F', '#{pane_id}\t#{pane_active}']);
+  if (!paneList.ok) return { ok: false, reason: paneList.stderr };
+  if (paneList.stdout === '') return { ok: false, reason: 'session has no panes' };
+  const paneIds = new Set<string>();
+  let activePaneId: string | null = null;
+  let firstPaneId: string | null = null;
+  for (const rawLine of paneList.stdout.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const parts = line.split('\t');
+    const paneId = parseCanonicalTmuxPaneId(parts[0]);
+    if (parts.length !== 2 || !paneId || paneId !== parts[0] || paneIds.has(paneId) || (parts[1] !== '0' && parts[1] !== '1')) {
+      return { ok: false, reason: 'malformed pane list' };
+    }
+    paneIds.add(paneId);
+    firstPaneId ??= paneId;
+    if (parts[1] === '1') {
+      if (activePaneId) return { ok: false, reason: 'multiple active panes' };
+      activePaneId = paneId;
+    }
   }
-  const lines = paneList.stdout.split('\n').map(line => line.trim()).filter(Boolean);
-  if (lines.length === 0) {
-    return { ok: false, reason: 'session has no panes' };
-  }
-  const active = lines.find(line => line.endsWith(' 1')) || lines[0];
-  const paneId = active.split(' ')[0];
-  if (!paneId) {
-    return { ok: false, reason: 'failed to resolve pane id from session' };
-  }
-  return { ok: true, target: paneId };
+  return { ok: true, target: activePaneId ?? firstPaneId! };
 }
 
 function detectActivePaneFromList(): InitialTargetDetection | null {
   const paneList = runTmux(['list-panes', '-a', '-F', '#{pane_id}\t#{pane_active}\t#{session_name}']);
-  if (!paneList.ok || paneList.stdout.trim() === '') return null;
-
-  const rows = paneList.stdout
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => line.split('\t'))
-    .filter(parts => parts.length >= 3);
-  if (rows.length === 0) return null;
-
-  const active = rows.find(parts => parts[1] === '1') || rows[0];
-  const paneId = (active?.[0] || '').trim();
-  const sessionName = (active?.[2] || '').trim();
-  if (!paneId) return null;
-
-  return {
-    target: { type: 'pane', value: paneId },
-    sessionName: sessionName || undefined,
-  };
+  if (!paneList.ok || paneList.stdout === '') return null;
+  const paneIds = new Set<string>();
+  let selected: [string, string] | null = null;
+  let first: [string, string] | null = null;
+  for (const rawLine of paneList.stdout.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const parts = line.split('\t');
+    const paneId = parseCanonicalTmuxPaneId(parts[0]);
+    if (parts.length !== 3 || !paneId || paneId !== parts[0] || paneIds.has(paneId) || !parts[2] || (parts[1] !== '0' && parts[1] !== '1')) return null;
+    paneIds.add(paneId);
+    const row: [string, string] = [paneId, parts[2]];
+    first ??= row;
+    if (parts[1] === '1') {
+      if (selected) return null;
+      selected = row;
+    }
+  }
+  const active = selected ?? first;
+  return active ? { target: { type: 'pane', value: active[0] }, sessionName: active[1] } : null;
 }
 
 function detectInitialTarget(): InitialTargetDetection | null {
-  const canonicalPane = resolveCodexPane();
-  if (canonicalPane) {
+  const rawEnvPane = process.env.TMUX_PANE;
+  // An explicit pane is authoritative input. A rejected Codex/HUD decision must
+  // not be reclassified by a weaker generic tmux fallback.
+  if (rawEnvPane !== undefined && rawEnvPane !== '') {
+    const requestedPane = parseCanonicalTmuxPaneId(rawEnvPane);
+    if (requestedPane !== rawEnvPane) return null;
+    const canonicalPane = resolveCodexPane();
+    if (canonicalPane === '') return null;
     const pane = runTmux(['display-message', '-p', '-t', canonicalPane, '#{pane_id}']);
-    if (pane.ok && pane.stdout) {
-      const session = runTmux(['display-message', '-p', '-t', canonicalPane, '#S']);
-      return {
-        target: { type: 'pane', value: pane.stdout },
-        sessionName: session.ok && session.stdout ? session.stdout : undefined,
-      };
-    }
-  }
-
-  const envPane = process.env.TMUX && typeof process.env.TMUX_PANE === 'string'
-    ? process.env.TMUX_PANE.trim()
-    : '';
-  if (envPane) {
-    const pane = runTmux(['display-message', '-p', '-t', envPane, '#{pane_id}']);
-    if (pane.ok && pane.stdout) {
-      const session = runTmux(['display-message', '-p', '-t', envPane, '#S']);
-      return {
-        target: { type: 'pane', value: pane.stdout },
-        sessionName: session.ok && session.stdout ? session.stdout : undefined,
-      };
-    }
-    return {
-      target: { type: 'pane', value: envPane },
-    };
+    const observedPane = pane.ok ? parseCanonicalTmuxPaneId(pane.stdout) : null;
+    if (observedPane !== canonicalPane) return null;
+    const session = runTmux(['display-message', '-p', '-t', canonicalPane, '#S']);
+    return { target: { type: 'pane', value: observedPane }, sessionName: session.ok && session.stdout !== '' ? session.stdout : undefined };
   }
 
   const currentClientPane = runTmux(['display-message', '-p', '#{pane_id}']);
-  if (currentClientPane.ok && currentClientPane.stdout) {
+  const observedCurrentPane = currentClientPane.ok ? parseCanonicalTmuxPaneId(currentClientPane.stdout) : null;
+  if (observedCurrentPane) {
     const session = runTmux(['display-message', '-p', '#S']);
-    return {
-      target: { type: 'pane', value: currentClientPane.stdout },
-      sessionName: session.ok && session.stdout ? session.stdout : undefined,
-    };
+    return { target: { type: 'pane', value: observedCurrentPane }, sessionName: session.ok && session.stdout !== '' ? session.stdout : undefined };
   }
 
   const activePane = detectActivePaneFromList();
   if (activePane) return activePane;
 
   const sessions = runTmux(['list-sessions', '-F', '#{session_name}']);
-  if (sessions.ok && sessions.stdout.trim() !== '') {
-    const firstSession = sessions.stdout
-      .split('\n')
-      .map(line => line.trim())
-      .find(Boolean);
-    if (firstSession) {
-      return {
-        target: { type: 'session', value: firstSession },
-        sessionName: firstSession,
-      };
-    }
+  if (sessions.ok && sessions.stdout !== '') {
+    const rows = sessions.stdout.split('\n').map(line => line.endsWith('\r') ? line.slice(0, -1) : line);
+    if (rows.length === 1 && rows[0] !== '') return { target: { type: 'session', value: rows[0] }, sessionName: rows[0] };
   }
 
   return null;

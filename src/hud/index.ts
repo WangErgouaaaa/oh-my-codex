@@ -10,7 +10,7 @@
  *   omx hud --reconcile-tmux
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync } from 'node:child_process';
 import { readlinkSync, realpathSync } from 'node:fs';
 import { readAllState, readHudConfig } from './state.js';
 import { getHudRenderMaxLines, renderHud } from './render.js';
@@ -19,16 +19,24 @@ import { HUD_TMUX_HEIGHT_LINES } from './constants.js';
 import { sleep } from '../utils/sleep.js';
 import { runHudAuthorityTick } from './authority.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
+import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 import {
+  createHudWatchPane,
+  buildHudRuntimeEnv,
   killTmuxPane,
-  listCurrentWindowHudPaneIds,
+  findHudWatchPaneIds,
+  listCurrentWindowPanes,
   OMX_TMUX_HUD_LEADER_PANE_ENV,
   readActiveTmuxPaneId,
   registerHudResizeHook,
   resizeTmuxPane,
+  parseCanonicalTmuxPaneId,
+  verifyHudWatchPaneAuthority,
+  writeHudWatchCommand,
 } from './tmux.js';
 import { OMX_TMUX_HUD_OWNER_ENV, reconcileHudForPromptSubmit } from './reconcile.js';
-import { buildHudRuntimeEnv } from './tmux.js';
+
+
 
 export const HUD_USAGE = [
   'Usage:',
@@ -152,10 +160,11 @@ function reconcileRunningHudPaneHeight(
   dependencies: Pick<RunWatchModeDependencies, 'env' | 'resizeTmuxPaneFn' | 'registerHudResizeHookFn'>,
 ): void {
   if (!dependencies.env.TMUX || dependencies.env[OMX_TMUX_HUD_OWNER_ENV] !== '1') return;
-  const hudPaneId = dependencies.env.TMUX_PANE?.trim();
-  if (!hudPaneId?.startsWith('%')) return;
-  const leaderPaneId = dependencies.env[OMX_TMUX_HUD_LEADER_PANE_ENV]?.trim() || undefined;
-  if (dependencies.resizeTmuxPaneFn(hudPaneId, desiredHeight) && leaderPaneId) {
+  const hudPaneId = parseCanonicalTmuxPaneId(dependencies.env.TMUX_PANE);
+  if (!hudPaneId) return;
+  const leaderPaneId = parseCanonicalTmuxPaneId(dependencies.env[OMX_TMUX_HUD_LEADER_PANE_ENV]);
+  if (!leaderPaneId) return;
+  if (dependencies.resizeTmuxPaneFn(hudPaneId, desiredHeight)) {
     dependencies.registerHudResizeHookFn(hudPaneId, leaderPaneId, desiredHeight);
   }
 }
@@ -369,6 +378,23 @@ export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+/** Build the command run by tmux for a HUD watch pane. */
+export function buildHudStartupCommand(
+  omxBin: string,
+  runtimeEnv: Record<string, string>,
+  preset?: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return writeHudWatchCommand({
+    omxEntry: omxBin,
+    runtimeEnv,
+    nodeCommand: process.execPath,
+    preset,
+    platform,
+    powerShellEnvelope: platform === 'win32',
+  });
+}
+
 /**
  * Build the argument array for `execFileSync('tmux', args)`.
  *
@@ -387,16 +413,22 @@ export function buildTmuxSplitArgs(
   rootEnv?: Parameters<typeof buildHudRuntimeEnv>[0],
 ): string[] {
   // Defense-in-depth: keep preset constrained even if this helper is reused.
-  const safePreset = parseHudPreset(preset);
-  const presetArg = safePreset ? ` --preset=${safePreset}` : '';
-  const envAssignments = Object.entries(buildHudRuntimeEnv({
-    sessionId,
-    leaderPaneId,
-    omxRoot,
-    ...(rootEnv ?? { rootSource: 'omx-root-env' }),
-  }).env).map(([key, value]) => `${key}=${key === OMX_TMUX_HUD_OWNER_ENV ? value : shellEscape(value)}`);
-  const envPrefix = envAssignments.length > 0 ? `env ${envAssignments.join(' ')} ` : '';
-  const cmd = `exec ${envPrefix}${shellEscape(process.execPath)} ${shellEscape(omxBin)} hud --watch${presetArg}`;
+  const rawLeaderPaneId = leaderPaneId;
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(rawLeaderPaneId);
+  if (rawLeaderPaneId !== undefined && !canonicalLeaderPaneId) {
+    throw new Error(`invalid_tmux_pane_id:${rawLeaderPaneId}`);
+  }
+  const cmd = buildHudStartupCommand(
+    omxBin,
+    buildHudRuntimeEnv({
+      sessionId,
+      leaderPaneId: canonicalLeaderPaneId ?? undefined,
+      omxRoot,
+      ...(rootEnv ?? { rootSource: 'omx-root-env' }),
+    }).env,
+    preset,
+    process.platform,
+  );
   const height = Number.isFinite(heightLines) && (heightLines ?? 0) > 0
     ? Math.floor(heightLines ?? HUD_TMUX_HEIGHT_LINES)
     : HUD_TMUX_HEIGHT_LINES;
@@ -405,11 +437,53 @@ export function buildTmuxSplitArgs(
     '-v',
     '-l',
     String(height),
-    ...(leaderPaneId ? ['-t', leaderPaneId] : []),
+    ...(canonicalLeaderPaneId ? ['-t', canonicalLeaderPaneId] : []),
     '-c',
     cwd,
     cmd,
   ];
+}
+
+function readStrictHudPanePids(): Map<string, string> | null {
+  try {
+    const output = execFileSync(resolveTmuxBinaryForPlatform() || 'tmux', [
+      'list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}',
+    ], { encoding: 'utf-8', ...(process.platform === 'win32' ? { windowsHide: true } : {}) });
+    if (!output || output.includes('\r') || !output.endsWith('\n') || output.endsWith('\n\n')) return null;
+    const lines = output.slice(0, -1).split('\n');
+    if (lines.length === 0) return null;
+    const panePids = new Map<string, string>();
+    for (const line of lines) {
+      const match = /^(%0|%[1-9]\d*) 0 ([1-9]\d*)$/.exec(line);
+      if (!match || panePids.has(match[1]!)) return null;
+      panePids.set(match[1]!, match[2]!);
+    }
+    return panePids;
+  } catch {
+    return null;
+  }
+}
+
+function hasFreshHudPaneAuthority(
+  paneId: string,
+  expectedPanePid: string,
+  currentPaneId: string,
+  expectedLeaderPid: string,
+  owner: { sessionId?: string; leaderPaneId?: string },
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId || !/^[1-9]\d*$/.test(expectedPanePid) || !/^[1-9]\d*$/.test(expectedLeaderPid)) return false;
+  const matchesOwner = (): boolean => findHudWatchPaneIds(
+    listCurrentWindowPanes(undefined, currentPaneId),
+    currentPaneId,
+    owner,
+  ).filter((candidatePaneId) => candidatePaneId === canonicalPaneId).length === 1;
+  const hasExactIncarnations = (): boolean => {
+    const panePids = readStrictHudPanePids();
+    return panePids?.get(canonicalPaneId) === expectedPanePid
+      && panePids.get(currentPaneId) === expectedLeaderPid;
+  };
+  return matchesOwner() && hasExactIncarnations() && matchesOwner() && hasExactIncarnations();
 }
 
 async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
@@ -424,24 +498,56 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
     console.error('Failed to resolve OMX launcher path for tmux HUD startup.');
     process.exit(1);
   }
-  const envPaneId = process.env.TMUX_PANE?.trim();
-  const currentPaneId = envPaneId || readActiveTmuxPaneId() || undefined;
-  const leaderPaneId = currentPaneId;
+  const envPaneId = process.env.TMUX_PANE;
+  const currentPaneId = envPaneId !== undefined
+    ? parseCanonicalTmuxPaneId(envPaneId)
+    : readActiveTmuxPaneId();
+  if (envPaneId !== undefined && !currentPaneId) {
+    console.error(`Invalid TMUX_PANE value: ${envPaneId}`);
+    process.exitCode = 1;
+    return;
+  }
+  const leaderPaneId = currentPaneId ?? undefined;
   const sessionId = process.env.OMX_SESSION_ID?.trim() || undefined;
   const existingHudPaneIds = leaderPaneId || sessionId
-    ? listCurrentWindowHudPaneIds(leaderPaneId, undefined, leaderPaneId ? { leaderPaneId } : { sessionId })
+    ? findHudWatchPaneIds(
+      listCurrentWindowPanes(undefined, leaderPaneId),
+      leaderPaneId,
+      leaderPaneId ? { leaderPaneId } : { sessionId },
+    )
     : [];
   if (existingHudPaneIds.length >= 1) {
     const [keeperPaneId, ...duplicatePaneIds] = existingHudPaneIds;
+    const owner = leaderPaneId ? { leaderPaneId } : { sessionId };
+    if (!leaderPaneId) {
+      console.error('Failed to establish a canonical tmux leader pane for HUD reuse.');
+      process.exitCode = 1;
+      return;
+    }
+    const panePids = readStrictHudPanePids();
+    const leaderPanePid = panePids?.get(leaderPaneId);
+    if (!leaderPanePid) {
+      console.error('Failed to establish exact tmux pane authority for HUD reuse.');
+      process.exitCode = 1;
+      return;
+    }
+
+    let removedDuplicateCount = 0;
     for (const paneId of duplicatePaneIds) {
+      if (!hasFreshHudPaneAuthority(paneId, panePids?.get(paneId) ?? '', leaderPaneId, leaderPanePid, owner)) continue;
       killTmuxPane(paneId);
+      removedDuplicateCount += 1;
     }
     const config = await readHudConfig(cwd);
     const ctx = await readAllState(cwd, config);
     const desiredHeight = getHudRenderMaxLines(ctx);
-    resizeTmuxPane(keeperPaneId, desiredHeight);
-    if (leaderPaneId) registerHudResizeHook(keeperPaneId, leaderPaneId, desiredHeight);
-    console.log(duplicatePaneIds.length > 0
+    if (hasFreshHudPaneAuthority(keeperPaneId, panePids?.get(keeperPaneId) ?? '', leaderPaneId, leaderPanePid, owner)) {
+      resizeTmuxPane(keeperPaneId, desiredHeight);
+    }
+    if (hasFreshHudPaneAuthority(keeperPaneId, panePids?.get(keeperPaneId) ?? '', leaderPaneId, leaderPanePid, owner)) {
+      registerHudResizeHook(keeperPaneId, leaderPaneId, desiredHeight);
+    }
+    console.log(removedDuplicateCount > 0
       ? 'HUD already running in tmux pane. Removed duplicate HUD panes and reused existing HUD pane.'
       : 'HUD already running in tmux pane. Reused existing HUD pane.');
     return;
@@ -455,7 +561,7 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
     flags.preset,
     process.env.OMX_SESSION_ID,
     process.env.OMX_ROOT,
-    currentPaneId,
+    currentPaneId ?? undefined,
     getHudRenderMaxLines(ctx),
     {
       omxStateRoot: process.env.OMX_STATE_ROOT,
@@ -465,9 +571,15 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
   );
 
   try {
-    // Split bottom pane at the shared HUD height, running omx hud --watch.
-    // execFileSync bypasses the shell – cwd and omxBin cannot inject commands.
-    execFileSync('tmux', args, { stdio: 'inherit' });
+    const hudPaneId = createHudWatchPane(cwd, args.at(-1)!, {
+      heightLines: getHudRenderMaxLines(ctx),
+      targetPaneId: currentPaneId ?? undefined,
+    });
+    if (!hudPaneId || !verifyHudWatchPaneAuthority(hudPaneId)) {
+      console.error('Failed to create a verified tmux HUD split.');
+      process.exitCode = 1;
+      return;
+    }
     console.log('HUD launched in tmux pane below. Close with: Ctrl+C in that pane, or `tmux kill-pane -t bottom`');
   } catch {
     console.error('Failed to create tmux split. Ensure tmux is available.');

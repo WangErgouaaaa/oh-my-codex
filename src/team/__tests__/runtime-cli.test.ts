@@ -133,6 +133,7 @@ describe('runtime-cli helpers', () => {
       });
 
       config.workers = [config.workers[0]!];
+      config.worker_count = 1;
       config.workers[0]!.pane_id = '%777';
       await saveTeamConfig(config, cwd);
 

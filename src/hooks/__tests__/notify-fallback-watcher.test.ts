@@ -103,10 +103,15 @@ async function writeCanonicalWatcherTeamFixture(
     last_turn_at: new Date(Date.now() - 300_000).toISOString(),
     turn_count: 3,
   }, null, 2));
+  const workers = [
+    { name: 'worker-1', index: 1, pane_id: '%43', pid: 4301, role: 'executor', assigned_tasks: [] },
+  ];
   const manifest = {
     schema_version: 2,
     name: teamName,
     task: 'canonical watcher fallback repro',
+    agent_type: 'executor',
+    max_workers: 20,
     leader: {
       session_id: ownerSessionId,
       worker_id: 'leader-fixed',
@@ -132,26 +137,52 @@ async function writeCanonicalWatcherTeamFixture(
       network_access: true,
     },
     tmux_session: `${teamName}:0`,
+    leader_cwd: wd,
+    team_state_root: stateDir,
+    workspace_mode: 'single',
+    worktree_mode: { enabled: false },
     leader_pane_id: '%42',
     hud_pane_id: null,
+    tmux_pane_owner_id: `team:${teamName}`,
     resize_hook_name: null,
     resize_hook_target: null,
-    worker_count: 1,
+    worker_count: workers.length,
     next_task_id: 1,
-    workers: [
-      { name: 'worker-1', index: 1, pane_id: '%42', role: 'executor' },
-    ],
+    next_worker_index: 2,
+    workers,
+    display_name: teamName,
+    requested_name: teamName,
+    identity_source: 'fixture',
     created_at: nowIso,
   };
+  const config = {
+    name: manifest.name,
+    task: manifest.task,
+    agent_type: manifest.agent_type,
+    worker_launch_mode: manifest.policy.worker_launch_mode,
+    lifecycle_profile: manifest.lifecycle_profile,
+    worker_count: manifest.worker_count,
+    max_workers: manifest.max_workers,
+    workers: manifest.workers,
+    created_at: manifest.created_at,
+    tmux_session: manifest.tmux_session,
+    next_task_id: manifest.next_task_id,
+    leader_cwd: manifest.leader_cwd,
+    team_state_root: manifest.team_state_root,
+    workspace_mode: manifest.workspace_mode,
+    worktree_mode: manifest.worktree_mode,
+    leader_pane_id: manifest.leader_pane_id,
+    hud_pane_id: manifest.hud_pane_id,
+    tmux_pane_owner_id: manifest.tmux_pane_owner_id,
+    resize_hook_name: manifest.resize_hook_name,
+    resize_hook_target: manifest.resize_hook_target,
+    next_worker_index: manifest.next_worker_index,
+    display_name: manifest.display_name,
+    requested_name: manifest.requested_name,
+    identity_source: manifest.identity_source,
+  };
+  await writeFile(join(teamDir, 'config.json'), JSON.stringify(config, null, 2));
   await writeFile(join(teamDir, 'manifest.v2.json'), JSON.stringify(manifest, null, 2));
-  await writeFile(join(teamDir, 'config.json'), JSON.stringify({
-    name: teamName,
-    tmux_session: `${teamName}:0`,
-    leader_pane_id: '%42',
-    workers: [
-      { name: 'worker-1', pane_id: '%42' },
-    ],
-  }, null, 2));
   await writeFile(join(teamDir, 'phase.json'), JSON.stringify({
     current_phase: terminal ? 'complete' : 'team-exec',
     updated_at: nowIso,
@@ -192,19 +223,52 @@ async function waitForExit(child: ReturnType<typeof spawn>, timeoutMs: number = 
   ]);
 }
 
-function defaultAutoNudgePattern(targetPane: string): RegExp {
-  return new RegExp(`send-keys -t ${targetPane} -l ${DEFAULT_AUTO_NUDGE_RESPONSE.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')} \\[OMX_TMUX_INJECT\\]`);
+function defaultAutoNudgePattern(_targetPane: string): RegExp {
+  return new RegExp(`set-buffer -b [^\\n]+ -- ${DEFAULT_AUTO_NUDGE_RESPONSE.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')} \\[OMX_TMUX_INJECT\\]`);
 }
 
 function buildFakeTmux(
   tmuxLogPath: string,
-  options: { failSendKeys?: boolean; failSendKeysMatch?: string } = {},
+  options: { failSendKeys?: boolean; failSendKeysMatch?: string; includeCanonicalWorker?: boolean } = {},
 ): string {
   return `#!/usr/bin/env bash
 set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "if-shell" ]]; then
+  target=""
+  condition=""
+  thenCommand=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      -F) condition="$2"; shift 2 ;;
+      *) if [[ -z "$thenCommand" ]]; then thenCommand="$1"; fi; shift ;;
+    esac
+  done
+  pid=""
+  case "$target" in
+    %42) pid="4201" ;;
+    %43) pid="4301" ;;
+  esac
+  if [[ -z "$pid" || "$condition" != *"#{pane_id},$target"* || "$condition" != *"#{pane_dead},0"* || "$condition" != *"#{pane_pid},$pid"* ]]; then
+    exit 0
+  fi
+  if [[ "${options.failSendKeys === true ? '1' : '0'}" == "1" && "$thenCommand" == *"send-keys"* ]]; then
+    echo "send failed" >&2
+    exit 1
+  fi
+  if [[ -n "${options.failSendKeysMatch || ''}" && "$thenCommand" == *"${options.failSendKeysMatch || ''}"* ]]; then
+    echo "send failed" >&2
+    exit 1
+  fi
+  if [[ "$thenCommand" == *"paste-buffer"* && -f "${tmuxLogPath}.buffer" ]]; then
+    echo "send-keys -t $target -l $(cat "${tmuxLogPath}.buffer")" >> "${tmuxLogPath}"
+  fi
+  printf '__OMX_PANE_MUTATION_OK__\n'
+  exit 0
+fi
 if [[ "$cmd" == "capture-pane" ]]; then
   if [[ -n "\${OMX_TEST_CAPTURE_SEQUENCE_FILE:-}" && -f "\${OMX_TEST_CAPTURE_SEQUENCE_FILE}" ]]; then
     counterFile="\${OMX_TEST_CAPTURE_COUNTER_FILE:-\${OMX_TEST_CAPTURE_SEQUENCE_FILE}.idx}"
@@ -221,7 +285,9 @@ if [[ "$cmd" == "capture-pane" ]]; then
   fi
   if [[ -n "\${OMX_TEST_CAPTURE_FILE:-}" && -f "\${OMX_TEST_CAPTURE_FILE}" ]]; then
     cat "\${OMX_TEST_CAPTURE_FILE}"
+    exit 0
   fi
+  printf '› \n'
   exit 0
 fi
 if [[ "$cmd" == "display-message" ]]; then
@@ -243,6 +309,15 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "0"
     exit 0
   fi
+  if [[ "$fmt" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    if [[ "\${target:-%42}" == "%43" ]]; then
+      printf '%%43\t0\t4301\n'
+    else
+      printf '%%42\t0\t4201\n'
+    fi
+    exit 0
+  fi
+
   if [[ "$fmt" == "#{pane_id}" ]]; then
     echo "\${target:-%42}"
     exit 0
@@ -259,6 +334,16 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}"
     exit 0
   fi
+  exit 0
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  if [[ "$*" == *"@omx_pane_instance_id"* || "$*" == *"@omx_instance_id"* ]]; then
+    printf '%s\n' "\${OMX_SESSION_ID:-}"
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\t%s\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}" "\${OMX_SESSION_ID:-}"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -299,6 +384,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  allArgs="$*"
   target=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -309,8 +395,23 @@ if [[ "$cmd" == "list-panes" ]]; then
     esac
     shift || true
   done
+  if [[ "$allArgs" == *"-a"* && "${options.includeCanonicalWorker === true ? '1' : '0'}" == "1" ]]; then
+    printf "%%42\t0\t4201\tdispatch-team:0\tteam:dispatch-team\n%%43\t0\t4301\tdispatch-team:0\tteam:dispatch-team\n"
+    exit 0
+  fi
   if [[ -n "$target" ]]; then
-    printf "%%42\tcodex\tcodex\n"
+    if [[ "$allArgs" == *"#{pane_id}"* && "$allArgs" != *"#{pane_active}"* && "$allArgs" != *"#{pane_pid}"* ]]; then
+      ${options.includeCanonicalWorker === true ? 'printf "%%42\\n%%43\\n"' : 'printf "%%42\\n"'}
+      exit 0
+    fi
+    if [[ "$allArgs" == *"#{pane_id} #{pane_pid}"* ]]; then
+      ${options.includeCanonicalWorker === true ? 'printf "%%42 4201\\n%%43 4301\\n"' : 'printf "%%42 4201\\n"'}
+      exit 0
+    fi
+    ${options.includeCanonicalWorker === true
+      ? 'printf "%%42\\t1\\tcodex\\tcodex\\n%%43\\t0\\tcodex\\tcodex\\n"'
+      : 'printf "%%42\\t1\\tcodex\\tcodex\\n"'
+    }
     exit 0
   fi
   echo "%42 1"
@@ -363,6 +464,24 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "if-shell" ]]; then
+  target=""
+  condition=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      -F) condition="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  pid=""
+  if [[ "$target" == "${anchorPane}" ]]; then pid="9901"; fi
+  if [[ "$target" == "${livePane}" ]]; then pid="4201"; fi
+  if [[ -n "$pid" && "$condition" == *"#{pane_id},$target"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},$pid"* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -381,6 +500,15 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "0"
     exit 0
   fi
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    if [[ "$target" == "${anchorPane}" ]]; then
+      printf '%s\t0\t9901\n' "${anchorPane}"
+    else
+      printf '%s\t0\t4201\n' "${livePane}"
+    fi
+    exit 0
+  fi
+
   if [[ "$format" == "#{pane_id}" ]]; then
     echo "$target"
     exit 0
@@ -402,21 +530,27 @@ ${paneCommandBranches}
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
+  format=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
-      -F) shift 2 ;;
-      -t) shift; target="$1" ;;
+      -F) format="$2"; shift 2 ;;
+      -t) target="$2"; shift 2 ;;
+      *) shift ;;
     esac
-    shift || true
   done
   if [[ "$target" == "${managedSessionName}" ]]; then
-    printf '%s\n' "${listPaneOutput}"
+    if [[ "$format" == "#{pane_id}" ]]; then
+      printf '%s\n' ${panes.map((pane) => JSON.stringify(pane.paneId)).join(' ')}
+    else
+      printf '%s\n' "${listPaneOutput}"
+    fi
     exit 0
   fi
   echo "can't find session" >&2
   exit 1
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
+  printf '› \n'
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -1284,26 +1418,15 @@ describe('notify-fallback watcher', () => {
     const fakeBinDir = join(wd, 'fake-bin');
     const tmuxLogPath = join(wd, 'tmux.log');
     try {
-      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
-      await mkdir(join(wd, '.omx', 'state', 'team', 'dispatch-team'), { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await writeCanonicalWatcherTeamFixture(wd, {
+        teamName: 'dispatch-team',
+        sessionId: 'sess-canonical-inactive',
+        ownerSessionId: 'sess-canonical-inactive',
+        coarseState: 'active',
+      });
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath, { includeCanonicalWorker: true }));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
-
-      await writeFile(join(wd, '.omx', 'state', 'team-state.json'), JSON.stringify({
-        active: true,
-        team_name: 'dispatch-team',
-        current_phase: 'team-exec',
-      }, null, 2));
-      await writeFile(join(wd, '.omx', 'state', 'hud-state.json'), JSON.stringify({
-        last_turn_at: new Date(Date.now() - 300_000).toISOString(),
-        turn_count: 3,
-      }, null, 2));
-      await writeFile(join(wd, '.omx', 'state', 'team', 'dispatch-team', 'config.json'), JSON.stringify({
-        name: 'dispatch-team',
-        tmux_session: 'omx-team-dispatch-team',
-        leader_pane_id: '%42',
-      }, null, 2));
 
       const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
       const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
@@ -1321,7 +1444,7 @@ describe('notify-fallback watcher', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %42 -l Team dispatch-team: leader stale, \d+ worker pane\(s\) still active\./);
+      assert.match(tmuxLog, /set-buffer -b [^\n]+ -- Team dispatch-team: leader stale, \d+ worker pane\(s\) still active\./);
 
       const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -1362,7 +1485,7 @@ describe('notify-fallback watcher', () => {
         ownerSessionId: 'sess-canonical-inactive',
         coarseState: 'inactive',
       });
-      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath, { includeCanonicalWorker: true }));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
@@ -1381,7 +1504,7 @@ describe('notify-fallback watcher', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %42 -l Team dispatch-team: leader stale, \d+ worker pane\(s\) still active\./);
+      assert.match(tmuxLog, /set-buffer -b [^\n]+ -- Team dispatch-team: leader stale, \d+ worker pane\(s\) still active\./);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1517,6 +1640,21 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "if-shell" ]]; then
+  target=""
+  condition=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      -F) condition="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [[ "$target" == "%42" && "$condition" == *"#{pane_id},%42"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},4201"* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   fmt=""
@@ -1536,6 +1674,11 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "0"
     exit 0
   fi
+  if [[ "$fmt" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    printf '%%42\t0\t4201\n'
+    exit 0
+  fi
+
   if [[ "$fmt" == "#{pane_id}" ]]; then
     echo "\${target:-%42}"
     exit 0
@@ -1583,6 +1726,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  allArgs="$*"
   target=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -1593,16 +1737,22 @@ if [[ "$cmd" == "list-panes" ]]; then
     esac
     shift || true
   done
-  if [[ -n "$target" ]]; then
-    printf "%%42 12345\n%%10 12346\n%%11 12347\n"
+  if [[ "$allArgs" == *"-a"* ]]; then
+    printf "%%42\t0\t4201\tdispatch-team:0\tteam:dispatch-team\n%%10\t0\t101\tdispatch-team:0\tteam:dispatch-team\n%%11\t0\t102\tdispatch-team:0\tteam:dispatch-team\n"
     exit 0
   fi
-  echo "%42 1"
+  if [[ -n "$target" ]]; then
+    printf "%%42\t0\t4201\n%%10\t0\t101\n%%11\t0\t102\n"
+    exit 0
+  fi
+  printf "%%42\t0\t4201\n"
   exit 0
 fi
 exit 0
 `;
       await writeFile(join(fakeBinDir, 'tmux'), tmuxScript);
+      await writeFile(tmuxLogPath, '');
+
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const now = Date.now();
@@ -2116,21 +2266,21 @@ exit 0
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-dispatch-cm-'));
     const fakeBinDir = join(wd, 'fake-bin');
     const tmuxLogPath = join(wd, 'tmux.log');
-    const captureFile = join(wd, 'capture.txt');
+    const captureSequenceFile = join(wd, 'capture-sequence.txt');
     const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
     try {
       process.env.OMX_RUNTIME_BRIDGE = '0';
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath, { includeCanonicalWorker: true }));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
-      await writeFile(captureFile, '... ping ...');
+      await writeFile(captureSequenceFile, 'ready\n... ping ...\n');
 
-      await initTeamState('dispatch-team', 'task', 'executor', 1, wd);
+      await writeCanonicalWatcherTeamFixture(wd);
       const queued = await enqueueDispatchRequest('dispatch-team', {
         kind: 'inbox',
         to_worker: 'worker-1',
         worker_index: 1,
-        pane_id: '%42',
+        pane_id: '%43',
         trigger_message: 'ping',
       }, wd);
 
@@ -2139,7 +2289,7 @@ exit 0
       const env = {
         ...buildCleanNotifyEnv(),
         PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
-        OMX_TEST_CAPTURE_FILE: captureFile,
+        OMX_TEST_CAPTURE_SEQUENCE_FILE: captureSequenceFile,
       };
 
       const first = spawnSync(
@@ -2157,11 +2307,11 @@ exit 0
       assert.equal(second.status, 0, second.stderr || second.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
+      const typeMatches = tmuxLog.match(/send-keys -t %43 -l ping/g) || [];
       assert.equal(typeMatches.length, 1, 'fresh attempt should type once; retries with draft should be submit-only');
-      const cmMatches = tmuxLog.match(/send-keys -t %42 C-m/g) || [];
-      assert.ok(cmMatches.length > 0, 'submit should use C-m');
-      assert.ok(!/send-keys[^\n]*-l[^\n]*C-m/.test(tmuxLog), 'must keep -l payload and C-m submits isolated');
+      const cmMatches = tmuxLog.match(/'send-keys' '-t' '%43' 'C-m'/g) || [];
+      assert.ok(cmMatches.length > 0, 'submit should use atomic C-m commands');
+      assert.ok(!/set-buffer[^\n]*C-m/.test(tmuxLog), 'must keep buffered payload and C-m submits isolated');
 
       const request = await readDispatchRequest('dispatch-team', queued.request.request_id, wd);
       assert.equal(request?.status, 'pending');
@@ -2702,6 +2852,24 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "if-shell" ]]; then
+  target=""
+  condition=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      -F) condition="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  pid=""
+  if [[ "$target" == "${anchorPane}" ]]; then pid="9901"; fi
+  if [[ "$target" == "${livePane}" ]]; then pid="4201"; fi
+  if [[ -n "$pid" && "$condition" == *"#{pane_id},$target"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},$pid"* ]]; then
+    printf '__OMX_PANE_MUTATION_OK__\n'
+  fi
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -2714,6 +2882,14 @@ if [[ "$cmd" == "display-message" ]]; then
   done
   if [[ "$format" == "#{pane_in_mode}" ]]; then
     echo "0"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    if [[ "$target" == "${anchorPane}" ]]; then
+      printf '%s\t0\t9901\n' "${anchorPane}"
+    else
+      printf '%s\t0\t4201\n' "${livePane}"
+    fi
     exit 0
   fi
   if [[ "$format" == "#{pane_id}" ]]; then
@@ -2764,6 +2940,7 @@ JSON
   exit 1
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
+  printf '› \n'
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -3486,10 +3663,17 @@ exit 0
       await mkdir(fakeBinDir, { recursive: true });
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath, {
         failSendKeysMatch: 'Ralph loop active continue',
+        includeCanonicalWorker: true,
       }));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
-      await initTeamState('dispatch-team', 'task', 'executor', 1, wd);
+      await writeCanonicalWatcherTeamFixture(wd, {
+        teamName: 'dispatch-team',
+        sessionId: 'sess-control-plane',
+        ownerSessionId: 'sess-control-plane',
+        coarseState: 'active',
+      });
+      await rm(join(wd, '.omx', 'state', 'session.json'));
       const queued = await enqueueDispatchRequest('dispatch-team', {
         kind: 'inbox',
         to_worker: 'worker-1',
@@ -3533,7 +3717,7 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.last_reason, 'send_failed');
       assert.match(watcherState.ralph_continue_steer?.last_error ?? '', /send failed/i);
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t .* -l dispatch ping/);
+      assert.match(tmuxLog, /set-buffer -b [^\n]+ -- dispatch ping/);
 
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
       const logEntries = (await readFile(logPath, 'utf-8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
@@ -3560,26 +3744,17 @@ exit 0
     try {
       process.env.OMX_RUNTIME_BRIDGE = '0';
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath, { includeCanonicalWorker: true }));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
-      // Shared preflight now adds one 80-line capture per tick before the
-      // narrow retry check. Pre-capture on retries still returns "ready"
-      // (no trigger) so the request is retyped on every retry.
-      await writeFile(captureSeqFile, [
-        // Run 1 (attempt 0): 1 shared preflight + 3 verify rounds × 2 captures = 7
-        'ready', 'ping', 'ping', 'ping', 'ping', 'ping', 'ping',
-        // Run 2 (attempt 1): 1 shared preflight + 1 pre-capture + 3 verify rounds × 2 captures = 8
-        'ready', 'ready', 'ping', 'ping', 'ping', 'ping', 'ping', 'ping',
-        // Run 3 (attempt 2): 1 shared preflight + 1 pre-capture + 3 verify rounds × 2 captures = 8
-        'ready', 'ready', 'ping', 'ping', 'ping', 'ping', 'ping', 'ping',
-      ].join('\n'));
-
-      await initTeamState('dispatch-team', 'task', 'executor', 1, wd);
+      // Dispatch authority adds tmux probes before retry captures. Keep every
+      // scripted capture clear so all three attempts exercise the retype path.
+      await writeFile(captureSeqFile, Array.from({ length: 40 }, () => 'ready').join('\n'));
+      await writeCanonicalWatcherTeamFixture(wd);
       const queued = await enqueueDispatchRequest('dispatch-team', {
         kind: 'inbox',
         to_worker: 'worker-1',
         worker_index: 1,
-        pane_id: '%42',
+        pane_id: '%43',
         trigger_message: 'ping',
       }, wd);
 
@@ -3602,7 +3777,7 @@ exit 0
       }
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
+      const typeMatches = tmuxLog.match(/send-keys -t %43 -l ping/g) || [];
       assert.equal(typeMatches.length, 3, 'should retype on every retry when trigger not in narrow capture (fresh + 2 retries)');
 
       const request = await readDispatchRequest('dispatch-team', queued.request.request_id, wd);
@@ -4063,7 +4238,7 @@ exit 0
         sessionId: 'sess-parent-canonical',
         ownerSessionId: 'sess-parent-canonical',
       });
-      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath, { includeCanonicalWorker: true }));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;

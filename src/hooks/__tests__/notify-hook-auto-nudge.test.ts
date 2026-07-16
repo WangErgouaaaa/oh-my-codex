@@ -116,6 +116,17 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="\$1"
 shift || true
+if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf '%s\t0\t4242\n' "$target"
+  exit 0
+fi
 if [[ "\$cmd" == "capture-pane" ]]; then
   if [[ -n "\${OMX_TEST_CAPTURE_FILE:-}" && -f "\${OMX_TEST_CAPTURE_FILE}" ]]; then
     cat "\${OMX_TEST_CAPTURE_FILE}"

@@ -59,10 +59,15 @@ import {
   dismissTrustPromptIfPresent,
   evaluateStartupDirectTriggerSafetyCapture,
   mitigateCopyModeUnderlineArtifacts,
+  hasCurrentTmuxClientContext,
+  paneHasOmxInstanceTag,
+  paneHasOmxTeamOwnerTag,
 } from '../tmux-session.js';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
 import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
+import { createHudWatchPane, parseExactTmuxAuthorityLines, parseExactTmuxAuthorityScalar } from '../../hud/tmux.js';
+
 
 const fsMutable = fs as typeof fs & {
   existsSync: typeof fs.existsSync;
@@ -92,6 +97,17 @@ function withMockedExistsSync<T>(mock: typeof fs.existsSync, fn: () => T): T {
   }
 }
 
+  describe('shared tmux authority framing', () => {
+    it('rejects truncated, CR, and multiply-terminated Team authority observations', () => {
+      assert.deepEqual(parseExactTmuxAuthorityLines('%1 0 101\n%2 0 202\n'), ['%1 0 101', '%2 0 202']);
+      for (const malformed of ['%1 0 101', '%1 0 101\r\n', '%1 0 101\r', '%1 0 101\n\n', '%1 0 101\n%2 0 202']) {
+        assert.equal(parseExactTmuxAuthorityLines(malformed), null, JSON.stringify(malformed));
+      }
+      assert.equal(parseExactTmuxAuthorityScalar('%1\n'), '%1');
+      assert.equal(parseExactTmuxAuthorityScalar('%1\n%2\n'), null);
+    });
+  });
+
 function withMockedStatSync<T>(mock: typeof fs.statSync, fn: () => T): T {
   const original = fsMutable.statSync;
   fsMutable.statSync = mock;
@@ -107,6 +123,28 @@ function withMockedStatSync<T>(mock: typeof fs.statSync, fn: () => T): T {
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+function removeTmuxFormatExpressions(value: string): string {
+  let result = '';
+  for (let index = 0; index < value.length;) {
+    if (value[index] !== '#' || value[index + 1] !== '{') {
+      result += value[index]!;
+      index += 1;
+      continue;
+    }
+
+    let depth = 1;
+    index += 2;
+    while (index < value.length && depth > 0) {
+      if (value[index] === '{') depth += 1;
+      else if (value[index] === '}') depth -= 1;
+      index += 1;
+    }
+    assert.equal(depth, 0, 'tmux format expression must be framed');
+  }
+  return result;
+}
+
 
 const CLAUDE_BYPASS_PROMPT_CAPTURE = `Bypass Permissions mode
 
@@ -153,7 +191,235 @@ async function withMockTmuxFixture<T>(
   const previousPath = process.env.PATH;
 
   try {
-    await writeFile(tmuxStubPath, tmuxScript(logPath));
+    const fixturePath = join(fakeBinDir, 'tmux-fixture');
+    await writeFile(fixturePath, tmuxScript(logPath));
+    await chmod(fixturePath, 0o755);
+    await writeFile(tmuxStubPath, `#!/bin/sh
+set -eu
+fixture="$(dirname "$0")/tmux-fixture"
+state="$(dirname "$0")/tmux-split-state"
+command_state="$(dirname "$0")/tmux-split-command-state"
+pid_state="$(dirname "$0")/tmux-split-pid-state"
+
+
+owner_state="$(dirname "$0")/tmux-owner-state"
+command="\${1:-}"
+if [ "$command" = "if-shell" ]; then
+  "$fixture" "$@" >/dev/null
+  inner_command="\${6:-}"
+  case "$(dirname "$0"):$inner_command" in
+    *omx-tmux-send-pid-recycle-*:*"send-keys -t %9 -l --"*)
+      inner_command="\${7:-}"
+      ;;
+  esac
+  log_size=$(wc -c < "$(dirname "$0")/tmux.log")
+  set +e
+  eval "set -- $inner_command"
+  "$fixture" "$@"
+  status=$?
+  truncate -s "$log_size" "$(dirname "$0")/tmux.log"
+  exit "$status"
+fi
+if [ "$command" = "set-option" ]; then
+  if [ "\${2:-}" = "-g" ] && [ -n "\${3:-}" ]; then
+    "$fixture" "$@"
+    printf '%s\t%s\n' "\${3:-}" "\${4:-}" >> "$owner_state"
+    exit 0
+  fi
+  "$fixture" "$@"
+  if [ "\${2:-}" = "-p" ] && [ "\${3:-}" = "-t" ] && [ -n "\${4:-}" ] && [ -n "\${5:-}" ]; then
+    printf '%s\t%s\t%s\n' "\${4:-}" "\${5:-}" "\${6:-}" >> "$owner_state"
+  fi
+  exit 0
+fi
+if [ "$command" = "show-options" ] && [ "\${2:-}" = "-g" ] && [ "\${3:-}" = "-v" ]; then
+  test -f "$owner_state" || exit 1
+  value="$(while IFS="$(printf '\t')" read -r option stored extra; do
+    if [ "$option" = "\${4:-}" ] && [ -z "$extra" ]; then value="$stored"; fi
+  done < "$owner_state"; printf '%s' "\${value:-}")"
+  [ -n "$value" ] || exit 1
+  printf '%s\n' "$value"
+  exit 0
+fi
+if [ "$command" = "show-options" ] && [ "\${2:-}" = "-p" ] && [ "\${3:-}" = "-v" ] && [ "\${4:-}" = "-t" ]; then
+  test -f "$owner_state" || exit 1
+  value="$(while IFS="$(printf '\t')" read -r pane option stored; do
+    if [ "$pane" = "\${5:-}" ] && [ "$option" = "\${6:-}" ]; then printf '%s' "$stored"; fi
+  done < "$owner_state")"
+  [ -n "$value" ] || exit 1
+  printf '%s\n' "$value"
+  exit 0
+fi
+if [ "$command" = "split-window" ]; then
+  output="$("$fixture" "$@")"
+  printf '%s\n' "$output"
+  split_command=""
+  for arg in "$@"; do split_command="$arg"; done
+  case "$output" in
+    %0)
+      pane_pid=1000000000
+      printf '%s\n' "$output" >> "$state"
+      printf '%s\t%s\n' "$output" "$pane_pid" >> "$pid_state"
+      printf '%s\t%s\n' "$output" "$split_command" >> "$command_state"
+      ;;
+    %[1-9]*)
+      digits="\${output#%}"
+      case "$digits" in
+        *[!0-9]*) ;;
+        *)
+          if [ "\${#digits}" -lt 10 ] || { [ "\${#digits}" -eq 10 ] && [ "$digits" -le 4294967295 ]; }; then
+            pane_pid=$((1000000000 + digits))
+            printf '%s\n' "$output" >> "$state"
+            printf '%s\t%s\n' "$output" "$pane_pid" >> "$pid_state"
+            printf '%s\t%s\n' "$output" "$split_command" >> "$command_state"
+          fi
+          ;;
+      esac
+      ;;
+
+  esac
+  exit 0
+fi
+
+output="$("$fixture" "$@")"
+if [ "$command" = "list-panes" ]; then
+  format=""
+  previous=""
+  for arg in "$@"; do
+    if [ "$previous" = "-F" ]; then format="$arg"; break; fi
+    previous="$arg"
+  done
+  case "$format" in
+    '#{pane_id} #{pane_dead}'|'#{pane_id} #{pane_dead} #{pane_pid}')
+      normalized=""
+      original_output="$output"
+      legacy_liveness=1
+      while IFS= read -r row || [ -n "$row" ]; do
+        case "$row" in
+          %*)
+            set -- $row
+            if [ "$#" -eq 1 ]; then
+              if [ "$format" = '#{pane_id} #{pane_dead}' ]; then row="$row 0"; else digits="\${row#%}"; row="$row 0 $((1000000000 + digits))"; fi
+            elif [ "$#" -eq 2 ] && [ "$format" = '#{pane_id} #{pane_dead} #{pane_pid}' ]; then
+              pane_pid=""
+              if [ -f "$pid_state" ]; then
+                pane_pid="$(while IFS="$(printf '\t')" read -r stored_pane stored_pid; do if [ "$stored_pane" = "$1" ]; then printf '%s' "$stored_pid"; fi; done < "$pid_state")"
+              fi
+              if [ -z "$pane_pid" ]; then
+                case "$1" in
+                  %0) pane_pid=1000000000 ;;
+                  %[1-9]*)
+                    digits="\${1#%}"
+                    case "$digits" in *[!0-9]*) ;; *) pane_pid=$((1000000000 + digits)) ;; esac
+                    ;;
+                esac
+              fi
+              if [ -n "$pane_pid" ]; then row="$1 $2 $pane_pid"; else legacy_liveness=0; fi
+            else
+              legacy_liveness=0
+            fi
+            ;;
+          *) legacy_liveness=0 ;;
+        esac
+        if [ -n "$normalized" ]; then normalized="$(printf '%s\n%s' "$normalized" "$row")"; else normalized="$row"; fi
+      done <<EOF
+$output
+EOF
+      if [ "$legacy_liveness" = "1" ]; then output="$normalized"; else output="$original_output"; fi
+      ;;
+    '#{pane_dead} #{pane_pid}')
+      target=""
+      previous=""
+      for arg in "$@"; do
+        if [ "$previous" = "-t" ]; then target="$arg"; break; fi
+        previous="$arg"
+      done
+      pane_pid=""
+      if [ -f "$pid_state" ]; then
+        pane_pid="$(while IFS="$(printf '\t')" read -r stored_pane stored_pid; do if [ "$stored_pane" = "$target" ]; then printf '%s' "$stored_pid"; fi; done < "$pid_state")"
+      fi
+      if [ -n "$pane_pid" ]; then output="0 $pane_pid"; fi
+      ;;
+    '#{pane_pid}')
+      target=""
+      previous=""
+      for arg in "$@"; do
+        if [ "$previous" = "-t" ]; then target="$arg"; break; fi
+        previous="$arg"
+      done
+      if [ -f "$pid_state" ]; then
+        pane_pid="$(while IFS="$(printf '\t')" read -r stored_pane stored_pid; do if [ "$stored_pane" = "$target" ]; then printf '%s' "$stored_pid"; fi; done < "$pid_state")"
+        [ -n "$pane_pid" ] && output="$pane_pid"
+      fi
+      ;;
+    *pane_start_command*)
+      tab="$(printf '\t')"
+      normalized=""
+      while IFS= read -r row || [ -n "$row" ]; do
+        [ -n "$row" ] || continue
+        pane="\${row%%"$tab"*}"
+        stored_command=""
+        if [ -f "$command_state" ]; then
+          while IFS="$tab" read -r stored_pane stored_start_command; do
+            if [ "$stored_pane" = "$pane" ]; then stored_command="$stored_start_command"; fi
+          done < "$command_state"
+        fi
+        if [ -n "$stored_command" ]; then
+          case "$row" in
+            *"$tab"*"$tab"*) row="\${row%$tab*}$tab$stored_command" ;;
+            *) row="$pane$tab$stored_command" ;;
+          esac
+        else
+          case "$row" in *"$tab"*) ;; *) row="\${row}\${tab}zsh" ;; esac
+        fi
+        if [ -n "$normalized" ]; then normalized="$(printf '%s\n%s' "$normalized" "$row")"; else normalized="$row"; fi
+      done <<EOF
+$output
+EOF
+      if [ -f "$command_state" ]; then
+        while IFS="$tab" read -r stored_pane stored_start_command; do
+          present=0
+          while IFS= read -r row || [ -n "$row" ]; do
+            pane="\${row%%"$tab"*}"
+            if [ "$pane" = "$stored_pane" ]; then present=1; fi
+          done <<EOF
+$normalized
+EOF
+          if [ "$present" -eq 0 ]; then
+            if [ -n "$normalized" ]; then normalized="$(printf '%s\n%s\t%s' "$normalized" "$stored_pane" "$stored_start_command")"; else normalized="$stored_pane$tab$stored_start_command"; fi
+          fi
+        done < "$command_state"
+      fi
+      output="$normalized"
+      ;;
+  esac
+
+  if [ -f "$state" ] && { [ "$format" != '#{pane_id}\t#{pane_start_command}' ]; }; then
+    while read -r pane; do
+      present=0
+      tab="$(printf '\t')"
+      while IFS= read -r row || [ -n "$row" ]; do
+        observed_pane="\${row%%"$tab"*}"
+        observed_pane="\${observed_pane%% *}"
+        [ "$observed_pane" = "$pane" ] && present=1
+      done <<EOF
+$output
+EOF
+      [ "$present" -eq 1 ] && continue
+      case "$format" in
+        '#{pane_id}') output="$(printf '%s\n%s' "$output" "$pane")" ;;
+        '#{pane_id} #{pane_dead}') output="$(printf '%s\n%s 0' "$output" "$pane")" ;;
+        '#{pane_id} #{pane_dead} #{pane_pid}')
+          pane_pid="$(while IFS="$(printf '\t')" read -r stored_pane stored_pid; do if [ "$stored_pane" = "$pane" ]; then printf '%s' "$stored_pid"; fi; done < "$pid_state")"
+          [ -n "$pane_pid" ] && output="$(printf '%s\n%s 0 %s' "$output" "$pane" "$pane_pid")"
+          ;;
+        *pane_current_command*) output="$(printf '%s\n%s\tzsh\tzsh' "$output" "$pane")" ;;
+      esac
+    done < "$state"
+  fi
+fi
+printf '%s\n' "$output"
+`);
     await chmod(tmuxStubPath, 0o755);
     process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
     return await run({ logPath });
@@ -215,9 +481,12 @@ describe('HUD resize hook command builders', () => {
     assert.equal(buildResizeHookTarget('my-session', '3'), 'my-session:3');
   });
 
-  it('buildHudPaneTarget always returns %<pane_id>', () => {
+  it('buildHudPaneTarget returns only bounded canonical pane ids', () => {
     assert.equal(buildHudPaneTarget('%41'), '%41');
-    assert.equal(buildHudPaneTarget('41'), '%41');
+    for (const unsafePaneId of ['41', ' %41', '%41 ', '%01', '01', '%4294967296', '4294967296', '%18446744073709551616']) {
+      assert.throws(() => buildHudPaneTarget(unsafePaneId), /invalid_tmux_pane_id/);
+    }
+
   });
 
   it('buildRegisterResizeHookArgs uses target and numeric client-resized hook slot', () => {
@@ -232,10 +501,48 @@ describe('HUD resize hook command builders', () => {
     );
   });
 
-  it('buildUnregisterResizeHookArgs removes the exact numeric hook slot', () => {
+  it('uses one tmux-server conditional transaction for exact leader and HUD incarnations', () => {
+    const args = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%9', {
+      leaderPaneId: '%1',
+      leaderPanePid: '101',
+      hudPaneId: '%9',
+      hudPanePid: '909',
+    });
+    const hook = args[4] ?? '';
+    assert.equal((hook.match(/\btmux if-shell -F -t %1 /g) ?? []).length, 2);
+    assert.equal((hook.match(/'\\''if-shell -F -t %9 /g) ?? []).length, 2);
+    assert.match(hook, /'\\''#\{&&:#\{==:#\{pane_id\},%1\},#\{&&:#\{==:#\{pane_dead\},0\},#\{==:#\{pane_pid\},101\}\}\}'\\''/);
+    assert.match(hook, /#\{pane_dead\}/);
+    assert.match(hook, /%1.*101/);
+    assert.match(hook, /%9.*909/);
+    assert.doesNotMatch(hook, /list-panes|awk|env /);
+    assert.match(hook, /sleep .*\btmux if-shell -F -t %1 /);
+    assert.match(hook, /set-hook -u -t/);
+  });
+
+  it('uses PowerShell-safe server conditionals for same-id PID recycle before resize', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    try {
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      const hook = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%9', {
+        leaderPaneId: '%1', leaderPanePid: '101', hudPaneId: '%9', hudPanePid: '909',
+      })[4] ?? '';
+      assert.equal((hook.match(/& ''[^']+'' if-shell -F -t %1 /g) ?? []).length, 2);
+      assert.equal((hook.match(/''if-shell -F -t %9 /g) ?? []).length, 2);
+      assert.match(hook, /& ''[^']+'' if-shell -F -t %1 ''#\{&&:#\{==:#\{pane_id\},%1\},#\{&&:#\{==:#\{pane_dead\},0\},#\{==:#\{pane_pid\},101\}\}\}''/);
+      assert.doesNotMatch(removeTmuxFormatExpressions(hook), /list-panes|awk|env |\/dev\/null|&&|\|\|/);
+      assert.match(hook, /set-hook -u -t/);
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+    }
+  });
+
+  it('buildUnregisterResizeHookArgs atomically compares hook identity before removing its slot', () => {
     const registered = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1');
     const unregistered = buildUnregisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1');
-    assert.deepEqual(unregistered, ['set-hook', '-u', '-t', 'my-session:0', registered[3] as string]);
+    assert.deepEqual(unregistered.slice(0, 4), ['if-shell', '-F', '-t', 'my-session:0']);
+    assert.match(unregistered[4] ?? '', /^#\{==:@omx_hook_identity_client_resized_\d+,omx-[0-9a-f]+\}$/);
+    assert.match(unregistered[5] ?? '', new RegExp(`set-hook -u -t my-session:0 ${String(registered[3]).replace(/[\[\]]/g, '\\$&')}`));
   });
 
   it('buildClientAttachedReconcileHookName normalizes all segments into collision-safe tokens', () => {
@@ -255,10 +562,12 @@ describe('HUD resize hook command builders', () => {
     );
   });
 
-  it('buildUnregisterClientAttachedReconcileArgs removes the exact numeric client-attached slot', () => {
+  it('buildUnregisterClientAttachedReconcileArgs atomically compares hook identity before removing its slot', () => {
     const registered = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
     const unregistered = buildUnregisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1');
-    assert.deepEqual(unregistered, ['set-hook', '-u', '-t', 'my-session:0', registered[3] as string]);
+    assert.deepEqual(unregistered.slice(0, 4), ['if-shell', '-F', '-t', 'my-session:0']);
+    assert.match(unregistered[4] ?? '', /^#\{==:@omx_hook_identity_client_attached_\d+,omx-[0-9a-f]+\}$/);
+    assert.match(unregistered[5] ?? '', new RegExp(`set-hook -u -t my-session:0 ${String(registered[3]).replace(/[\[\]]/g, '\\$&')}`));
   });
 
   it('hook indices stay within signed 32-bit range (issue #240)', () => {
@@ -414,6 +723,102 @@ describe('sendToWorker validation', () => {
     );
   });
 
+  it('fails closed after submit when tmux capture is absent or unframed', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-send-unframed-capture-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    exit 1
+    ;;
+  send-keys)
+    ;;
+  *) exit 0 ;;
+esac
+`,
+      async () => {
+        await assert.rejects(
+          () => sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101'),
+          /failed pre_dispatch_scrollback/,
+        );
+      },
+    );
+  });
+
+  it('fails closed when the same pane ID changes PID between awaited dispatch sinks', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-send-pid-recycle-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+probe_file="$state_dir/liveness-probes"
+server_probe_file="$state_dir/server-liveness-probes"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  if-shell)
+    ;;
+  list-panes)
+    probes=0
+    if [ -f "$probe_file" ]; then probes=$(cat "$probe_file"); fi
+    probes=$((probes + 1))
+    printf '%s' "$probes" > "$probe_file"
+    if [ "$probes" -eq 1 ]; then printf '%%9 0 101\n'; else printf '%%9 0 202\n'; fi
+    ;;
+  capture-pane)
+    cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    ;;
+  send-keys)
+    exit 0
+    ;;
+  display-message)
+    printf '__omx_send_authority_rejected__\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        await assert.rejects(
+          () => sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101'),
+          /pane authority changed before literal typing/,
+        );
+        const log = await readFile(logPath, 'utf-8');
+        assert.doesNotMatch(log, /send-keys -t %9 -l -- check inbox/);
+      },
+    );
+  });
+
+  it('uses one server-atomic incarnation conditional for every send and capture sink', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-atomic-send-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    ;;
+  *) exit 0 ;;
+esac
+`,
+      async ({ logPath }) => {
+        await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /if-shell -F -t %9 #\{&&:#\{==:#\{pane_id},%9},#\{&&:#\{==:#\{pane_dead},0},#\{==:#\{pane_pid},101}}}/);
+        assert.match(log, /send-keys -t %9 -l -- "check inbox"/);
+        assert.match(log, /capture-pane -t %9 -p -S -80/);
+        assert.doesNotMatch(log, /^send-keys /m);
+      },
+    );
+  });
+
   it('auto-accepts the Claude bypass prompt before sending worker text', async () => {
     await withMockTmuxFixture(
       'omx-tmux-claude-bypass-send-',
@@ -436,7 +841,7 @@ EOF
     exit 0
     ;;
   send-keys)
-    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "2" ]; then
+    if [ "\${3:-}" = "%9" ] && [ "\${4:-}" = "C-m" ]; then
       : > "$accepted_file"
     fi
     exit 0
@@ -447,12 +852,12 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        await sendToWorker('omx-team-x', 1, 'check inbox');
+        await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
         const log = await readFile(logPath, 'utf-8');
-        const acceptIndex = log.indexOf('send-keys -t omx-team-x:1 -l -- 2');
-        const submitIndex = log.indexOf('send-keys -t omx-team-x:1 -l -- check inbox');
-        assert.notEqual(acceptIndex, -1, `expected bypass acceptance in log:\n${log}`);
-        assert.notEqual(submitIndex, -1, `expected worker text submission in log:\n${log}`);
+        const acceptIndex = log.indexOf('send-keys -t %9 "C-m"');
+        const submitIndex = log.indexOf('send-keys -t %9 -l -- "check inbox"');
+        assert.notEqual(acceptIndex, -1, `expected atomic bypass acceptance in log:\n${log}`);
+        assert.notEqual(submitIndex, -1, `expected atomic worker text submission in log:\n${log}`);
         assert.ok(acceptIndex < submitIndex, `expected bypass acceptance before worker text:\n${log}`);
       },
     );
@@ -497,16 +902,16 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        await sendToWorker('omx-team-x', 1, 'check inbox');
+        await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
         assert.equal(
           enterCount,
           2,
           `expected only the baseline submit presses when the queued banner is stale scrollback:\n${log}`,
         );
-        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
-        assert.match(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+        assert.match(log, /capture-pane -t %9 -p/);
+        assert.match(log, /capture-pane -t %9 -p -S -80/);
       },
     );
   });
@@ -569,9 +974,9 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        await sendToWorker('omx-team-x', 1, 'check inbox');
+        await sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected extra submit nudges when Codex queues the trigger:\n${log}`,
@@ -620,11 +1025,11 @@ esac
 `,
       async ({ logPath }) => {
         await assert.rejects(
-          () => sendToWorker('omx-team-x', 1, 'check inbox'),
+          () => sendToWorker('omx-team-x', 1, 'check inbox', '%9', 'codex', '101'),
           /submit_queued_after_tool_call/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing closed on stuck queued banner:\n${log}`,
@@ -671,11 +1076,11 @@ esac
 `,
       async ({ logPath }) => {
         await assert.rejects(
-          () => sendToWorker('omx-team-x', 1, trigger),
+          () => sendToWorker('omx-team-x', 1, trigger, '%9', 'codex', '101'),
           /submit_failed/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %9 "C-m"/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing on the still-visible wrapped draft:\n${log}`,
@@ -4167,6 +4572,24 @@ esac
     }
   });
 
+  it('rejects whitespace or multiline owner-tag proof output while accepting exactly framed values', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-owner-tag-framing-',
+      () => `#!/bin/sh
+case "$*" in
+  *'%1'*'@omx_pane_instance_id'*) printf 'owner\n' ;;
+  *'@omx_pane_instance_id'*) printf ' owner\n' ;;
+  *'@omx_team_pane_owner_id'*) printf 'owner\nextra\n' ;;
+esac
+`,
+      async () => {
+        assert.equal(paneHasOmxInstanceTag('%1', 'owner'), true);
+        assert.equal(paneHasOmxInstanceTag('%2', 'owner'), false);
+        assert.equal(paneHasOmxTeamOwnerTag('%1', 'owner'), false);
+      },
+    );
+  });
+
   it('does not reuse the Team pane owner token as the HUD logical session id', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-hud-session-boundary-'));
     const prevTmux = process.env.TMUX;
@@ -4343,7 +4766,7 @@ esac
           assert.equal(session.hudPaneId, '%4');
 
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %8/);
           assert.match(tmuxLog, /split-window -v -f -l 3 -t shared:0 -d -P -F #\{pane_id\}/);
         },
@@ -4658,7 +5081,7 @@ esac
 
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.match(tmuxLog, /split-window -v -l 3 -t %11/);
-          assert.doesNotMatch(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\}/);
+          assert.match(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\} #\{pane_pid\}/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %(?:11|44)/);
         },
       );
@@ -4675,6 +5098,95 @@ esac
       else delete process.env.WSL_INTEROP;
     }
   });
+  it('rejects a pre-existing worker split result before non-Windows pane authority', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-posix-split-provenance-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-posix-split-provenance-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        printf "%%2\\tzsh\\tzsh\\n"
+        ;;
+      *) printf "%%1\\n%%2\\n" ;;
+    esac
+    ;;
+  split-window)
+    echo "%2"
+    ;;
+  *)
+    ;;
+esac
+exit 0
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = dirname(logPath);
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          delete process.env.MSYSTEM;
+          delete process.env.OSTYPE;
+          delete process.env.WSL_DISTRO_NAME;
+          delete process.env.WSL_INTEROP;
+
+          assert.throws(
+            () => createTeamSession('POSIX split provenance', 1, cwd),
+            /failed to prove worker pane authority/,
+
+          );
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /split-window -h -t %1/);
+          assert.doesNotMatch(tmuxLog, /set-option -p -t %2/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /resize-pane .* -t %2/);
+          assert.doesNotMatch(tmuxLog, /select-pane .* -t %2/);
+        },
+      );
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 });
 
 describe('native Windows HUD reconciliation', () => {
@@ -4753,7 +5265,7 @@ exit 0
     }
   });
 
-  it('revalidates fresh Team HUD discovery ids before cleanup kill', async () => {
+  it('derives Team HUD cleanup only from the initial authorized pane snapshot', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-win32-hud-snapshot-'));
     const prevTmux = process.env.TMUX;
     const prevTmuxPane = process.env.TMUX_PANE;
@@ -4829,7 +5341,8 @@ exit 0
 
             assert.throws(
               () => createTeamSession(`Windows HUD snapshot ${index}`, 1, cwd),
-              /failed to validate initial team HUD pane id/,
+              /failed to prove worker pane authority/,
+
             );
 
             const tmuxLog = await readFile(logPath, 'utf-8');
@@ -4842,7 +5355,7 @@ exit 0
             assert.doesNotMatch(tmuxLog, new RegExp(`select-pane .* -t ${escapedPaneId}`));
             assert.doesNotMatch(tmuxLog, /kill-pane/);
             assert.doesNotMatch(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\}/);
-            assert.doesNotMatch(tmuxLog, /split-window/);
+            assert.doesNotMatch(tmuxLog, /split-window -h -t %1/);
           },
         );
       }
@@ -4908,11 +5421,10 @@ case "\${1:-}" in
         if [ -f "$probe_state" ]; then probe_count=$(cat "$probe_state"); fi
         probe_count=$((probe_count + 1))
         printf '%s' "$probe_count" > "$probe_state"
-        printf "%%1 0\\n"
-        if [ -f "$worker_state" ]; then
-          if [ "$probe_count" -eq 2 ]; then printf "%%2 1\\n"; else printf "%%2 0\\n"; fi
-        fi
-        if [ -f "$hud_state" ]; then printf "%%3 0\\n"; fi
+        printf "%%1 0 1000000001\\n"
+        if [ -f "$worker_state" ]; then printf "%%2 0 1000000002\\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3 0 1000000003\\n"; fi
+
         ;;
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
@@ -4973,6 +5485,22 @@ esac
           assert.match(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           const strictGlobalProbeCalls = tmuxLog.match(/list-panes -a -F #\{pane_id\} #\{pane_dead\}/g) ?? [];
           assert.ok(strictGlobalProbeCalls.length >= 6, tmuxLog);
+          const splitProofOptions = [...tmuxLog.matchAll(/set-option -g (@omx_split_owner_nonce_[a-f0-9]+) (%[0-9]+:split:[a-f0-9-]+)/g)];
+          assert.equal(splitProofOptions.length, 2, tmuxLog);
+          assert.equal(new Set(splitProofOptions.map((match) => match[1])).size, 2, tmuxLog);
+          assert.deepEqual(splitProofOptions.map((match) => match[2]?.split(':', 1)[0]), ['%2', '%3']);
+          const provisionalProofOptions = [...tmuxLog.matchAll(/set-option -g (@omx_split_owner_nonce_[a-f0-9]+) (pending:split:[a-f0-9-]+)/g)];
+          assert.equal(provisionalProofOptions.length, 2, tmuxLog);
+          for (const provisional of provisionalProofOptions) {
+            const option = provisional[1]!;
+            const boundProof = splitProofOptions.find((bound) => bound[1] === option);
+            assert.ok(boundProof, `missing bound proof for ${option}:\n${tmuxLog}`);
+            assert.match(boundProof[2]!, /:%?split:/);
+          }
+          assert.ok(
+            tmuxLog.indexOf(provisionalProofOptions[0]![0]!) < tmuxLog.indexOf('split-window'),
+            `the first split must have provisional rollback proof before it runs:\n${tmuxLog}`,
+          );
         },
       );
     } finally {
@@ -5033,9 +5561,10 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"#{pane_id} #{pane_dead}"*)
-        printf "%%1 0\\n"
-        if [ -f "$worker_state" ]; then printf "%%2 0\\n"; fi
-        if [ -f "$hud_state" ]; then printf "%%3 0\\n"; fi
+        printf "%%1 0 1000000001\\n"
+        if [ -f "$worker_state" ]; then printf "%%2 0 1000000002\\n"; fi
+        if [ -f "$hud_state" ]; then printf "%%3 0 1000000003\\n"; fi
+
         ;;
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
@@ -5118,7 +5647,7 @@ esac
     }
   });
 
-  it('rolls back a provenance-approved worker when the strict global probe reports duplicate pane records on native Windows', async () => {
+  it('rolls back a provenance-approved worker when the strict global probe reports any duplicate pane record on native Windows', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-win32-synthetic-pane-'));
     const prevTmux = process.env.TMUX;
     const prevTmuxPane = process.env.TMUX_PANE;
@@ -5154,7 +5683,8 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"#{pane_id} #{pane_dead}"*)
-        printf "%%1 0\\n%%2 0\\n%%2 0\\n"
+        printf "%%1 0 1000000001\n%%2 0 1000000002\n%%77 0 1000000077\n%%77 0 1000000077\n"
+
         ;;
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
@@ -5203,12 +5733,12 @@ esac
 
           assert.throws(
             () => createTeamSession('Windows Team', 1, cwd),
-            /worker pane 1 did not remain present/,
+            /failed to prove worker pane authority for worker 1/,
           );
 
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.match(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\}/);
-          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %1/);
         },
       );
@@ -5255,7 +5785,7 @@ printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
   list-panes)
     case "$*" in
-      *"#{pane_id} #{pane_dead}"*) printf "%%11 0\\n%%77 0\\n" ;;
+      *"#{pane_id} #{pane_dead}"*) printf "%%11 0 1000000011\\n%%77 0 1000000077\\n" ;;
       *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
       *"-a -F #{pane_id}"*) printf "%%11\\n%%77\\n" ;;
       *) printf "%%11\\n" ;;
@@ -5275,7 +5805,7 @@ exit 0
           assert.equal(restoreStandaloneHudPane('%11', cwd), null);
 
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.doesNotMatch(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\}/);
+          assert.match(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\} #\{pane_pid\}/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %(?:11|77)/);
           assert.doesNotMatch(tmuxLog, /resize-pane -t %77/);
         },
@@ -5323,7 +5853,11 @@ exit 0
       for (const [index, scenario] of scenarios.entries()) {
         await withMockTmuxFixture(
           `omx-tmux-win32-hud-provenance-${index}-`,
-          (logPath) => `#!/bin/sh
+          (logPath) => {
+            const splitCommandPath = `${logPath}.split-command`;
+            const ownerProofPath = `${logPath}.owner-proof`;
+
+            return `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
@@ -5338,12 +5872,47 @@ case "\${1:-}" in
     ;;
   list-panes)
     case "$*" in
+      *"-t %2 -F #{pane_pid}"*) printf "1000000002\\n" ;;
+
       *"#{pane_id} #{pane_dead}"*)
-        printf "%%1 0\\n%%2 0\\n"
-        ${scenario.preExistingPaneId ? `printf "%%9 0\\n"` : ':'}
+        printf "%%1 0 1000000001\n%%2 0 1000000002\n"
+        ${scenario.preExistingPaneId ? `printf "%%9 0 1000000009\n"` : ':'}
+
         ;;
-      *"pane_current_command"*) printf "${scenario.initialPaneRows}" ;;
-      *"-a -F #{pane_id}"*) printf "${scenario.globalPaneIds}" ;;
+      *"#{pane_current_command}"*"#{pane_start_command}"*)
+        printf "${scenario.initialPaneRows}"
+        if [ -f "${splitCommandPath}" ]; then
+          printf "%%2\tnode\t"
+          cat "${splitCommandPath}"
+          printf "\n"
+        fi
+        ;;
+
+      *"pane_start_command"*)
+        printf "%%1\tzsh\n"
+        if [ -f "${splitCommandPath}" ]; then
+          printf "%%2\t"
+          cat "${splitCommandPath}"
+          printf "\n"
+        fi
+        ;;
+      *"pane_current_command"*)
+        printf "${scenario.initialPaneRows}"
+        if [ -f "${splitCommandPath}" ]; then
+          printf "%%2\tnode\t"
+          cat "${splitCommandPath}"
+          printf "\n"
+        fi
+        ;;
+      *"-a -F #{pane_id}"*)
+        if [ -f "${splitCommandPath}" ]; then
+          printf "%%1\n%%2\n"
+          ${scenario.preExistingPaneId ? `printf "%%9\n"` : ':'}
+        else
+          printf "${scenario.globalPaneIds}"
+        fi
+        ;;
+
       *) printf "%%1\\n" ;;
     esac
     ;;
@@ -5352,6 +5921,17 @@ case "\${1:-}" in
       *" -h "*) echo "%2" ;;
       *) echo "${scenario.hudPaneId}" ;;
     esac
+      split_command=''
+      for arg do split_command="$arg"; done
+      printf '%s' "$split_command" > "${splitCommandPath}"
+    ;;
+  set-option)
+    owner_value=''
+    for arg do owner_value="$arg"; done
+    printf '%s\n' "$owner_value" > "${ownerProofPath}"
+    ;;
+  show-options)
+    if [ -f "${ownerProofPath}" ]; then cat "${ownerProofPath}"; fi
     ;;
   kill-pane|select-layout|set-window-option|select-pane|resize-pane|set-hook|run-shell)
     ;;
@@ -5359,7 +5939,8 @@ case "\${1:-}" in
     ;;
 esac
 exit 0
-`,
+`;
+          },
           async ({ logPath }) => {
             const fakeBinDir = join(logPath, '..');
             const geminiPath = join(fakeBinDir, 'gemini');
@@ -5379,12 +5960,12 @@ exit 0
 
             assert.throws(
               () => createTeamSession(`Windows HUD ${scenario.name}`, 1, cwd),
-              /failed to validate team HUD pane id/,
+              /failed to prove team HUD pane authority/,
             );
 
             const tmuxLog = await readFile(logPath, 'utf-8');
             const workerRollbackCalls = tmuxLog.match(/kill-pane -t %2/g) ?? [];
-            assert.equal(workerRollbackCalls.length, 1, scenario.name);
+            assert.equal(workerRollbackCalls.length, scenario.name === 'duplicate worker' ? 0 : 1, scenario.name);
             assert.doesNotMatch(tmuxLog, /kill-pane -t %1/);
             if (scenario.preExistingPaneId) {
               assert.doesNotMatch(tmuxLog, new RegExp(`kill-pane -t ${scenario.preExistingPaneId}`));
@@ -5418,7 +5999,59 @@ exit 0
     }
   });
 
-  it('fails closed before native Team or standalone HUD splits when the current target pane snapshot is unavailable', async () => {
+  it('rejects a newline-injected cross-window HUD metadata row before Team pane authority', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-injected-cross-window-row-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-injected-cross-window-row-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V) echo 'tmux 3.4' ;;
+  display-message) echo 'leader:0 %1' ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*) printf '%%1\\n%%30\\n' ;;
+      *"pane_current_command"*) printf "%%1\\tnode\\t'codex'\\n%%30\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%1' node /omx.js hud --watch\\n" ;;
+      *) printf '%%1\\n' ;;
+    esac
+    ;;
+  *) ;;
+esac
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = dirname(logPath);
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          process.env.TMUX = 'leader,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+
+          assert.throws(
+            () => createTeamSession('Injected Cross Window Row', 1, cwd),
+            /failed to establish current leader\/window\/global tmux pane agreement/,
+          );
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.doesNotMatch(tmuxLog, /set-option -p|kill-pane|split-window|resize-pane|select-pane/);
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before Team or standalone HUD splits when the current target pane snapshot is unavailable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-win32-snapshot-failure-'));
     const prevTmux = process.env.TMUX;
     const prevTmuxPane = process.env.TMUX_PANE;
@@ -5476,7 +6109,7 @@ exit 0
 
           assert.throws(
             () => createTeamSession('Windows Snapshot Failure', 1, cwd),
-            /failed to snapshot the current native Windows tmux target/,
+            /failed to establish current leader\/window\/global tmux pane agreement/,
           );
           assert.equal(restoreStandaloneHudPane('%1', cwd), null);
 
@@ -5505,6 +6138,31 @@ exit 0
     }
   });
 
+  it('treats an empty global pane snapshot as unavailable before standalone HUD mutation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-empty-global-snapshot-'));
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-empty-global-snapshot-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  list-panes) exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(restoreStandaloneHudPane('%1', cwd), null);
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}/);
+          assert.doesNotMatch(tmuxLog, /split-window|kill-pane|resize-pane|select-pane/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('rejects non-round-trippable split ids plus missing, similar, dead, malformed, and failed strict probes on native Windows', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-win32-strict-probe-'));
     const prevMsystem = process.env.MSYSTEM;
@@ -5517,22 +6175,30 @@ exit 0
       probe: string;
       splitOutput?: string;
       expectRollback?: boolean;
+      recycleAfterRecovery?: boolean;
       unsafePaneId?: string;
     }> = [
-      { name: 'missing exact id', probe: `printf "%%11 0\\n"` },
-      { name: 'similar id only', probe: `printf "%%11 0\\n%%440 0\\n"` },
-      { name: 'leading-zero observed id', probe: `printf "%%11 0\\n%%044 0\\n"` },
-      { name: '32-bit overflow observed id', probe: `printf "%%11 0\\n%%4294967296 0\\n"` },
-      { name: '64-bit overflow observed id', probe: `printf "%%11 0\\n%%18446744073709551616 0\\n"` },
-      { name: 'dead exact id', probe: `printf "%%11 0\\n%%44 1\\n"` },
-      { name: 'nonliteral status', probe: `printf "%%11 0\\n%%44 false\\n"` },
-      { name: 'missing status', probe: `printf "%%11 0\\n%%44\\n"` },
-      { name: 'extra status token', probe: `printf "%%11 0\\n%%44 0 123\\n"` },
-      { name: 'query failure', probe: 'exit 1' },
+      { name: 'same-id respawn after recovery', probe: `printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"`, recycleAfterRecovery: true, expectRollback: false },
+      { name: 'replayed exact command with changed pid', probe: `count=0; if [ -f "$probe_state" ]; then count=$(cat "$probe_state"); fi; count=$((count + 1)); printf '%s' "$count" > "$probe_state"; if [ "$count" -lt 4 ]; then printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"; else printf "%%11 0 1000000011\\n%%44 0 2000000044\\n"; fi`, expectRollback: false },
+      { name: 'missing exact id', probe: `printf "%%11 0 1000000011\\n"`, expectRollback: false },
+      { name: 'similar id only', probe: `printf "%%11 0 1000000011\\n%%440 0 1000000440\\n"`, expectRollback: false },
+      { name: 'leading-zero observed id', probe: `printf "%%11 0 1000000011\\n%%044 0 1000000044\\n"`, expectRollback: false },
+      { name: '32-bit overflow observed id', probe: `printf "%%11 0 1000000011\\n%%4294967296 0 1000000044\\n"`, expectRollback: false },
+      { name: '64-bit overflow observed id', probe: `printf "%%11 0 1000000011\\n%%18446744073709551616 0 1000000044\\n"`, expectRollback: false },
+      { name: 'dead exact id', probe: `printf "%%11 0 1000000011\\n%%44 1 1000000044\\n"`, expectRollback: false },
+      { name: 'nonliteral status', probe: `printf "%%11 0 1000000011\\n%%44 false 1000000044\\n"`, expectRollback: false },
+      { name: 'missing status', probe: `printf "%%11 0 1000000011\\n%%44\\n"`, expectRollback: false },
+      { name: 'extra status token', probe: `printf "%%11 0 1000000011\\n%%44 0 1000000044 extra\\n"`, expectRollback: false },
+      { name: 'query failure', probe: 'exit 1', expectRollback: false },
+      {
+        name: 'live then dead during stabilization',
+        probe: `count=0; if [ -f "$probe_state" ]; then count=$(cat "$probe_state"); fi; count=$((count + 1)); printf '%s' "$count" > "$probe_state"; if [ "$count" -eq 1 ]; then printf "%%11 0 1000000011\\n%%44 0 1000000044\\n"; else printf "%%11 0 1000000011\\n%%44 1 1000000044\\n"; fi`,
+        expectRollback: false,
+      },
       { name: 'extra split output', probe: ':', splitOutput: `printf "%%44\\nwarning\\n"`, expectRollback: false },
-      { name: 'leading-zero alias', probe: `printf "%%11 0\\n%%1 0\\n"`, splitOutput: `echo "%01"`, expectRollback: false, unsafePaneId: '%01' },
-      { name: '32-bit usize overflow', probe: `printf "%%11 0\\n"`, splitOutput: `echo "%4294967296"`, expectRollback: false, unsafePaneId: '%4294967296' },
-      { name: 'usize overflow', probe: `printf "%%11 0\\n"`, splitOutput: `echo "%18446744073709551616"`, expectRollback: false, unsafePaneId: '%18446744073709551616' },
+      { name: 'leading-zero alias', probe: `printf "%%11 0 1000000011\\n%%1 0 1000000001\\n"`, splitOutput: `echo "%01"`, expectRollback: false },
+      { name: '32-bit usize overflow', probe: `printf "%%11 0 1000000011\\n"`, splitOutput: `echo "%4294967296"`, expectRollback: false },
+      { name: 'usize overflow', probe: `printf "%%11 0 1000000011\\n"`, splitOutput: `echo "%18446744073709551616"`, expectRollback: false },
     ];
 
     try {
@@ -5547,29 +6213,75 @@ exit 0
           `omx-tmux-win32-strict-probe-${index}-`,
           (logPath) => `#!/bin/sh
 set -eu
+probe_state="$(dirname "${logPath}")/strict-probe-count"
+marker_probe_state="$(dirname "${logPath}")/marker-probe-count"
+split_created="$(dirname "${logPath}")/split-created"
+split_command_path="$(dirname "${logPath}")/split-command"
+owner_proof_path="$(dirname "${logPath}")/split-owner-proof"
+recycle_after_recovery=${scenario.recycleAfterRecovery ? '1' : '0'}
+force_strict_probe_failure=${scenario.recycleAfterRecovery ? '0' : '1'}
+
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
   list-panes)
     case "$*" in
-      *"#{pane_id} #{pane_dead}"*)
+      *pane_dead*)
         ${scenario.probe}
+        if [ "$force_strict_probe_failure" = '1' ] && [ -f "$split_created" ]; then exit 1; fi
+        ;;
+      *pane_start_command*)
+        if [ -f "$split_created" ]; then
+          marker_probe_count=0
+          if [ -f "$marker_probe_state" ]; then marker_probe_count=$(cat "$marker_probe_state"); fi
+          marker_probe_count=$((marker_probe_count + 1))
+          printf '%s' "$marker_probe_count" > "$marker_probe_state"
+          printf "%%11\\tzsh\\n"
+          if [ "$recycle_after_recovery" = '1' ] && [ "$marker_probe_count" -gt 2 ]; then
+            exit 1
+          else
+            printf "%%44\\t"
+            cat "$split_command_path"
+            printf "\\n"
+          fi
+        else
+          printf "%%11\\tzsh\\n"
+        fi
         ;;
       *"pane_current_command"*)
         printf "%%11\\tzsh\\tzsh\\n"
+        if [ -f "$split_created" ]; then printf "%%44\\tzsh\\tzsh\\n"; fi
         ;;
       *)
         printf "%%11\\n"
+        if [ -f "$split_created" ]; then printf "%%44\\n"; fi
         ;;
+
     esac
     exit 0
     ;;
   split-window)
+    touch "$split_created"
+    split_command=''
+    for arg do split_command="$arg"; done
+    printf '%s' "$split_command" > "$split_command_path"
     ${scenario.splitOutput ?? 'echo "%44"'}
+    exit 0
+
+    ;;
+  set-option)
+    owner_value=''
+    for arg do owner_value="$arg"; done
+    printf '%s\n' "$owner_value" > "$owner_proof_path"
+    exit 0
+    ;;
+  show-options)
+    if [ -f "$owner_proof_path" ]; then cat "$owner_proof_path"; fi
     exit 0
     ;;
   kill-pane|select-pane|resize-pane)
     exit 0
     ;;
+
   *)
     exit 0
     ;;
@@ -5579,16 +6291,18 @@ esac
             assert.equal(restoreStandaloneHudPane('%11', cwd), null, scenario.name);
 
             const tmuxLog = await readFile(logPath, 'utf-8');
-            const candidatePaneId = scenario.unsafePaneId ?? '%44';
+            const candidatePaneId = '%44';
             const escapedCandidatePaneId = escapeRegExp(candidatePaneId);
             const rollbackCalls = tmuxLog.match(new RegExp(`kill-pane -t ${escapedCandidatePaneId}`, 'g')) ?? [];
             assert.equal(rollbackCalls.length, scenario.expectRollback === false ? 0 : 1, scenario.name);
+            if (scenario.recycleAfterRecovery) {
+              const markerProbeCount = await readFile(join(dirname(logPath), 'marker-probe-count'), 'utf-8');
+              assert.equal(Number(markerProbeCount), 4, 'candidate recovery reaches PID rejection before final authority and rollback probes');
+            }
+
             assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
             assert.doesNotMatch(tmuxLog, new RegExp(`resize-pane -t ${escapedCandidatePaneId}`));
             assert.doesNotMatch(tmuxLog, new RegExp(`select-pane -t ${escapedCandidatePaneId}`));
-            if (scenario.expectRollback === false) {
-              assert.doesNotMatch(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\}/);
-            }
           },
         );
       }
@@ -5625,6 +6339,10 @@ printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
   list-panes)
     case "$*" in
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%11 0 1000000011\\n"
+        if [ -f "$hud_state" ]; then printf "%%44 0 1000000044\\n"; fi
+        ;;
       *"#{pane_id} #{pane_dead}"*)
         printf "%%11 0\\n"
         if [ -f "$hud_state" ]; then printf "%%44 0\\n"; fi
@@ -5688,6 +6406,69 @@ esac
     }
   });
 
+  it('validates the full fresh non-native standalone HUD batch before cleanup or reuse', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-hud-batch-'));
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const unsafePaneIds = ['%01', '%4294967296', '%18446744073709551616'];
+
+    try {
+      for (const [index, unsafePaneId] of unsafePaneIds.entries()) {
+        const printfUnsafePaneId = unsafePaneId.replace('%', '%%');
+        await withMockTmuxFixture(
+          `omx-tmux-standalone-hud-batch-${index}-`,
+          (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*) printf "%%11\\n%%44\\n%%45\\n" ;;
+      *)
+        printf "%%11\\n%%44\\n${printfUnsafePaneId}\\n"
+        ;;
+    esac
+    ;;
+  *)
+    ;;
+esac
+exit 0
+`,
+          async ({ logPath }) => {
+            delete process.env.MSYSTEM;
+            delete process.env.OSTYPE;
+            delete process.env.WSL_DISTRO_NAME;
+            delete process.env.WSL_INTEROP;
+
+            assert.equal(restoreStandaloneHudPane('%11', cwd), null);
+
+            const tmuxLog = await readFile(logPath, 'utf-8');
+            assert.match(tmuxLog, /list-panes -t %11/);
+            assert.doesNotMatch(tmuxLog, /kill-pane/);
+            assert.doesNotMatch(tmuxLog, /resize-pane/);
+            assert.doesNotMatch(tmuxLog, /select-pane/);
+            assert.doesNotMatch(tmuxLog, /split-window/);
+          },
+        );
+      }
+    } finally {
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('reuses an existing standalone HUD pane across repeated restore calls', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-reuse-hud-'));
 
@@ -5696,17 +6477,47 @@ esac
         'omx-tmux-reuse-standalone-hud-',
         (logPath) => {
           const statePath = `${logPath}.state`;
+          const commandPath = `${logPath}.command`;
+          const ownerProofPath = `${logPath}.owner-proof`;
+          const fixtureCommandStatePath = join(dirname(logPath), 'tmux-split-command-state');
+
+
           return `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
   list-panes)
     case "$*" in
-      *"pane_current_command"*)
-        printf '%%11\\tzsh\\tzsh\\n'
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf '%%11 0 1000000011\n'
+        if [ -f "${statePath}" ]; then printf "%%44 0 1000000044\n"; fi
+        ;;
+      *"#{pane_dead} #{pane_pid}"*)
+        case "$*" in
+          *"-t %11"*) printf '0 1000000011\n' ;;
+          *"-t %44"*) printf '0 1000000044\n' ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      *"#{pane_current_command}"*"#{pane_start_command}"*)
+        printf '%%11\tzsh\tzsh\n'
         if [ -f "${statePath}" ]; then
-          printf "%%44\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' /node /omx.js hud --watch\\n"
+          printf '%%44\tnode\t'
+          cat "${commandPath}"
+          printf '\n'
         fi
+        ;;
+
+      *"pane_start_command"*)
+        printf '%%11\\tzsh\\n'
+        if [ -f "${statePath}" ]; then
+          printf '%%44\t'
+          cat "${commandPath}"
+          printf '\\n'
+        fi
+        ;;
+      *"pane_current_command"*)
+        printf '%%11\tzsh\tzsh\n'
         ;;
       *)
         printf '%%11\\n'
@@ -5717,9 +6528,25 @@ case "\${1:-}" in
     ;;
   split-window)
     : > "${statePath}"
+    split_command=''
+    for arg do split_command="$arg"; done
+    printf '%s' "$split_command" > "${commandPath}"
     echo "%44"
     exit 0
     ;;
+  set-option)
+    owner_value=''
+    for arg do owner_value="$arg"; done
+    printf '%s\n' "$owner_value" > "${ownerProofPath}"
+    ;;
+  show-options)
+    if [ -f "${ownerProofPath}" ]; then cat "${ownerProofPath}"; fi
+    ;;
+  select-pane)
+    printf '%%44\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='"'"'%%11'"'"' node /omx.js hud --watch\n' > "${fixtureCommandStatePath}"
+    exit 0
+    ;;
+
   run-shell|select-pane|resize-pane|set-hook|kill-pane)
     exit 0
     ;;
@@ -5759,6 +6586,12 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
+      *) printf "%%11\\n" ;;
+    esac
+    ;;
   display-message)
     case "$*" in
       *"#{pane_current_path}"*)
@@ -5813,6 +6646,12 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
+      *) printf "%%11\\n" ;;
+    esac
+    ;;
   display-message)
     case "$*" in
       *"#{pane_current_path}"*)
@@ -5892,6 +6731,12 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
+      *) printf "%%11\\n" ;;
+    esac
+    ;;
   display-message)
     case "$*" in
       *"#{pane_current_path}"*)
@@ -5990,6 +6835,12 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
+      *) printf "%%11\\n" ;;
+    esac
+    ;;
   display-message)
     case "$*" in
       *"#{pane_current_path}"*)
@@ -6079,6 +6930,12 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
+      *) printf "%%11\\n" ;;
+    esac
+    ;;
   split-window)
     echo "%44"
     exit 0
@@ -6127,6 +6984,12 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
+      *) printf "%%11\\n" ;;
+    esac
+    ;;
   split-window)
     echo "%44"
     exit 0
@@ -6168,6 +7031,12 @@ esac
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%11\\tzsh\\tzsh\\n" ;;
+      *) printf "%%11\\n" ;;
+    esac
+    ;;
   split-window)
     echo "%44"
     exit 0
@@ -6281,7 +7150,8 @@ describe('isWorkerAlive', () => {
     });
   });
 
-  it('treats an existing non-dead pane id as live even when pane_pid is unavailable', async () => {
+  it('fails closed when a pane liveness row omits its PID', async () => {
+
     await withMockTmuxFixture(
       'omx-pane-id-liveness-',
       (logPath) => `#!/bin/sh
@@ -6305,8 +7175,8 @@ case "\${1:-}" in
 esac
 `,
       async () => {
-        assert.equal(isWorkerAlive('ignored-session', 1, '%77'), true);
-        assert.equal(isWorkerPaneOpen('ignored-session', 1, '%77'), true);
+        assert.equal(isWorkerAlive('ignored-session', 1, '%77'), false);
+        assert.equal(isWorkerPaneOpen('ignored-session', 1, '%77'), false);
         assert.equal(isWorkerAlive('ignored-session', 2, '%88'), false);
       },
     );
@@ -6461,6 +7331,27 @@ describe('isNativeWindows', () => {
       assert.equal(isNativeWindows(), false);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+    }
+  });
+});
+
+describe('current tmux context parsing', () => {
+  it('rejects a current-context response with trailing fields', async () => {
+    const previousTmuxPane = process.env.TMUX_PANE;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-context-trailing-fields-',
+        () => `#!/bin/sh
+if [ "$1" = "display-message" ]; then printf '%s\\n' 'leader:0 %1 trailing'; fi
+`,
+        async () => {
+          process.env.TMUX_PANE = '%1';
+          assert.equal(hasCurrentTmuxClientContext(), false);
+        },
+      );
+    } finally {
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
     }
   });
 });
@@ -6717,6 +7608,59 @@ exit 0
     );
   });
 
+  it('rejects non-round-trippable pane ids before constructing teardown kill targets', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-teardown-invalid-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+exit 0
+`,
+      async ({ logPath }) => {
+        const unsafePaneIds = ['%01', '%4294967296', '%18446744073709551616'];
+        const summary = await teardownWorkerPanes(unsafePaneIds, {
+          leaderPaneId: '%1',
+          graceMs: 1,
+        });
+
+        assert.deepEqual(summary.attemptedPaneIds, []);
+        assert.equal(summary.excluded.invalid, unsafePaneIds.length);
+        assert.equal(summary.kill.attempted, 0);
+        const log = await readFile(logPath, 'utf-8').catch(() => '');
+        for (const paneId of unsafePaneIds) {
+          assert.doesNotMatch(log, new RegExp(`kill-pane -t ${escapeRegExp(paneId)}`));
+        }
+      },
+    );
+  });
+
+  it('fails teardown atomically for invalid guards, mixed targets, or duplicate targets', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-teardown-atomic-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+exit 0
+`,
+      async ({ logPath }) => {
+        const scenarios = [
+          { paneIds: ['%3', '%4'], options: { leaderPaneId: '%01' } },
+          { paneIds: ['%3', '%4'], options: { hudPaneId: '%01' } },
+          { paneIds: ['%3', '%01'], options: { leaderPaneId: '%1' } },
+          { paneIds: ['%3', '%3'], options: { hudPaneId: '%2' } },
+        ];
+        for (const { paneIds, options } of scenarios) {
+          const summary = await teardownWorkerPanes(paneIds, { ...options, graceMs: 1 });
+          assert.deepEqual(summary.attemptedPaneIds, []);
+          assert.equal(summary.kill.attempted, 0);
+          assert.ok(summary.excluded.invalid > 0);
+        }
+        const log = await readFile(logPath, 'utf-8').catch(() => '');
+        assert.doesNotMatch(log, /kill-pane/);
+      },
+    );
+  });
+
   it('uses pane-id-direct kill semantics without liveness-gated helper calls', async () => {
     const source = await readFile(new URL('../tmux-session.js', import.meta.url), 'utf-8');
     const primitiveBlock = source.split('export async function teardownWorkerPanes')[1] ?? '';
@@ -6724,7 +7668,7 @@ exit 0
     assert.equal(primitiveBlock.includes('killWorker('), false);
   });
 
-  it('continues best-effort when a pane target is missing', async () => {
+  it('aborts remaining sinks when an earlier pane kill fails', async () => {
     await withMockTmuxFixture(
       'omx-tmux-teardown-missing-',
       (logPath) => `#!/bin/sh
@@ -6739,11 +7683,52 @@ exit 0
       async ({ logPath }) => {
         const summary = await teardownWorkerPanes(['%404', '%405'], { graceMs: 1 });
         assert.equal(summary.kill.attempted, 2);
-        assert.equal(summary.kill.succeeded, 1);
+        assert.equal(summary.kill.succeeded, 0);
         assert.equal(summary.kill.failed, 1);
         const log = await readFile(logPath, 'utf-8');
         assert.match(log, /kill-pane -t %404/);
-        assert.match(log, /kill-pane -t %405/);
+        assert.doesNotMatch(log, /kill-pane -t %405/);
+      },
+    );
+  });
+
+  it('aborts remaining sinks when a later pane ownership changes after the first kill', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-teardown-drift-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+if [ "$1" = 'list-panes' ]; then
+  if [ "$2" = '-a' ]; then
+    printf '%%4\\n%%5\\n'
+  elif [ "$5" = '#{pane_id}' ]; then
+    printf '%%4\\n%%5\\n'
+  else
+    printf '%%4\\tbash\\tbash\\n%%5\\tbash\\tbash\\n'
+  fi
+elif [ "$1" = 'show-option' ]; then
+  if [ "$5" = '%5' ] && [ -f "${logPath}.first-kill" ]; then printf 'team:foreign\\n'; else printf 'team:target\\n'; fi
+elif [ "$1" = 'kill-pane' ] && [ "$3" = '%4' ]; then
+  : > "${logPath}.first-kill"
+elif [ "$1" = 'kill-pane' ] && [ "$3" = '%5' ]; then
+  exit 99
+fi
+exit 0
+`,
+      async ({ logPath }) => {
+        const summary = await teardownWorkerPanes(['%4', '%5'], {
+          graceMs: 1,
+          authority: {
+            sessionName: 'team:0',
+            expectedOwnerId: 'team:target',
+            expectedPanePids: new Map([['%4', '1000000004'], ['%5', '1000000005']]),
+          },
+        });
+        assert.equal(summary.kill.succeeded, 1);
+        assert.equal(summary.kill.failed, 1);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /kill-pane -t %4/);
+        assert.doesNotMatch(log, /kill-pane -t %5/);
       },
     );
   });

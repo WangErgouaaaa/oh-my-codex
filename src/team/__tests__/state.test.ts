@@ -45,8 +45,12 @@ import {
   readMonitorSnapshot,
   resolveDispatchLockTimeoutMs,
   writeTeamManifestV2,
+  readTeamStateOutcome,
 } from '../state.js';
+
 import { normalizeDispatchRequest } from '../state/dispatch.js';
+import { buildResizeHookName, buildUnregisterResizeHookArgs } from '../tmux-session.js';
+
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
@@ -284,6 +288,268 @@ describe('team state', () => {
     }
   });
 
+  it('fails closed when persisted team pane identities are noncanonical, overflowed, or ambiguous', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-pane-identities-'));
+    try {
+      await initTeamState('team-pane-identities', 't', 'executor', 2, cwd);
+      const root = join(cwd, '.omx', 'state', 'team', 'team-pane-identities');
+      const manifestPath = join(root, 'manifest.v2.json');
+      const baseline = await readFile(manifestPath, 'utf8');
+      const cases: Array<{ name: string; update: (manifest: Record<string, unknown>) => void }> = [
+        {
+          name: 'leading-zero leader',
+          update: (manifest) => { manifest.leader_pane_id = '%01'; },
+        },
+        {
+          name: 'overflowed HUD',
+          update: (manifest) => { manifest.hud_pane_id = '%4294967296'; },
+        },
+        {
+          name: 'large overflowed worker',
+          update: (manifest) => {
+            (manifest.workers as Array<Record<string, unknown>>)[0]!.pane_id = '%18446744073709551616';
+          },
+        },
+        {
+          name: 'duplicate worker panes',
+          update: (manifest) => {
+            const workers = manifest.workers as Array<Record<string, unknown>>;
+            workers[0]!.pane_id = '%21';
+            workers[1]!.pane_id = '%21';
+          },
+        },
+        {
+          name: 'leader and worker collision',
+          update: (manifest) => {
+            manifest.leader_pane_id = '%22';
+            (manifest.workers as Array<Record<string, unknown>>)[0]!.pane_id = '%22';
+          },
+        },
+      ];
+
+      for (const testCase of cases) {
+        const manifest = JSON.parse(baseline) as Record<string, unknown>;
+        testCase.update(manifest);
+        await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+        assert.equal(await readTeamManifestV2('team-pane-identities', cwd), null, testCase.name);
+        assert.deepEqual(await readTeamStateOutcome('team-pane-identities', cwd), {
+          status: 'invalid',
+          source: 'manifest',
+          reason: 'malformed',
+        }, testCase.name);
+        assert.equal(await readTeamConfig('team-pane-identities', cwd), null, testCase.name);
+
+      }
+
+      await rm(manifestPath, { force: true });
+      const configPath = join(root, 'config.json');
+      const legacyConfig = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+      (legacyConfig.workers as Array<Record<string, unknown>>)[0]!.pane_id = '%01';
+      await writeFile(configPath, JSON.stringify(legacyConfig, null, 2));
+      assert.equal(await readTeamConfig('team-pane-identities', cwd), null);
+      assert.deepEqual(await readTeamStateOutcome('team-pane-identities', cwd), {
+        status: 'invalid',
+        source: 'config',
+        reason: 'malformed',
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects incomplete or semantically inconsistent V2 manifests before normalization', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-strict-v2-manifest-'));
+    const teamName = 'team-strict-v2-manifest';
+    try {
+      await initTeamState(teamName, 't', 'executor', 2, cwd);
+      const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
+      const baseline = await readFile(manifestPath, 'utf8');
+      const cases: Array<{ name: string; update: (manifest: Record<string, unknown>) => void }> = [
+        { name: 'missing policy field', update: (manifest) => { delete (manifest.policy as Record<string, unknown>).dispatch_mode; } },
+        { name: 'invalid policy enum', update: (manifest) => { (manifest.policy as Record<string, unknown>).worker_launch_mode = 'background'; } },
+        { name: 'missing permissions field', update: (manifest) => { delete (manifest.permissions_snapshot as Record<string, unknown>).network_access; } },
+        { name: 'blank leader identity', update: (manifest) => { (manifest.leader as Record<string, unknown>).worker_id = ' '; } },
+        { name: 'unsafe task counter', update: (manifest) => { manifest.next_task_id = Number.MAX_SAFE_INTEGER + 1; } },
+        { name: 'worker count mismatch', update: (manifest) => { manifest.worker_count = 1; } },
+        { name: 'duplicate worker identity', update: (manifest) => {
+          const workers = manifest.workers as Array<Record<string, unknown>>;
+          workers[1]!.name = workers[0]!.name;
+        } },
+        { name: 'noncanonical blank pane', update: (manifest) => { (manifest.workers as Array<Record<string, unknown>>)[0]!.pane_id = ''; } },
+        { name: 'stale next worker index', update: (manifest) => { manifest.next_worker_index = 2; } },
+        { name: 'partial resize hook metadata', update: (manifest) => { manifest.resize_hook_name = 'omx_resize'; } },
+      ];
+      for (const testCase of cases) {
+        const manifest = JSON.parse(baseline) as Record<string, unknown>;
+        testCase.update(manifest);
+        await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+        assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+          status: 'invalid', source: 'manifest', reason: 'malformed',
+        }, testCase.name);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects matching noncanonical resize hook metadata, including hash-slot aliases', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-resize-hook-authority-'));
+    const teamName = 'b0';
+    const configPath = join(cwd, '.omx', 'state', 'team', teamName, 'config.json');
+    const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
+    try {
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const baselineConfig = await readFile(configPath, 'utf8');
+      const baselineManifest = await readFile(manifestPath, 'utf8');
+      const hookGeneration = {
+        target: 'leader:0',
+        hudPaneId: '%3',
+      };
+      const [sessionName, windowIndex] = hookGeneration.target.split(':');
+      assert.ok(sessionName);
+      assert.ok(windowIndex);
+      const canonicalHookName = buildResizeHookName(teamName, sessionName, windowIndex, hookGeneration.hudPaneId);
+      const aliasHookName = buildResizeHookName('aO', sessionName, windowIndex, hookGeneration.hudPaneId);
+      assert.notEqual(aliasHookName, canonicalHookName);
+      const currentGeneration = buildUnregisterResizeHookArgs(hookGeneration.target, canonicalHookName);
+      const aliasGeneration = buildUnregisterResizeHookArgs(hookGeneration.target, aliasHookName);
+      assert.notEqual(aliasGeneration[4], currentGeneration[4]);
+      assert.equal(aliasGeneration[5], currentGeneration[5]);
+
+      for (const resizeHookName of [
+        buildResizeHookName(teamName, sessionName, windowIndex, '%4'),
+        aliasHookName,
+      ]) {
+        const config = JSON.parse(baselineConfig) as Record<string, unknown>;
+        const manifest = JSON.parse(baselineManifest) as Record<string, unknown>;
+        for (const state of [config, manifest]) {
+          state.tmux_session = hookGeneration.target;
+          state.hud_pane_id = hookGeneration.hudPaneId;
+          state.resize_hook_name = resizeHookName;
+          state.resize_hook_target = hookGeneration.target;
+        }
+        await writeFile(configPath, JSON.stringify(config, null, 2));
+        await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+        assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+          status: 'invalid', source: 'config', reason: 'malformed',
+        });
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed or divergent config.json when a valid manifest is present', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-config-projection-'));
+    const teamName = 'team-config-projection';
+    const configPath = join(cwd, '.omx', 'state', 'team', teamName, 'config.json');
+    try {
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const baseline = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+      const cases: Array<{ name: string; update: (config: Record<string, unknown>) => void }> = [
+        { name: 'invalid worker domain', update: (config) => { (config.workers as Array<Record<string, unknown>>)[0]!.name = 'INVALID'; } },
+        { name: 'blank leader pane identifier', update: (config) => { config.leader_pane_id = ' '; } },
+        { name: 'blank worker pane identifier', update: (config) => { (config.workers as Array<Record<string, unknown>>)[0]!.pane_id = ''; } },
+        { name: 'blank pane owner metadata', update: (config) => { config.tmux_pane_owner_id = ' '; } },
+        { name: 'unsafe counter', update: (config) => { config.next_worker_index = 1; } },
+        { name: 'omitted task counter', update: (config) => { delete config.next_task_id; } },
+        { name: 'omitted worker counter', update: (config) => { delete config.next_worker_index; } },
+        { name: 'agent type divergence', update: (config) => { config.agent_type = 'planner'; } },
+        { name: 'max workers divergence', update: (config) => { config.max_workers = DEFAULT_MAX_WORKERS - 1; } },
+        { name: 'manifest divergence', update: (config) => { config.task = 'other task'; } },
+      ];
+      for (const testCase of cases) {
+        const config = JSON.parse(JSON.stringify(baseline)) as Record<string, unknown>;
+        testCase.update(config);
+        await writeFile(configPath, JSON.stringify(config, null, 2));
+        assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+          status: 'invalid', source: 'config', reason: 'malformed',
+        }, testCase.name);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('distinguishes authoritative absence from malformed and unreadable persisted Team state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-outcome-'));
+    const teamName = 'team-state-outcome';
+    const root = join(cwd, '.omx', 'state', 'team', teamName);
+    const configPath = join(root, 'config.json');
+    const manifestPath = join(root, 'manifest.v2.json');
+    try {
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), { status: 'absent' });
+
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const malformedBlankManifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+      malformedBlankManifest.leader_pane_id = '';
+      malformedBlankManifest.hud_pane_id = '';
+      (malformedBlankManifest.workers as Array<Record<string, unknown>>)[0]!.pane_id = '';
+      await writeFile(manifestPath, JSON.stringify(malformedBlankManifest, null, 2));
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid', source: 'manifest', reason: 'malformed',
+      });
+
+      await writeFile(manifestPath, '{');
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid',
+        source: 'manifest',
+        reason: 'malformed',
+      });
+
+      await rm(manifestPath, { force: true });
+      await writeFile(configPath, '{');
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid',
+        source: 'config',
+        reason: 'malformed',
+      });
+
+      await rm(configPath, { force: true });
+      await mkdir(configPath);
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid',
+        source: 'config',
+        reason: 'unreadable',
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects partial Team roots and foreign persisted owner tokens atomically', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-strict-state-'));
+    const teamName = 'team-strict-state';
+    const root = join(cwd, '.omx', 'state', 'team', teamName);
+    const configPath = join(root, 'config.json');
+    const manifestPath = join(root, 'manifest.v2.json');
+    try {
+      await mkdir(root, { recursive: true });
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid', source: 'config', reason: 'incomplete',
+      });
+
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      await rm(manifestPath, { force: true });
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid', source: 'manifest', reason: 'incomplete',
+      });
+
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const config = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+      config.tmux_pane_owner_id = 'team:team-strict-state';
+      manifest.tmux_pane_owner_id = 'team:foreign-team:nonce';
+      await writeFile(configPath, JSON.stringify(config));
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid', source: 'manifest', reason: 'malformed',
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('migrateV1ToV2 writes manifest.v2.json idempotently from legacy config.json', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-migrate-'));
     try {
@@ -292,6 +558,11 @@ describe('team state', () => {
       // Simulate a legacy team by removing v2 manifest.
       const root = join(cwd, '.omx', 'state', 'team', 'team-mig');
       await rm(join(root, 'manifest.v2.json'), { force: true });
+      const configPath = join(root, 'config.json');
+      const legacyConfig = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+      legacyConfig.schema_version = 1;
+      await writeFile(configPath, JSON.stringify(legacyConfig, null, 2));
+
 
       const m1 = await migrateV1ToV2('team-mig', cwd);
       assert.ok(m1);
@@ -306,78 +577,74 @@ describe('team state', () => {
     }
   });
 
-  it('backfills missing or blank tmux pane owner ids in legacy manifests', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-pane-owner-backfill-'));
+  it('never reconstructs a deleted v2 manifest from current config state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-current-config-only-'));
+    const teamName = 'team-current-config-only';
+    const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
     try {
-      await initTeamState('team-pane-owner-backfill', 't', 'executor', 1, cwd);
-      const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-pane-owner-backfill', 'manifest.v2.json');
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
-      delete manifest.tmux_pane_owner_id;
-      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
-
-      const loadedManifest = await readTeamManifestV2('team-pane-owner-backfill', cwd);
-      const loadedConfig = await readTeamConfig('team-pane-owner-backfill', cwd);
-      assert.equal(loadedManifest?.tmux_pane_owner_id, 'team:team-pane-owner-backfill');
-      assert.equal(loadedConfig?.tmux_pane_owner_id, 'team:team-pane-owner-backfill');
-
-      await writeTeamManifestV2({
-        ...loadedManifest!,
-        tmux_pane_owner_id: '   ',
-      }, cwd);
-
-      const blankNormalized = await readTeamManifestV2('team-pane-owner-backfill', cwd);
-      assert.equal(blankNormalized?.tmux_pane_owner_id, 'team:team-pane-owner-backfill');
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      await rm(manifestPath, { force: true });
+      assert.equal(await migrateV1ToV2(teamName, cwd), null);
+      assert.equal(existsSync(manifestPath), false);
+      assert.deepEqual(await readTeamStateOutcome(teamName, cwd), {
+        status: 'invalid', source: 'manifest', reason: 'incomplete',
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('normalizes legacy manifest policy with dispatch defaults, timeout bounds, and governance split', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-policy-'));
+  it('migrates config-only legacy state through the explicit legacy reader', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-migrate-legacy-config-'));
+    const teamName = 'team-migrate-legacy-config';
+    try {
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const root = join(cwd, '.omx', 'state', 'team', teamName);
+      const configPath = join(root, 'config.json');
+      await rm(join(root, 'manifest.v2.json'), { force: true });
+      const legacyConfig = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+      delete legacyConfig.next_task_id;
+      delete legacyConfig.next_worker_index;
+      delete legacyConfig.tmux_pane_owner_id;
+      legacyConfig.schema_version = 1;
+      await writeFile(configPath, JSON.stringify(legacyConfig, null, 2));
+
+      const manifest = await migrateV1ToV2(teamName, cwd);
+      assert.ok(manifest);
+      assert.equal(manifest?.agent_type, 'executor');
+      assert.equal(manifest?.max_workers, DEFAULT_MAX_WORKERS);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects incomplete V2 owner and policy metadata instead of normalizing it', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-boundary-'));
     try {
       await initTeamState('team-policy', 't', 'executor', 1, cwd);
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'team-policy', 'manifest.v2.json');
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
-      const policy = (manifest.policy ?? {}) as Record<string, unknown>;
-      delete policy.dispatch_mode;
-      policy.dispatch_ack_timeout_ms = 999_999;
-      policy.delegation_only = true;
-      policy.nested_teams_allowed = true;
-      policy.cleanup_requires_all_workers_inactive = false;
-      policy.team_decomposition = { decomposition_source: 'dag_sidecar' };
-      manifest.policy = policy;
-      delete manifest.governance;
-      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
-
-      const loaded = await readTeamManifestV2('team-policy', cwd);
-      assert.equal(loaded?.policy.dispatch_mode, 'hook_preferred_with_fallback');
-      assert.equal(loaded?.policy.dispatch_ack_timeout_ms, 10_000);
-      assert.equal(loaded?.governance.delegation_only, true);
-      assert.equal(loaded?.governance.nested_teams_allowed, true);
-      assert.equal(loaded?.governance.cleanup_requires_all_workers_inactive, false);
-      assert.equal('delegation_only' in (loaded?.policy ?? {}), false);
-      assert.equal('nested_teams_allowed' in (loaded?.policy ?? {}), false);
-      assert.equal('cleanup_requires_all_workers_inactive' in (loaded?.policy ?? {}), false);
-      assert.equal('team_decomposition' in (loaded?.policy ?? {}), false);
-      assert.deepEqual(loaded?.team_decomposition, { decomposition_source: 'dag_sidecar' });
-
-      const freshCwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-policy-default-'));
-      try {
-        await initTeamState('team-policy-default', 't', 'executor', 1, freshCwd);
-        const fresh = await readTeamManifestV2('team-policy-default', freshCwd);
-        assert.equal(fresh?.policy.dispatch_ack_timeout_ms, 2_000);
-        assert.equal(fresh?.governance.cleanup_requires_all_workers_inactive, true);
-
-        const freshManifestPath = join(freshCwd, '.omx', 'state', 'team', 'team-policy-default', 'manifest.v2.json');
-        const persisted = JSON.parse(await readFile(freshManifestPath, 'utf8')) as {
-          policy?: Record<string, unknown>;
-          governance?: Record<string, unknown>;
-        };
-        assert.equal('delegation_only' in (persisted.policy ?? {}), false);
-        assert.equal(persisted.governance?.delegation_only, false);
-      } finally {
-        await rm(freshCwd, { recursive: true, force: true });
+      const baseline = await readFile(manifestPath, 'utf8');
+      const cases: Array<{ name: string; update: (manifest: Record<string, unknown>) => void }> = [
+        { name: 'missing owner', update: (manifest) => { delete manifest.tmux_pane_owner_id; } },
+        { name: 'blank owner', update: (manifest) => { manifest.tmux_pane_owner_id = '   '; } },
+        { name: 'missing dispatch mode', update: (manifest) => { delete (manifest.policy as Record<string, unknown>).dispatch_mode; } },
+        { name: 'out of range dispatch timeout', update: (manifest) => { (manifest.policy as Record<string, unknown>).dispatch_ack_timeout_ms = 999_999; } },
+        { name: 'missing governance', update: (manifest) => { delete manifest.governance; } },
+      ];
+      for (const testCase of cases) {
+        const manifest = JSON.parse(baseline) as Record<string, unknown>;
+        testCase.update(manifest);
+        await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+        assert.equal(await readTeamManifestV2('team-policy', cwd), null, testCase.name);
+        assert.deepEqual(await readTeamStateOutcome('team-policy', cwd), {
+          status: 'invalid', source: 'manifest', reason: 'malformed',
+        }, testCase.name);
       }
+
+      await writeFile(manifestPath, baseline);
+      const fresh = await readTeamManifestV2('team-policy', cwd);
+      assert.equal(fresh?.policy.dispatch_ack_timeout_ms, 2_000);
+      assert.equal(fresh?.governance.cleanup_requires_all_workers_inactive, true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1743,27 +2010,24 @@ exit 1
     }
   });
 
-  it('createTask does not overwrite existing tasks when config next_task_id is missing (legacy)', async () => {
+  it('createTask migrates a config-only legacy counter before allocating tasks', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
     try {
       await initTeamState('team-legacy', 't', 'executor', 1, cwd);
-
-      // Simulate legacy config by removing next_task_id field.
-      const configPath = join(cwd, '.omx', 'state', 'team', 'team-legacy', 'config.json');
-      const cfg = JSON.parse(readFileSync(configPath, 'utf8')) as unknown as { [key: string]: unknown };
+      const root = join(cwd, '.omx', 'state', 'team', 'team-legacy');
+      const configPath = join(root, 'config.json');
+      await rm(join(root, 'manifest.v2.json'), { force: true });
+      const cfg = JSON.parse(readFileSync(configPath, 'utf8')) as { [key: string]: unknown };
       delete cfg.next_task_id;
+      delete cfg.next_worker_index;
+      delete cfg.tmux_pane_owner_id;
+      cfg.schema_version = 1;
       await writeAtomic(configPath, JSON.stringify(cfg, null, 2));
+      assert.ok(await migrateV1ToV2('team-legacy', cwd));
 
-      // Create an existing task-1.json, then create another task; it must get id=2.
       const t1 = await createTask('team-legacy', { subject: 'a', description: 'd', status: 'pending' }, cwd);
-      assert.equal(t1.id, '1');
-
-      // Remove next_task_id again to simulate older config still missing field.
-      const cfg2 = JSON.parse(readFileSync(configPath, 'utf8')) as unknown as { [key: string]: unknown };
-      delete cfg2.next_task_id;
-      await writeAtomic(configPath, JSON.stringify(cfg2, null, 2));
-
       const t2 = await createTask('team-legacy', { subject: 'b', description: 'd', status: 'pending' }, cwd);
+      assert.equal(t1.id, '1');
       assert.equal(t2.id, '2');
     } finally {
       await rm(cwd, { recursive: true, force: true });

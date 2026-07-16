@@ -3337,11 +3337,14 @@ describe("tmux HUD pane helpers", () => {
     assert.deepEqual(findHudWatchPaneIds(panes, "%2"), ["%3"]);
   });
 
-  it("buildHudPaneCleanupTargets de-dupes pane ids and includes created pane", () => {
-    assert.deepEqual(
-      buildHudPaneCleanupTargets(["%3", "%3", "invalid"], "%4"),
-      ["%3", "%4"],
-    );
+  it("buildHudPaneCleanupTargets rejects duplicate or malformed batches atomically", () => {
+    assert.deepEqual(buildHudPaneCleanupTargets(["%3", "%3"], "%4"), []);
+    assert.deepEqual(buildHudPaneCleanupTargets(["%3", "%01"], "%4"), []);
+    assert.deepEqual(buildHudPaneCleanupTargets(["%3"], "%4294967296"), []);
+  });
+
+  it("buildHudPaneCleanupTargets includes a canonical created pane", () => {
+    assert.deepEqual(buildHudPaneCleanupTargets(["%3"], "%4"), ["%3", "%4"]);
   });
 
   it("buildHudPaneCleanupTargets excludes leader pane from existing ids", () => {
@@ -3352,9 +3355,8 @@ describe("tmux HUD pane helpers", () => {
     ]);
   });
 
-  it("buildHudPaneCleanupTargets excludes leader pane even when it matches the created HUD pane id", () => {
-    // Defensive edge case: if createHudWatchPane somehow returned the leader pane id, guard protects it.
-    assert.deepEqual(buildHudPaneCleanupTargets(["%3"], "%5", "%5"), ["%3"]);
+  it("buildHudPaneCleanupTargets rejects a created pane matching the leader", () => {
+    assert.deepEqual(buildHudPaneCleanupTargets(["%3"], "%5", "%5"), []);
   });
 
   it("buildHudPaneCleanupTargets is a no-op guard when leaderPaneId is absent", () => {
@@ -3363,19 +3365,21 @@ describe("tmux HUD pane helpers", () => {
 
   it("listCurrentWindowHudPaneIds scopes tmux pane listing to the emitting pane", () => {
     const calls: string[][] = [];
-    const panes = listCurrentWindowHudPaneIds("%leader", (args) => {
+    const panes = listCurrentWindowHudPaneIds("%1", (args) => {
       calls.push(args);
+      if (args.at(-1) === "#{pane_id}") return "%1\n%2\n";
       return [
-        "%leader\tcodex\tcodex",
-        "%hud\tnode\tnode /tmp/bin/omx.js hud --watch",
-      ].join("\n");
+        "%1\x1fcodex\x1f0\x1f0\x1f80\x1f24\x1f24\x1f80\x1f24\x1fcodex\x1f/repo\x1f0\x1f101",
+        "%2\x1fnode\x1f0\x1f0\x1f80\x1f2\x1f2\x1f80\x1f24\x1fnode /tmp/bin/omx.js hud --watch\x1f/repo\x1f0\x1f202",
+      ].join("\n") + "\n";
     });
 
-    assert.deepEqual(panes, ["%hud"]);
-    assert.deepEqual(calls[0], [
+    assert.deepEqual(panes, ["%2"]);
+    assert.deepEqual(calls[0], ["list-panes", "-t", "%1", "-F", "#{pane_id}"]);
+    assert.deepEqual(calls[1], [
       "list-panes",
       "-t",
-      "%leader",
+      "%1",
       "-F",
       [
         "#{pane_id}",
@@ -3389,38 +3393,70 @@ describe("tmux HUD pane helpers", () => {
         "#{window_height}",
         "#{pane_start_command}",
         "#{pane_current_path}",
+        "#{pane_dead}",
+        "#{pane_pid}",
       ].join("\x1f"),
     ]);
   });
 
   it("createHudWatchPane splits from the emitting pane target when provided", () => {
     const calls: string[][] = [];
+    const globalPaneIds = new Set(["%1"]);
+    const targetPaneIds = new Set(["%1"]);
+    const options = new Map<string, string>();
+    let splitStartCommand = '';
     const paneId = createSharedHudWatchPane(
       "/repo",
       "node /repo/dist/cli/omx.js hud --watch",
-      { heightLines: 3, targetPaneId: "%leader" },
+      { heightLines: 3, targetPaneId: "%1" },
       (args) => {
         calls.push(args);
-        return "%hud\n";
+        if (args[0] === "list-panes") {
+          const panes = args.includes("-a") ? globalPaneIds : targetPaneIds;
+          if (args.at(-1) === "#{pane_id}\t#{pane_start_command}") {
+            return `${[...panes].map((paneId) => `${paneId}\t${paneId === "%2" ? splitStartCommand : "codex"}`).join("\n")}\n`;
+          }
+          if (args.at(-1) === "#{pane_id} #{pane_dead} #{pane_pid}") {
+            return `${[...panes].map((paneId) => `${paneId} 0 ${paneId === "%2" ? "202" : "101"}`).join("\n")}\n`;
+          }
+          return `${[...panes].join("\n")}\n`;
+        }
+        if (args[0] === "split-window") {
+          splitStartCommand = args.at(-1)!;
+          globalPaneIds.add("%2");
+          targetPaneIds.add("%2");
+          return "%2\n";
+        }
+        if (args[0] === "set-option") {
+          options.set(args[2]!, args[3]!);
+          return "";
+        }
+        if (args[0] === "show-options") return `${options.get(args[3]!) ?? ""}\n`;
+        throw new Error(`unexpected tmux command: ${args.join(" ")}`);
       },
     );
 
-    assert.equal(paneId, "%hud");
-    assert.deepEqual(calls[0], [
+    assert.equal(paneId, "%2");
+    const splitCall = calls.find((args) => args[0] === "split-window");
+    assert.ok(splitCall);
+    assert.deepEqual(splitCall.slice(0, -1), [
       "split-window",
       "-v",
       "-l",
       "3",
       "-d",
       "-t",
-      "%leader",
+      "%1",
       "-c",
       "/repo",
       "-P",
       "-F",
       "#{pane_id}",
-      "node /repo/dist/cli/omx.js hud --watch",
     ]);
+    assert.match(
+      splitCall.at(-1) ?? '',
+      /^OMX_TMUX_SPLIT_OPERATION_MARKER='[0-9a-f-]+'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node \/repo\/dist\/cli\/omx\.js hud --watch$/,
+    );
   });
 });
 
@@ -4064,23 +4100,25 @@ exit 0
     const source = await readFile(join(repoRoot, "src", "cli", "index.ts"), "utf8");
     assert.match(
       source,
-      /const staleHudPaneIds = currentPaneId\s*\? listHudWatchPaneIdsInCurrentWindow\(currentPaneId, \{ sessionId, leaderPaneId: currentPaneId \}\)\s*: \[\];/,
+      /const staleHudPaneIds = findHudWatchPaneIds\(\s*currentWindowPanes,\s*currentPaneId,\s*\{ sessionId, leaderPaneId: currentPaneId \},\s*\);/,
     );
+    assert.match(source, /const globalPaneIdsBefore = readGlobalTmuxPaneIdSnapshot\(\);/);
     assert.match(source, /const \[keeperHudPaneId, \.\.\.duplicateHudPaneIds\] = staleHudPaneIds;/);
-    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*killTmuxPane\(paneId\);\s*\}/);
+    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) killTmuxPane\(paneId\);\s*\}/);
     assert.match(source, /if \(keeperHudPaneId\) \{\s*hudPaneId = keeperHudPaneId;/);
+    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*resizeTmuxPane\(hudPaneId, HUD_TMUX_HEIGHT_LINES\);\s*\}/);
+    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*registerInsideTmuxHudResizeHook/);
+    assert.match(source, /return matchesOwner\(\) && matchesLiveIncarnation\(\) && matchesOwner\(\) && matchesLiveIncarnation\(\);/);
     assert.doesNotMatch(
       source,
       /const staleHudPaneIds = listHudWatchPaneIdsInCurrentWindow\(currentPaneId, \{ leaderPaneId: currentPaneId \}\);/,
     );
   });
 
-  it("runCodex skips launch-time HUD cleanup when TMUX_PANE is unavailable", async () => {
+  it("runCodex skips all tmux authority when TMUX_PANE is invalid or unavailable", async () => {
     const source = await readFile(join(repoRoot, "src", "cli", "index.ts"), "utf8");
-    assert.match(
-      source,
-      /const staleHudPaneIds = currentPaneId\s*\? listHudWatchPaneIdsInCurrentWindow\(currentPaneId, \{ sessionId, leaderPaneId: currentPaneId \}\)\s*: \[\];/,
-    );
+    assert.match(source, /if \(rawCurrentPaneId && !currentPaneId\) \{\s*runCodexBlocking/);
+    assert.match(source, /if \(!currentPaneId \|\| !globalPaneIdsBefore\?\.has\(currentPaneId\) \|\| !globalPanePidsBefore\?\.has\(currentPaneId\)\) \{\s*runCodexBlocking/);
   });
 
   it("runCodex builds inside-tmux HUD command through explicit runtime-root resolver", async () => {
@@ -4088,13 +4126,9 @@ exit 0
     assert.match(source, /const hudRuntimeRoot: HudRuntimeRootForLaunch = runtimeContext\s*\? \{ omxRoot: runtimeContext\.omxRoot, rootSource: 'omx-root-env' \}\s*: resolveHudRuntimeRootForLaunch\(cwd, process\.env\);/);
     assert.match(
       source,
-      /const hudRuntimeEnv = \{\s*\.\.\.buildHudRuntimeEnv\(\{\s*sessionId,\s*leaderPaneId: currentPaneId,\s*\.\.\.hudRuntimeRoot,\s*\}\)\.env,\s*\.\.\.runtimeEnvOverlay,\s*\};\s*const hudEnvArgs = Object\.entries\(hudRuntimeEnv\)\.map\(\(\[key, value\]\) => `\$\{key\}=\$\{value\}`\)/,
+      /const hudRuntimeEnv = Object\.fromEntries\(Object\.entries\(\{\s*\.\.\.buildHudRuntimeEnv\(\{\s*sessionId,\s*leaderPaneId: currentPaneId,\s*\.\.\.hudRuntimeRoot,\s*\}\)\.env,\s*\.\.\.runtimeEnvOverlay,\s*\}\)\.filter\(\(entry\): entry is \[string, string\] => typeof entry\[1\] === 'string'\)\);\s*const hudCmd = buildHudStartupCommand\(\s*omxBin,\s*hudRuntimeEnv,\s*undefined,\s*nativeWindows \? "win32" : process\.platform,\s*\);/,
     );
     assert.match(source, /if \(env\.OMX_TEAM_STATE_ROOT\?\.trim\(\)\) return 'team-env';\s*if \(env\.OMX_ROOT\?\.trim\(\) \|\| omxRootOverride\) return 'omx-root-env';\s*if \(env\.OMX_STATE_ROOT\?\.trim\(\)\) return 'omx-state-root-env';/);
-    assert.match(
-      source,
-      /buildTmuxPaneCommand\("env",\s*\[\.\.\.hudEnvArgs,\s*"node",\s*omxBin,\s*"hud",\s*"--watch"\]\)/,
-    );
   });
 
   it("runCodex registers a HUD resize hook immediately for inside-tmux launches", async () => {
@@ -4105,7 +4139,7 @@ exit 0
     );
     assert.match(
       source,
-      /if \(currentPaneId\) \{\s*unregisterHudResizeHook\(currentPaneId\);\s*\}/,
+      /if \(currentPaneId && hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\)\) \{\s*unregisterHudResizeHook\(currentPaneId\);\s*\}/,
     );
   });
 
@@ -4113,14 +4147,14 @@ exit 0
     const env = buildInsideTmuxHudHookEnv(
       { PATH: "/bin" },
       "sess-a",
-      "%leader",
+      "%1",
       "/repo",
     );
 
     assert.equal(env.PATH, "/bin");
     assert.equal(env.OMX_SESSION_ID, "sess-a");
     assert.equal(env.OMX_TMUX_HUD_OWNER, "1");
-    assert.equal(env.OMX_TMUX_HUD_LEADER_PANE, "%leader");
+    assert.equal(env.OMX_TMUX_HUD_LEADER_PANE, "%1");
     assert.equal(env.OMX_ROOT, "/repo");
   });
 
@@ -4134,8 +4168,8 @@ exit 0
     }> = [];
 
     const result = registerInsideTmuxHudResizeHook({
-      hudPaneId: "%hud",
-      currentPaneId: "%leader",
+      hudPaneId: "%2",
+      currentPaneId: "%1",
       cwd: "/repo",
       sessionId: "sess-a",
       omxRootOverride: "/repo",
@@ -4148,26 +4182,33 @@ exit 0
 
     assert.equal(result, true);
     assert.deepEqual(calls, [{
-      hudPaneId: "%hud",
-      leaderPaneId: "%leader",
+      hudPaneId: "%2",
+      leaderPaneId: "%1",
       heightLines: HUD_TMUX_HEIGHT_LINES,
       cwd: "/repo",
       env: {
         PATH: "/bin",
         OMX_SESSION_ID: "sess-a",
         OMX_TMUX_HUD_OWNER: "1",
-        OMX_TMUX_HUD_LEADER_PANE: "%leader",
+        OMX_TMUX_HUD_LEADER_PANE: "%1",
         OMX_ROOT: "/repo",
       },
     }]);
     assert.equal(registerInsideTmuxHudResizeHook({
       hudPaneId: null,
-      currentPaneId: "%leader",
+      currentPaneId: "%1",
       cwd: "/repo",
       sessionId: "sess-a",
       register: () => {
         throw new Error("should not register without a HUD pane");
       },
+    }), false);
+    assert.equal(registerInsideTmuxHudResizeHook({
+      hudPaneId: "%01",
+      currentPaneId: "%1",
+      cwd: "/repo",
+      sessionId: "sess-a",
+      register: () => { throw new Error("should not register an alias pane"); },
     }), false);
   });
 
@@ -4175,7 +4216,7 @@ exit 0
     const env = buildDetachedHudHookEnv(
       { PATH: "/bin" },
       "sess-a",
-      "%leader",
+      "%1",
       "/tmp/tmux.sock,123,7",
       "/repo/dist/cli/omx.js",
       "/repo",
@@ -4183,7 +4224,7 @@ exit 0
 
     assert.equal(env.PATH, "/bin");
     assert.equal(env.TMUX, "/tmp/tmux.sock,123,7");
-    assert.equal(env.TMUX_PANE, "%leader");
+    assert.equal(env.TMUX_PANE, "%1");
     assert.equal(env.OMX_SESSION_ID, "sess-a");
     assert.equal(env.OMX_TMUX_HUD_OWNER, "1");
     assert.equal(env.OMX_ROOT, "/repo");
@@ -4201,8 +4242,8 @@ exit 0
     const readTargets: string[] = [];
 
     const result = registerDetachedHudLayoutReconcileHook({
-      hudPaneId: "%hud",
-      detachedLeaderPaneId: "%leader",
+      hudPaneId: "%2",
+      detachedLeaderPaneId: "%1",
       cwd: "/repo",
       sessionId: "sess-a",
       omxBin: "/repo/dist/cli/omx.js",
@@ -4219,16 +4260,16 @@ exit 0
     });
 
     assert.equal(result, true);
-    assert.deepEqual(readTargets, ["%leader"]);
+    assert.deepEqual(readTargets, ["%1"]);
     assert.deepEqual(calls, [{
-      hudPaneId: "%hud",
-      leaderPaneId: "%leader",
+      hudPaneId: "%2",
+      leaderPaneId: "%1",
       heightLines: HUD_TMUX_HEIGHT_LINES,
       cwd: "/repo",
       env: {
         PATH: "/bin",
         TMUX: "/tmp/tmux.sock,123,7",
-        TMUX_PANE: "%leader",
+        TMUX_PANE: "%1",
         OMX_SESSION_ID: "sess-a",
         OMX_TMUX_HUD_OWNER: "1",
         OMX_ROOT: "/repo",
@@ -4236,8 +4277,8 @@ exit 0
       },
     }]);
     assert.equal(registerDetachedHudLayoutReconcileHook({
-      hudPaneId: "%hud",
-      detachedLeaderPaneId: "%leader",
+      hudPaneId: "%2",
+      detachedLeaderPaneId: "%1",
       cwd: "/repo",
       sessionId: "sess-a",
       omxBin: "/repo/dist/cli/omx.js",
@@ -4245,6 +4286,15 @@ exit 0
       register: () => {
         throw new Error("should not register without TMUX");
       },
+    }), false);
+    assert.equal(registerDetachedHudLayoutReconcileHook({
+      hudPaneId: "%2",
+      detachedLeaderPaneId: "%4294967296",
+      cwd: "/repo",
+      sessionId: "sess-a",
+      omxBin: "/repo/dist/cli/omx.js",
+      readTmuxEnvValue: () => { throw new Error("should not target an overflow pane"); },
+      register: () => { throw new Error("should not register an overflow pane"); },
     }), false);
   });
 
@@ -5293,52 +5343,71 @@ exit 0
       await rm(cwd, { recursive: true, force: true });
     }
   });
-    it("buildDetachedSessionFinalizeSteps keeps schedule after split-capture and before attach", () => {
-    const steps = buildDetachedSessionFinalizeSteps(
-      "omx-demo",
-      "%12",
-      "3",
-      true,
-      false,
-      true,
-      "%leader",
-    );
+  it("buildDetachedSessionFinalizeSteps retains pane incarnations for every finalization hook", () => {
+    const incarnations = { leaderPaneId: "%11", leaderPanePid: "101", hudPaneId: "%12", hudPanePid: "909" };
+    const steps = buildDetachedSessionFinalizeSteps("omx-demo", "%12", "3", true, false, true, "%11", incarnations);
     const names = steps.map((step) => step.name);
     const attachedIndex = names.indexOf("register-client-attached-reconcile");
     const scheduleIndex = names.indexOf("schedule-delayed-resize");
     const attachIndex = names.indexOf("attach-session");
     assert.equal(attachedIndex >= 0, true);
     assert.equal(scheduleIndex > attachedIndex, true);
-    assert.equal(scheduleIndex >= 0, true);
     assert.equal(attachIndex > scheduleIndex, true);
-    assert.equal(names.includes("register-resize-hook"), true);
-    assert.equal(names.includes("reconcile-hud-resize"), true);
-    assert.equal(DETACHED_TMUX_HISTORY_LIMIT, 500);
+    for (const name of ["register-resize-hook", "register-client-attached-reconcile", "schedule-delayed-resize", "reconcile-hud-resize"]) {
+      const hook = steps.find((step) => step.name === name);
+      assert.match((hook?.args ?? []).join(" "), /%11.*pane_pid\},101/);
+      assert.match((hook?.args ?? []).join(" "), /%12.*pane_pid\},909/);
+    }
     const historyHook = steps.find((step) => step.name === "register-detached-history-prune-hook");
     assert.ok(historyHook);
-    assert.deepEqual(historyHook.args.slice(0, 3), ["set-hook", "-t", "omx-demo"]);
-    assert.match(historyHook.args[3] || "", /^client-detached\[[0-9]+\]$/);
-    assert.equal(
-      historyHook.args[4],
-      `if-shell -F '#{==:#{session_attached},0}' 'run-shell -b "tmux clear-history -t %leader >/dev/null 2>&1 || true"'`,
-    );
+    assert.match(historyHook.args[4] || "", /#\{pane_id\},%11/);
+    assert.match(historyHook.args[4] || "", /#\{pane_pid\},101/);
   });
 
-  it("detached history prune hook tolerates a dead leader pane", () => {
-    const steps = buildDetachedSessionFinalizeSteps(
-      "omx-demo",
-      "%12",
-      "3",
-      true,
-      false,
-      true,
-      "%leader",
-    );
+  it("detached history prune hook uses one server-atomic leader incarnation conditional", () => {
+    const incarnations = { leaderPaneId: "%11", leaderPanePid: "101", hudPaneId: "%12", hudPanePid: "909" };
+    const steps = buildDetachedSessionFinalizeSteps("omx-demo", "%12", "3", true, false, true, "%11", incarnations);
     const historyHook = steps.find((step) => step.name === "register-detached-history-prune-hook");
     assert.ok(historyHook);
     const hookCommand = historyHook.args[4] || "";
-    assert.match(hookCommand, /run-shell -b/);
-    assert.match(hookCommand, />\/dev\/null 2>&1 \|\| true/);
+    assert.match(hookCommand, /if-shell -F -t %11/);
+    assert.match(hookCommand, /#\{pane_id\},%11/);
+    assert.match(hookCommand, /#\{pane_dead\},0/);
+    assert.match(hookCommand, /#\{pane_pid\},101/);
+    assert.match(hookCommand, /set-hook -u -t omx-demo/);
+    assert.doesNotMatch(hookCommand, /list-panes|awk|Where-Object/);
+  });
+
+
+  it("uses the resolved psmux executable for native-Windows atomic history pruning", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalPath = process.env.PATH;
+    const originalPathext = process.env.PATHEXT;
+    const wd = await mkdtemp(join(tmpdir(), "omx-psmux-history-hook-"));
+    const fakeBin = join(wd, "bin");
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(join(fakeBin, "psmux.exe"), "", "utf8");
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = ".EXE";
+      const incarnations = { leaderPaneId: "%11", leaderPanePid: "101", hudPaneId: "%12", hudPanePid: "909" };
+      const steps = buildDetachedSessionFinalizeSteps("omx-demo", "%12", "3", true, true, true, "%11", incarnations);
+      const historyHook = steps.find((step) => step.name === "register-detached-history-prune-hook");
+      assert.ok(historyHook);
+      const hook = historyHook.args[4] || "";
+      assert.match(hook, /if-shell -F -t %11/);
+      assert.match(hook, /#\{pane_id\},%11/);
+      assert.match(hook, /#\{pane_dead\},0/);
+      assert.match(hook, /#\{pane_pid\},101/);
+      assert.match(hook, new RegExp(join(fakeBin, "psmux.exe").replace(/\\\\/g, "/").replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")));
+      assert.doesNotMatch(hook, /list-panes|\\btmux clear-history/);
+    } finally {
+      process.env.PATH = originalPath;
+      process.env.PATHEXT = originalPathext;
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 
   it("buildDetachedSessionFinalizeSteps skips attach for Hermes MCP bridge launches", () => {
@@ -5355,59 +5424,23 @@ exit 0
     );
 
     assert.equal(steps.some((step) => step.name === "attach-session"), false);
-    assert.equal(steps.some((step) => step.name === "register-resize-hook"), true);
+    assert.equal(steps.some((step) => step.name === "register-resize-hook"), false);
     assert.equal(steps.some((step) => step.name === "set-mouse"), true);
   });
 
-  it("buildDetachedSessionFinalizeSteps uses quiet best-effort tmux resize commands", () => {
-    const steps = buildDetachedSessionFinalizeSteps(
-      "omx-demo",
-      "%12",
-      "3",
-      false,
-    );
-    const registerHook = steps.find(
-      (step) => step.name === "register-resize-hook",
-    );
-    const schedule = steps.find(
-      (step) => step.name === "schedule-delayed-resize",
-    );
-    const reconcile = steps.find(
-      (step) => step.name === "reconcile-hud-resize",
-    );
-
-    assert.match(registerHook?.args[4] ?? "", />\/dev\/null 2>&1 \|\| true/);
-    assert.match(
-      registerHook?.args[4] ?? "",
-      new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`),
-    );
-    assert.match(schedule?.args[2] ?? "", />\/dev\/null 2>&1 \|\| true/);
-    assert.match(
-      schedule?.args[2] ?? "",
-      new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`),
-    );
-    assert.match(
-      (reconcile?.args ?? []).join(" "),
-      />\/dev\/null 2>&1 \|\| true/,
-    );
-    assert.match(
-      (reconcile?.args ?? []).join(" "),
-      new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`),
-    );
+  it("buildDetachedSessionFinalizeSteps binds finalization resize commands to retained pane PIDs", () => {
+    const incarnations = { leaderPaneId: "%11", leaderPanePid: "101", hudPaneId: "%12", hudPanePid: "909" };
+    const steps = buildDetachedSessionFinalizeSteps("omx-demo", "%12", "3", false, false, true, "%11", incarnations);
+    for (const name of ["register-resize-hook", "schedule-delayed-resize", "reconcile-hud-resize"]) {
+      const step = steps.find((candidate) => candidate.name === name);
+      assert.match((step?.args ?? []).join(" "), /%11.*pane_pid\},101/);
+      assert.match((step?.args ?? []).join(" "), /%12.*pane_pid\},909/);
+    }
   });
 
-  it("buildDetachedSessionFinalizeSteps skips detached resize hooks on native Windows", () => {
-    const steps = buildDetachedSessionFinalizeSteps(
-      "omx-demo",
-      "%12",
-      "3",
-      true,
-      true,
-    );
-    assert.deepEqual(
-      steps.map((step) => step.name),
-      ["set-mouse", "sanitize-copy-mode-style", "attach-session"],
-    );
+  it("buildDetachedSessionFinalizeSteps requires retained pane PIDs before registering hooks", () => {
+    const steps = buildDetachedSessionFinalizeSteps("omx-demo", "%12", "3", true, true, true, "%11");
+    assert.equal(steps.some((step) => step.name.includes("hook") || step.name.includes("resize")), false);
   });
 
   it("buildDetachedSessionFinalizeSteps sanitizes copy-mode styling before attach when mouse mode is enabled", () => {
@@ -5461,12 +5494,14 @@ exit 0
         "kill-session",
       ],
     );
-    assert.equal(steps[0]?.args[0], "set-hook");
-    assert.equal(steps[0]?.args[1], "-u");
-    assert.equal(steps[0]?.args[2], "-t");
-    assert.equal(steps[0]?.args[3], "omx-demo:0");
-    assert.match(steps[0]?.args[4] ?? "", /^client-attached\[\d+\]$/);
-    assert.match(steps[1]?.args[4] ?? "", /^client-resized\[\d+\]$/);
+    for (const step of steps.slice(0, 2)) {
+      assert.equal(step.args[0], "if-shell");
+      assert.equal(step.args[1], "-F");
+      assert.equal(step.args[2], "-t");
+      assert.equal(step.args[3], "omx-demo:0");
+      assert.match(step.args.join(" "), /set-hook -u -t omx-demo:0/);
+      assert.match(step.args.join(" "), /#\{==:@omx_hook_identity_/);
+    }
     assert.doesNotMatch(steps[1]?.args.join(" ") ?? "", /window-resized/);
     assert.deepEqual(steps[2]?.args, ["kill-session", "-t", "omx-demo"]);
   });
@@ -5705,6 +5740,15 @@ exit 1
       process.env.PATHEXT = originalPathext;
       if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
       await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveNativeSessionName rejects noncanonical TMUX_PANE before tmux lookup", () => {
+    for (const paneId of ["%01", "%4294967296", "%18446744073709551616"]) {
+      assert.equal(
+        resolveNativeSessionName("/tmp/repo", "omx-abc123", { TMUX: "1", TMUX_PANE: paneId }),
+        buildTmuxSessionName("/tmp/repo", "omx-abc123"),
+      );
     }
   });
 

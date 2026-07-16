@@ -1,7 +1,7 @@
 import { existsSync } from 'fs';
 import { readdir } from 'fs/promises';
 import { join } from 'path';
-import { readTeamManifestV2, readTeamPhase } from '../../team/state.js';
+import { readTeamPhase, readTeamStateOutcome } from '../../team/state.js';
 import { resolveCanonicalTeamStateRoot } from '../../team/state-root.js';
 import { TEAM_NAME_SAFE_PATTERN } from '../../team/contracts.js';
 import { isTerminalPhase, safeString } from './utils.js';
@@ -31,13 +31,13 @@ export async function listNotifyCanonicalActiveTeams(
     const teamName = entry.name.trim();
     if (!teamName || !TEAM_NAME_SAFE_PATTERN.test(teamName)) continue;
 
-    const [manifest, phaseState] = await Promise.all([
-      readTeamManifestV2(teamName, cwd),
+    const [teamStateOutcome, phaseState] = await Promise.all([
+      readTeamStateOutcome(teamName, cwd),
       readTeamPhase(teamName, cwd),
     ]);
-    if (!manifest || !phaseState) continue;
+    if (teamStateOutcome.status !== 'valid' || !phaseState) continue;
 
-    const ownerSessionId = safeString(manifest.leader?.session_id).trim();
+    const ownerSessionId = safeString(teamStateOutcome.manifest.leader?.session_id).trim();
     if (!ownerSessionId || ownerSessionId !== sessionId) continue;
 
     const phase = safeString(phaseState.current_phase).trim();

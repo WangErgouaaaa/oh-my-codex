@@ -7,22 +7,200 @@ import {
   buildHudLayoutHookSlot,
   buildHudResizeHookName,
   buildHudResizeHookSlot,
+  buildHudRuntimeEnv,
   buildHudWatchCommand,
+  createHudWatchPane,
   findLegacyFocusedHudWatchPaneIds,
   findHudWatchPaneIds,
   hudPaneMatchesOwner,
+  killTmuxPane,
   listCurrentWindowHudPaneIds,
   OMX_TMUX_HUD_LEADER_PANE_ENV,
   TMUX_PANE_FIELD_SEPARATOR_OCTAL_ESCAPE,
   parseTmuxPaneSnapshot,
+  parseCanonicalTmuxPaneId,
+  parseExactTmuxAuthorityLines,
+  parseExactTmuxAuthorityScalar,
+  parsePaneIdFromTmuxOutput,
   readActiveTmuxPaneId,
   readHudPaneOwner,
+  readCurrentWindowSize,
   reapDeadHudPanes,
+  resizeTmuxPane,
   parseHudResizeHookContext,
   registerHudResizeHook,
   unregisterHudResizeHook,
+  verifyHudWatchPaneAuthority,
 } from '../tmux.js';
+import { buildHudStartupCommand } from '../index.js';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS } from '../constants.js';
+
+describe('HUD pane identity boundaries', () => {
+  const unsafePaneIds = ['%01', '%4294967296', '%18446744073709551616'];
+
+  it('accepts only the bounded canonical psmux pane-id subset', () => {
+    assert.equal(parseCanonicalTmuxPaneId('%0'), '%0');
+    assert.equal(parseCanonicalTmuxPaneId('%1'), '%1');
+    assert.equal(parseCanonicalTmuxPaneId('%4294967295'), '%4294967295');
+    for (const paneId of unsafePaneIds) assert.equal(parseCanonicalTmuxPaneId(paneId), null);
+  });
+
+  it('requires exact LF authority frames and rejects truncation, CR, and extra terminators', () => {
+    assert.deepEqual(parseExactTmuxAuthorityLines('%1\n%2\n'), ['%1', '%2']);
+    assert.equal(parseExactTmuxAuthorityScalar('%1\n'), '%1');
+    for (const malformed of ['%1', '%1\r\n', '%1\r', '%1\n\n', '%1\n%2']) {
+      assert.equal(parseExactTmuxAuthorityLines(malformed), null, JSON.stringify(malformed));
+      assert.equal(parseExactTmuxAuthorityScalar(malformed), null, JSON.stringify(malformed));
+    }
+  });
+
+  it('rejects whitespace, blank rows, and duplicate rows without partially accepting snapshots', () => {
+    for (const paneId of [' %1', '%1 ', '\t%1', '%1\r']) {
+      assert.equal(parseCanonicalTmuxPaneId(paneId), null);
+      assert.equal(parsePaneIdFromTmuxOutput(`${paneId}\n`), null);
+    }
+    assert.deepEqual(parseTmuxPaneSnapshot('%1\tcodex\tcodex\n\n%2\tnode\tnode omx.js hud --watch'), []);
+    assert.deepEqual(parseTmuxPaneSnapshot('%1\tcodex\tcodex\n%1\tnode\tnode omx.js hud --watch'), []);
+    assert.equal(parsePaneIdFromTmuxOutput('%1\n\n'), null);
+  });
+
+  it('rejects unsafe or ambiguous fresh pane observations atomically', () => {
+    for (const paneId of unsafePaneIds) {
+      assert.deepEqual(parseTmuxPaneSnapshot(`%1\tcodex\tcodex\n${paneId}\tnode\tnode omx.js hud --watch`), []);
+      assert.equal(parsePaneIdFromTmuxOutput(`${paneId}\n`), null);
+    }
+    assert.deepEqual(parseTmuxPaneSnapshot('%1\tcodex\tcodex\n%1\tnode\tnode omx.js hud --watch'), []);
+    assert.equal(parsePaneIdFromTmuxOutput('%2\n%3\n'), null);
+  });
+
+  it('rejects a HUD pane that becomes dead during delayed authority stabilization', () => {
+    const options = new Map<string, string>();
+    let split = false;
+    let strictProbeCount = 0;
+    let splitStartCommand = '';
+    const execTmuxSync = (args: string[]) => {
+      const format = args.at(-1);
+      if (args[0] === 'set-option') {
+        options.set(args[2]!, args[3]!);
+        return '';
+      }
+      if (args[0] === 'show-options') return `${options.get(args.at(-1)!) ?? ''}\n`;
+      if (args[0] === 'split-window') {
+        split = true;
+        splitStartCommand = args.at(-1)!;
+        return '%2\n';
+      }
+      if (args[0] === 'list-panes' && format === '#{pane_id}\t#{pane_start_command}') {
+        return split ? `%1\tcodex\n%2\t${splitStartCommand}\n` : '%1\tcodex\n';
+      }
+      if (args[0] === 'list-panes' && format === '#{pane_id} #{pane_dead} #{pane_pid}') {
+        strictProbeCount += 1;
+        return strictProbeCount > 9 ? '%1 0 101\n%2 1 202\n' : '%1 0 101\n%2 0 202\n';
+      }
+      if (args[0] === 'list-panes' && format === '#{pane_id}') return split ? '%1\n%2\n' : '%1\n';
+      throw new Error(`unexpected tmux argv: ${args.join(' ')}`);
+    };
+
+    const paneId = createHudWatchPane('/repo', 'node omx.js hud --watch', { targetPaneId: '%1' }, execTmuxSync);
+    assert.equal(paneId, '%2');
+    assert.equal(verifyHudWatchPaneAuthority('%2', execTmuxSync), false);
+  });
+
+  it('does not adopt or roll back a same-id HUD pane whose operation marker disappeared after recovery', () => {
+    const options = new Map<string, string>();
+    const calls: string[][] = [];
+    let split = false;
+    let markerProbeCount = 0;
+    let splitStartCommand = '';
+    const execTmuxSync = (args: string[]) => {
+      calls.push(args);
+      const format = args.at(-1);
+      if (args[0] === 'set-option') {
+        options.set(args[2]!, args[3]!);
+        return '';
+      }
+      if (args[0] === 'show-options') return `${options.get(args.at(-1)!) ?? ''}\n`;
+      if (args[0] === 'split-window') {
+        split = true;
+        splitStartCommand = args.at(-1)!;
+        return '%2\n';
+      }
+      if (args[0] === 'list-panes' && format === '#{pane_id}') return split ? '%1\n%2\n' : '%1\n';
+      if (args[0] === 'list-panes' && format === '#{pane_id}\t#{pane_start_command}') {
+        markerProbeCount += 1;
+        return markerProbeCount === 1
+          ? `%1\tcodex\n%2\t${splitStartCommand}\n`
+          : '%1\tcodex\n%2\tforeign-command\n';
+      }
+      throw new Error(`unexpected tmux argv: ${args.join(' ')}`);
+    };
+
+    assert.equal(createHudWatchPane('/repo', 'node omx.js hud --watch', { targetPaneId: '%1' }, execTmuxSync), null);
+    assert.equal(calls.some((args) => args[0] === 'kill-pane' || args[0] === 'resize-pane' || args[0] === 'set-hook'), false);
+  });
+
+  it('rejects unsafe targets before kill, resize, hook, list, or split commands', () => {
+    const calls: string[][] = [];
+    const execTmuxSync = (args: string[]) => {
+      calls.push(args);
+      return '%2\n';
+    };
+    for (const paneId of unsafePaneIds) {
+      assert.equal(killTmuxPane(paneId, execTmuxSync), false);
+      assert.equal(resizeTmuxPane(paneId, 3, execTmuxSync), false);
+      assert.equal(registerHudResizeHook(paneId, '%1', 3, execTmuxSync), false);
+      assert.equal(registerHudResizeHook('%2', paneId, 3, execTmuxSync), false);
+      assert.deepEqual(listCurrentWindowHudPaneIds(paneId, execTmuxSync), []);
+      assert.equal(createHudWatchPane('/repo', 'node omx.js hud --watch', { targetPaneId: paneId }, execTmuxSync), null);
+    }
+    assert.deepEqual(calls, []);
+    assert.equal(
+      createHudWatchPane('/repo', 'node omx.js hud --watch', { targetPaneId: '%1' }, () => '%01\n'),
+      null,
+    );
+  });
+
+  it('rejects newline-injected HUD metadata rows absent from the authoritative pane-id snapshot', () => {
+    const calls: string[][] = [];
+    const paneIds = listCurrentWindowHudPaneIds(undefined, (args) => {
+      calls.push(args);
+      if (args.at(-1) === '#{pane_id}') return '%1\n';
+      return [
+        ['%1', 'codex', 'codex'].join('\x1f'),
+        ['%30', 'node', 'node omx.js hud --watch'].join('\x1f'),
+      ].join('\n');
+    });
+
+    assert.deepEqual(paneIds, []);
+    assert.equal(calls.length, 2);
+  });
+
+  it('invalidates unsafe owner leaders and preserves an unsafe reaper batch without kills', () => {
+    for (const paneId of unsafePaneIds) {
+      const [pane] = parseTmuxPaneSnapshot(
+        `%2\tnode\texec env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='${paneId}' node omx.js hud --watch`,
+      );
+      assert.deepEqual(readHudPaneOwner(pane!), { sessionId: undefined, leaderPaneId: undefined });
+      assert.equal(hudPaneMatchesOwner(pane!, { sessionId: 'sess-a', leaderPaneId: '%1' }), false);
+      assert.deepEqual(buildHudRuntimeEnv({ sessionId: 'sess-a', leaderPaneId: paneId }).owner, { sessionId: 'sess-a' });
+    }
+
+    const killed: string[] = [];
+    const result = reapDeadHudPanes([{
+      paneId: '%01',
+      currentCommand: 'node',
+      startCommand: `exec env OMX_TMUX_HUD_OWNER=1 ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%9' node omx.js hud --watch`,
+    }], {
+      isLivePane: () => false,
+      killPane: (paneId) => {
+        killed.push(paneId);
+        return true;
+      },
+    });
+    assert.deepEqual(killed, []);
+    assert.deepEqual(result, { reaped: [], preserved: ['%01'] });
+  });
+});
 
 describe('HUD resize hook helpers', () => {
   it('builds a deterministic hook name from the tmux session, window, and leader identity', () => {
@@ -54,6 +232,9 @@ describe('HUD resize hook helpers', () => {
       sessionId: '$7',
       windowId: '@3',
       leaderPaneId: '%1',
+      leaderPanePid: '1',
+      hudPaneId: '%1',
+      hudPanePid: '1',
       hookName: 'omx_hud_resize_7_3_1',
       hookSlot: buildHudResizeHookSlot('omx_hud_resize_7_3_1'),
       layoutHookSlot: buildHudLayoutHookSlot('omx_hud_resize_7_3_1'),
@@ -77,6 +258,7 @@ describe('HUD resize hook helpers', () => {
       (args) => {
         calls.push(args);
         if (args[0] === 'display-message') return '$7\t@3\n';
+        if (args[0] === 'list-panes') return '%1 0 101\n%9 0 909\n';
         return '';
       },
     );
@@ -84,29 +266,45 @@ describe('HUD resize hook helpers', () => {
     const hookSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
     const layoutHookSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
     assert.equal(result, true);
-    assert.deepEqual(calls[0], ['display-message', '-p', '-t', '%1', '#{session_id}\t#{window_id}']);
-    assert.equal(calls[1]?.[0], 'set-hook');
-    assert.equal(calls[1]?.[1], '-t');
-    assert.equal(calls[1]?.[2], '$7');
-    assert.equal(calls[1]?.[3], hookSlot);
-    assert.match(calls[1]?.[4] ?? '', /^run-shell -b /);
-    assert.match(calls[1]?.[4] ?? '', /resize-pane/);
-    assert.match(calls[1]?.[4] ?? '', /set-hook/);
-    assert.doesNotMatch(calls[1]?.[4] ?? '', /'-w'/);
-    assert.match(calls[1]?.[4] ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
-    assert.match(calls[1]?.[4] ?? '', new RegExp(hookSlot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.deepEqual(calls[2], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
+    assert.deepEqual(calls[0], ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}']);
+    assert.deepEqual(calls[1], ['display-message', '-p', '-t', '%1', '#{session_id}\t#{window_id}']);
+    assert.equal(calls[2]?.[0], 'set-hook');
+    assert.equal(calls[2]?.[1], '-t');
+    assert.equal(calls[2]?.[2], '$7');
+    assert.equal(calls[2]?.[3], hookSlot);
+    const resizeHook = calls[2]?.[4] ?? '';
+    assert.match(resizeHook, /^run-shell -b /);
+    // Each delayed resize is one tmux server transaction: the outer if-shell
+    // is argv-framed, while the HUD conditional is its quoted true branch.
+    assert.equal((resizeHook.match(/'\\''if-shell'\\'' '\\''-F'\\'' '\\''-t'\\'' '\\''%1'\\''/g) ?? []).length, 2);
+    assert.equal((resizeHook.match(/'\\''if-shell -F -t %9 /g) ?? []).length, 2);
+    assert.match(resizeHook, /'\\''#\{&&:#\{==:#\{pane_id\},%1\},#\{&&:#\{==:#\{pane_dead\},0\},#\{==:#\{pane_pid\},101\}\}\}'\\''/);
+    assert.match(resizeHook, /'\\''if-shell -F -t %9 /);
+    assert.match(resizeHook, /#\{pane_dead\}/);
+    assert.match(resizeHook, /%1.*101/);
+    assert.match(resizeHook, /%9.*909/);
+    assert.match(resizeHook, /resize-pane/);
+    assert.match(resizeHook, /set-hook/);
+    assert.doesNotMatch(resizeHook, /list-panes|awk/);
+    assert.match(resizeHook, /env TMUX=/);
+    assert.doesNotMatch(resizeHook, /'-w'/);
+    assert.match(resizeHook, new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
+    assert.match(resizeHook, new RegExp(hookSlot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.equal(calls[3]?.[0], 'set-hook');
     assert.equal(calls[3]?.[1], '-t');
     assert.equal(calls[3]?.[2], '$7');
     assert.equal(calls[3]?.[3], layoutHookSlot);
-    assert.match(calls[3]?.[4] ?? '', /^run-shell -b /);
-    assert.match(calls[3]?.[4] ?? '', /display-message/);
-    assert.match(calls[3]?.[4] ?? '', /--reconcile-tmux/);
-    assert.match(calls[3]?.[4] ?? '', /TMUX/);
-    assert.match(calls[3]?.[4] ?? '', /TMUX_PANE/);
-    assert.match(calls[3]?.[4] ?? '', /OMX_TMUX_HUD_OWNER/);
-    assert.doesNotMatch(calls[3]?.[4] ?? '', /wait-for/);
+    const layoutHook = calls[3]?.[4] ?? '';
+    assert.match(layoutHook, /^run-shell -b /);
+    assert.equal((layoutHook.match(/'\\''if-shell'\\'' '\\''-F'\\'' '\\''-t'\\'' '\\''%1'\\''/g) ?? []).length, 1);
+    assert.equal((layoutHook.match(/'\\''if-shell -F -t %9 /g) ?? []).length, 1);
+    assert.match(layoutHook, /#\{&&:#\{==:#\{pane_id\},%1\}/);
+    assert.doesNotMatch(layoutHook, /list-panes/);
+    assert.match(layoutHook, /--reconcile-tmux/);
+    assert.match(layoutHook, /TMUX/);
+    assert.match(layoutHook, /TMUX_PANE/);
+    assert.match(layoutHook, /OMX_TMUX_HUD_OWNER/);
+    assert.doesNotMatch(layoutHook, /wait-for/);
   });
 
   it('reports partial failure but keeps the resize hook when layout-change hook install fails', () => {
@@ -122,6 +320,7 @@ describe('HUD resize hook helpers', () => {
       (args) => {
         calls.push(args);
         if (args[0] === 'display-message') return '$7\t@3\n';
+        if (args[0] === 'list-panes') return '%1 0 101\n%9 0 909\n';
         if (args[0] === 'set-hook' && args[3] === layoutHookSlot) {
           throw new Error('layout hook rejected');
         }
@@ -130,8 +329,7 @@ describe('HUD resize hook helpers', () => {
     );
 
     assert.equal(result, false);
-    assert.deepEqual(calls[1]?.slice(0, 4), ['set-hook', '-t', '$7', hookSlot]);
-    assert.deepEqual(calls[2], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
+    assert.deepEqual(calls[2]?.slice(0, 4), ['set-hook', '-t', '$7', hookSlot]);
     assert.deepEqual(calls[3]?.slice(0, 4), ['set-hook', '-t', '$7', layoutHookSlot]);
   });
 
@@ -146,21 +344,11 @@ describe('HUD resize hook helpers', () => {
 
     assert.equal(result, true);
     assert.deepEqual(calls[0], ['display-message', '-p', '-t', '%1', '#{session_id}\t#{window_id}']);
-    assert.deepEqual(calls[1], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
-    assert.deepEqual(calls[2], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudResizeHookSlot('omx_hud_resize_7_3_1'),
-    ]);
-    assert.deepEqual(calls[3], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudLayoutHookSlot('omx_hud_resize_7_3_1'),
-    ]);
+    for (const call of calls.slice(1)) {
+      assert.deepEqual(call.slice(0, 4), ['if-shell', '-F', '-t', '$7']);
+      assert.match(call[4] ?? '', /^#\{==:@omx_hook_identity_(client_resized|window_layout_changed)_\d+,omx-[0-9a-f]+\}$/);
+      assert.match(call[5] ?? '', /^set-hook -u -t \$7 /);
+    }
   });
 
   it('attempts to unregister the layout hook even when resize hook unregister fails', () => {
@@ -169,27 +357,19 @@ describe('HUD resize hook helpers', () => {
     const result = unregisterHudResizeHook('%1', (args) => {
       calls.push(args);
       if (args[0] === 'display-message') return '$7\t@3\n';
-      if (args[0] === 'set-hook' && args[4] === buildHudResizeHookSlot('omx_hud_resize_7_3_1')) {
+      if (args[0] === 'if-shell' && args[5]?.includes(buildHudResizeHookSlot('omx_hud_resize_7_3_1'))) {
         throw new Error('resize hook unregister rejected');
       }
       return '';
     });
 
     assert.equal(result, false);
-    assert.deepEqual(calls[2], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudResizeHookSlot('omx_hud_resize_7_3_1'),
-    ]);
-    assert.deepEqual(calls[3], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudLayoutHookSlot('omx_hud_resize_7_3_1'),
-    ]);
+    assert.deepEqual(calls[1]?.slice(0, 4), ['if-shell', '-F', '-t', '$7']);
+    assert.match(calls[1]?.[4] ?? '', /^#\{==:@omx_hook_identity_client_resized_\d+,omx-[0-9a-f]+\}$/);
+    assert.match(calls[1]?.[5] ?? '', /^set-hook -u -t \$7 client-resized\[\d+\]/);
+    assert.deepEqual(calls[2]?.slice(0, 4), ['if-shell', '-F', '-t', '$7']);
+    assert.match(calls[2]?.[4] ?? '', /^#\{==:@omx_hook_identity_window_layout_changed_\d+,omx-[0-9a-f]+\}$/);
+    assert.match(calls[2]?.[5] ?? '', /^set-hook -u -t \$7 window-layout-changed\[\d+\]/);
   });
 
   it('uses distinct hook slots for different windows in the same session', () => {
@@ -197,6 +377,7 @@ describe('HUD resize hook helpers', () => {
 
     const execFor = (windowId: string) => (args: string[]) => {
       if (args[0] === 'display-message') return `$7\t${windowId}\n`;
+      if (args[0] === 'list-panes') return '%1 0 101\n%2 0 102\n%9 0 909\n%10 0 910\n';
       registered.push(args);
       return '';
     };
@@ -205,7 +386,7 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%10', '%2', 3, execFor('@4')), true);
 
     const firstSlot = registered[0]?.[3];
-    const secondSlot = registered[3]?.[3];
+    const secondSlot = registered[2]?.[3];
     assert.match(firstSlot ?? '', /^client-resized\[\d+\]$/);
     assert.match(secondSlot ?? '', /^client-resized\[\d+\]$/);
     assert.notEqual(firstSlot, secondSlot);
@@ -215,6 +396,7 @@ describe('HUD resize hook helpers', () => {
     const registered: string[][] = [];
     const execTmuxSync = (args: string[]) => {
       if (args[0] === 'display-message') return '$7\t@3\n';
+      if (args[0] === 'list-panes') return '%1 0 101\n%2 0 102\n%9 0 909\n%10 0 910\n';
       registered.push(args);
       return '';
     };
@@ -223,7 +405,7 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%10', '%2', 3, execTmuxSync), true);
 
     const firstSlot = registered[0]?.[3];
-    const secondSlot = registered[3]?.[3];
+    const secondSlot = registered[2]?.[3];
     assert.match(firstSlot ?? '', /^client-resized\[\d+\]$/);
     assert.match(secondSlot ?? '', /^client-resized\[\d+\]$/);
     assert.notEqual(firstSlot, secondSlot);
@@ -233,6 +415,7 @@ describe('HUD resize hook helpers', () => {
     const registered: string[][] = [];
     const execTmuxSync = (args: string[]) => {
       if (args[0] === 'display-message') return '$7\t@3\n';
+      if (args[0] === 'list-panes') return '%1 0 101\n%9 0 909\n%10 0 910\n';
       registered.push(args);
       return '';
     };
@@ -240,7 +423,7 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%9', '%1', 3, execTmuxSync), true);
     assert.equal(registerHudResizeHook('%10', '%1', 3, execTmuxSync), true);
 
-    assert.equal(registered[0]?.[3], registered[3]?.[3]);
+    assert.equal(registered[0]?.[3], registered[2]?.[3]);
   });
 
   it('does not unregister the legacy hook when installing the leader-scoped hook fails', () => {
@@ -249,12 +432,14 @@ describe('HUD resize hook helpers', () => {
     const result = registerHudResizeHook('%9', '%1', 3, (args) => {
       calls.push(args);
       if (args[0] === 'display-message') return '$7\t@3\n';
+      if (args[0] === 'list-panes') return '%1 0 101\n%9 0 909\n';
       if (args[0] === 'set-hook' && args[1] === '-t') throw new Error('transient tmux failure');
       return '';
     });
 
     assert.equal(result, false);
     assert.deepEqual(calls.map((args) => args.slice(0, 2)), [
+      ['list-panes', '-a'],
       ['display-message', '-p'],
       ['set-hook', '-t'],
     ]);
@@ -266,14 +451,16 @@ describe('HUD resize hook helpers', () => {
     const result = registerHudResizeHook('%9', '%1', 3, (args) => {
       calls.push(args);
       if (args[0] === 'display-message') return '$7\t@3\n';
+      if (args[0] === 'list-panes') return '%1 0 101\n%9 0 909\n';
       if (args[0] === 'set-hook' && args[1] === '-u') throw new Error('stale legacy cleanup failure');
       return '';
     });
 
     assert.equal(result, true);
-    assert.equal(calls[1]?.[0], 'set-hook');
-    assert.equal(calls[1]?.[1], '-t');
-    assert.deepEqual(calls[2], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
+    assert.equal(calls[2]?.[0], 'set-hook');
+    assert.equal(calls[2]?.[1], '-t');
+    assert.equal(calls[3]?.[0], 'set-hook');
+    assert.equal(calls[3]?.[1], '-t');
   });
 
   it('unregisters only the leader-scoped hook slot for the selected leader', () => {
@@ -286,21 +473,11 @@ describe('HUD resize hook helpers', () => {
 
     assert.equal(unregisterHudResizeHook('%2', execTmuxSync), true);
 
-    assert.deepEqual(unregistered[0], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
-    assert.deepEqual(unregistered[1], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudResizeHookSlot('omx_hud_resize_7_3_2'),
-    ]);
-    assert.deepEqual(unregistered[2], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudLayoutHookSlot('omx_hud_resize_7_3_2'),
-    ]);
+    for (const call of unregistered) {
+      assert.deepEqual(call.slice(0, 4), ['if-shell', '-F', '-t', '$7']);
+      assert.match(call[4] ?? '', /^#\{==:@omx_hook_identity_(client_resized|window_layout_changed)_\d+,omx-[0-9a-f]+\}$/);
+      assert.match(call[5] ?? '', /^set-hook -u -t \$7 /);
+    }
   });
 });
 
@@ -323,6 +500,26 @@ describe('HUD pane ownership helpers', () => {
       startCommand: `exec env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch`,
       currentPath: '/tmp/repo',
     });
+  });
+
+  it('rejects noncanonical, signed, exponent, and out-of-range HUD geometry fields', () => {
+    for (const value of ['160px', '+160', '-1', '1e2', ' 160', '160 ', '4294967296']) {
+      const panes = parseTmuxPaneSnapshot(
+        `%2\tnode\t0\t47\t${value}\t3\t49\t160\t50\tnode omx hud --watch\t/tmp/repo`,
+      );
+      assert.deepEqual(panes, [], value);
+    }
+  });
+
+  it('parses independently valid current-window geometry fields without numeric prefixes', () => {
+    for (const [output, expected] of [
+      ['160px\t50\n', { width: null, height: 50 }],
+      ['+160\t50\n', { width: null, height: 50 }],
+      ['1e2\t50\n', { width: null, height: 50 }],
+      ['160\t4294967296\n', { width: 160, height: null }],
+    ] satisfies Array<[string, { width: number | null; height: number | null }]>) {
+      assert.deepEqual(readCurrentWindowSize(() => output), expected, output);
+    }
   });
 
   it('reads session and leader ownership from env-prefixed HUD commands', () => {
@@ -349,6 +546,31 @@ describe('HUD pane ownership helpers', () => {
     });
   });
 
+  it('fails closed on POSIX owner text that is not an unambiguous assignment word', () => {
+    const commands = [
+      "node omx.js hud --watch --preset=focused 'OMX_SESSION_ID=session-a'",
+      "# OMX_SESSION_ID=session-a\nnode omx.js hud --watch --preset=focused",
+      'exec env OMX_SESSION_ID=session-a; node omx.js hud --watch',
+      'exec env OMX_SESSION_ID=session-a|node omx.js hud --watch',
+      'exec env OMX_SESSION_ID=session-a OMX_SESSION_ID=session-b node omx.js hud --watch',
+    ];
+    for (const startCommand of commands) {
+      const pane = { paneId: '%9', currentCommand: 'node', startCommand };
+      assert.deepEqual(readHudPaneOwner(pane), { sessionId: undefined, leaderPaneId: undefined });
+      assert.deepEqual(findLegacyFocusedHudWatchPaneIds([pane], '%1'), []);
+    }
+  });
+
+  it('does not case-fold POSIX owner assignment keys', () => {
+    const pane = {
+      paneId: '%9',
+      currentCommand: 'node',
+      startCommand: "exec env omx_session_id='session-a' omx_tmux_hud_owner='1' omx_tmux_hud_leader_pane='%1' node omx.js hud --watch",
+    };
+    assert.deepEqual(readHudPaneOwner(pane), { sessionId: undefined, leaderPaneId: undefined });
+    assert.equal(hudPaneMatchesOwner(pane, { sessionId: 'session-a', leaderPaneId: '%1' }), false);
+  });
+
   it('reads and matches PowerShell HUD owner assignments with case-insensitive keys and literal quote decoding', () => {
     const panes = parseTmuxPaneSnapshot(
       [
@@ -366,6 +588,20 @@ describe('HUD pane ownership helpers', () => {
       findHudWatchPaneIds(panes, '%1', { sessionId: "session 'quoted'", leaderPaneId: '%1' }),
       ['%2'],
     );
+  });
+
+  it('round-trips native-Windows generated ownership through the shared parser', () => {
+    const command = buildHudStartupCommand('/opt/omx.js', {
+      OMX_TMUX_HUD_OWNER: '1',
+      OMX_SESSION_ID: "session 'quoted'",
+      [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%1',
+    }, undefined, 'win32');
+    const pane = { paneId: '%2', currentCommand: 'node.exe', startCommand: command };
+    assert.deepEqual(readHudPaneOwner(pane), {
+      sessionId: "session 'quoted'",
+      leaderPaneId: '%1',
+    });
+    assert.equal(hudPaneMatchesOwner(pane, { sessionId: "session 'quoted'", leaderPaneId: '%1' }), true);
   });
 
   it('treats PowerShell owner-marker-only HUD commands as owned metadata instead of legacy fallback', () => {
@@ -388,6 +624,7 @@ describe('HUD pane ownership helpers', () => {
         `%2\tnode\t$env:OMX_SESSION_ID = 'session-a'; $env:OMX_SESSION_ID = 'session-b'; $env:OMX_TMUX_HUD_OWNER = '1'; $env:OMX_TMUX_HUD_LEADER_PANE = '%1'; & node omx.js hud --watch --preset=focused`,
         `%3\tnode\tOMX_SESSION_ID='session-a'; $env:OMX_SESSION_ID = 'session-b'; $env:OMX_TMUX_HUD_OWNER = '1'; & node omx.js hud --watch --preset=focused`,
         `%4\tnode\t$env:OMX_TMUX_HUD_OWNER = '1'; $env:OMX_TMUX_HUD_LEADER_PANE = '%1'; $env:OMX_TMUX_HUD_LEADER_PANE = '%9'; & node omx.js hud --watch --preset=focused`,
+        `%5\tnode\t$env:OMX_SESSION_ID = 'session-a'; $env:OMX_TMUX_HUD_OWNER = '1'; $env:OMX_TMUX_HUD_LEADER_PANE = '%1'; & Write-Output x; $env:omx_session_id = 'session-b'; & node omx.js hud --watch --preset=focused`,
       ].join('\n'),
     );
 
@@ -398,6 +635,37 @@ describe('HUD pane ownership helpers', () => {
     }
     assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
     assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
+  });
+
+  it('fails closed on duplicate POSIX owner keys, including quoted tmux-shell assignments', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        `%2\tnode\texec env OMX_SESSION_ID='session-a' OMX_SESSION_ID='session-b' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx.js hud --watch --preset=focused`,
+        `%3\tnode\texec env OMX_SESSION_ID='session-a' '${OMX_TMUX_HUD_LEADER_PANE_ENV}=%1' '${OMX_TMUX_HUD_LEADER_PANE_ENV}=%9' node omx.js hud --watch --preset=focused`,
+        `%4\tnode\t/bin/zsh -c 'exec '\\''env'\\'' '\\''OMX_TMUX_HUD_OWNER=1'\\'' '\\''OMX_TMUX_HUD_OWNER=1'\\'' '\\''node'\\'' '\\''omx.js'\\'' '\\''hud'\\'' '\\''--watch'\\'' '\\''--preset=focused'\\'''`,
+      ].join('\n'),
+    );
+
+    for (const pane of panes.slice(1)) {
+      assert.deepEqual(readHudPaneOwner(pane), { sessionId: undefined, leaderPaneId: undefined });
+      assert.equal(hudPaneMatchesOwner(pane, { sessionId: 'session-a', leaderPaneId: '%1' }), false);
+    }
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
+  });
+
+  it('does not treat unrelated PowerShell environment prefixes as OMX owner metadata', () => {
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex',
+        `%2\tnode\t$env:PATH = 'C:\\Tools'; & node omx.js hud --watch --preset=focused`,
+      ].join('\n'),
+    );
+
+    assert.deepEqual(readHudPaneOwner(panes[1]!), { sessionId: undefined, leaderPaneId: undefined });
+    assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), ['%2']);
   });
 
   it('rejects empty, malformed, and near-miss PowerShell owner assignments', () => {
@@ -418,7 +686,7 @@ describe('HUD pane ownership helpers', () => {
       assert.equal(hudPaneMatchesOwner(pane, { sessionId: 'session-a', leaderPaneId: '%1' }), false);
     }
     assert.deepEqual(findHudWatchPaneIds(panes, '%1', { sessionId: 'session-a', leaderPaneId: '%1' }), []);
-    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), ['%6', '%7']);
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), []);
   });
 
   it('splits tmux octal-escaped control separators from live list-panes output', () => {
@@ -429,7 +697,7 @@ describe('HUD pane ownership helpers', () => {
         [
           '%202',
           'node',
-          `"exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%140' OMX_ROOT='/tmp/run' '/usr/bin/node' '/repo/dist/cli/omx.js' hud --watch --preset=focused"`,
+          `exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%140' OMX_ROOT='/tmp/run' '/usr/bin/node' '/repo/dist/cli/omx.js' hud --watch --preset=focused`,
           '/home/tools/oh-my-codex.omx-worktrees/launch-fix-default-subagent-fix',
         ].join(escapedSeparator),
       ].join('\n'),
@@ -591,35 +859,20 @@ describe('HUD pane ownership helpers', () => {
     );
   });
 
-  it('finds one same-session HUD pane when TMUX_PANE is unavailable', () => {
+  it('rejects a truncated HUD pane authority snapshot when TMUX_PANE is unavailable', () => {
     const calls: string[][] = [];
     const execTmuxSync = (args: string[]) => {
       calls.push(args);
+      if (args.at(-1) === '#{pane_id}') return '%1\n%2';
       return [
         '%1\tcodex\tcodex',
         `%2\tnode\texec env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch`,
       ].join('\n');
     };
 
-    assert.deepEqual(listCurrentWindowHudPaneIds(undefined, execTmuxSync, { sessionId: 'sess-a' }), ['%2']);
+    assert.deepEqual(listCurrentWindowHudPaneIds(undefined, execTmuxSync, { sessionId: 'sess-a' }), []);
     assert.deepEqual(calls, [
-      [
-        'list-panes',
-        '-F',
-        [
-          '#{pane_id}',
-          '#{pane_current_command}',
-          '#{pane_left}',
-          '#{pane_top}',
-          '#{pane_width}',
-          '#{pane_height}',
-          '#{pane_bottom}',
-          '#{window_width}',
-          '#{window_height}',
-          '#{pane_start_command}',
-          '#{pane_current_path}',
-        ].join('\x1f'),
-      ],
+      ['list-panes', '-F', '#{pane_id}'],
     ]);
   });
 
@@ -850,6 +1103,34 @@ describe('dead HUD pane reaper', () => {
 
     assert.deepEqual(killed, ['%2']);
     assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
+  });
+
+  it('preserves deleted-cwd HUD panes without unambiguous OMX owner metadata', () => {
+    const deletedPath = join(tmpdir(), 'omx-hud-owner-metadata-regression (deleted)');
+    rmSync(deletedPath, { recursive: true, force: true });
+    const panes = parseTmuxPaneSnapshot(
+      [
+        '%1\tcodex\tcodex\t/repo',
+        `%2\tnode\t$env:PATH = 'C:\\Tools'; & node omx.js hud --watch --preset=focused\t${deletedPath}`,
+        `%3\tnode\texec env OMX_SESSION_ID='session-a' OMX_SESSION_ID='session-b' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%9' node omx.js hud --watch --preset=focused\t${deletedPath}`,
+        `%4\tnode\texec env OMX_SESSION_ID='session-a' '${OMX_TMUX_HUD_LEADER_PANE_ENV}=%1' '${OMX_TMUX_HUD_LEADER_PANE_ENV}=%9' node omx.js hud --watch --preset=focused\t${deletedPath}`,
+        `%5\tnode\t/bin/zsh -c 'exec '\\''env'\\'' '\\''OMX_TMUX_HUD_OWNER=1'\\'' '\\''OMX_TMUX_HUD_OWNER=1'\\'' '\\''node'\\'' '\\''omx.js'\\'' '\\''hud'\\'' '\\''--watch'\\'' '\\''--preset=focused'\\'''\t${deletedPath}`,
+        `%6\tnode\texec env OMX_SESSION_ID='' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%9' node omx.js hud --watch --preset=focused\t${deletedPath}`,
+        `%7\tnode\t$env:OMX_SESSION_ID = 'session-a'; & ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%9' node omx.js hud --watch --preset=focused\t${deletedPath}`,
+      ].join('\n'),
+    );
+    const killed: string[] = [];
+
+    const result = reapDeadHudPanes(panes, {
+      killPane: (paneId) => {
+        killed.push(paneId);
+        return true;
+      },
+    });
+
+    assert.deepEqual(killed, []);
+    assert.deepEqual(result, { reaped: [], preserved: ['%2', '%3', '%4', '%5', '%6', '%7'] });
+    assert.deepEqual(findLegacyFocusedHudWatchPaneIds(panes, '%1'), ['%2']);
   });
 
   it('preserves HUD panes in an existing cwd whose name ends with the deleted marker text', () => {

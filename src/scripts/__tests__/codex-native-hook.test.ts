@@ -231,30 +231,32 @@ async function withLoreGuardConfig<T>(
 }
 
 function buildWorkerStopFakeTmux(
-	tmuxLogPath: string,
-	options: {
-		failSend?: boolean;
-		busyLeader?: boolean;
-		captureText?: string;
-		currentCommand?: string;
-		sendDelayMs?: number;
-		removePathOnSend?: string;
-		removePathOnCapture?: string;
-	} = {},
+  tmuxLogPath: string,
+  options: {
+    failSend?: boolean;
+    busyLeader?: boolean;
+    captureText?: string;
+    currentCommand?: string;
+    sendDelayMs?: number;
+    removePathOnSend?: string;
+    removePathOnCapture?: string;
+    tmuxSession?: string;
+    teamOwnerId?: string;
+    leaderPanePid?: number;
+    leaderPanePidAfterCapture?: number;
+  } = {},
 ): string {
-	const rawCaptureText =
-		options.captureText ??
-		(options.busyLeader ? "• Working… (esc to interrupt)" : "› ready");
-	const captureText = `'${rawCaptureText.replace(/'/g, "'\"'\"'")}'`;
-	const currentCommand = `'${(options.currentCommand ?? "codex").replace(/'/g, "'\"'\"'")}'`;
-	const sendDelaySeconds = Math.max(0, options.sendDelayMs ?? 0) / 1000;
-	const removePathOnSend = options.removePathOnSend
-		? `'${options.removePathOnSend.replace(/'/g, "'\"'\"'")}'`
-		: "";
-	const removePathOnCapture = options.removePathOnCapture
-		? `'${options.removePathOnCapture.replace(/'/g, "'\"'\"'")}'`
-		: "";
-	return `#!/usr/bin/env bash
+  const rawCaptureText = options.captureText ?? (options.busyLeader ? "• Working… (esc to interrupt)" : "› ready");
+  const captureText = `'${rawCaptureText.replace(/'/g, "'\"'\"'")}'`;
+  const currentCommand = `'${(options.currentCommand ?? "codex").replace(/'/g, "'\"'\"'")}'`;
+  const sendDelaySeconds = Math.max(0, options.sendDelayMs ?? 0) / 1000;
+  const removePathOnSend = options.removePathOnSend ? `'${options.removePathOnSend.replace(/'/g, "'\"'\"'")}'` : "";
+  const removePathOnCapture = options.removePathOnCapture ? `'${options.removePathOnCapture.replace(/'/g, "'\"'\"'")}'` : "";
+  const tmuxSession = options.tmuxSession ?? "omx-team-worker-stop";
+  const teamOwnerId = options.teamOwnerId ?? "team:worker-stop";
+  const leaderPanePid = options.leaderPanePid ?? 4242;
+  const leaderPanePidAfterCapture = options.leaderPanePidAfterCapture;
+  return `#!/usr/bin/env bash
 set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
@@ -270,6 +272,11 @@ if [[ "$cmd" == "display-message" ]]; then
     shift || true
   done
   case "$fmt" in
+    *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*)
+      leaderPanePid="${leaderPanePid}"
+      if [[ -f "${tmuxLogPath}.leader-pid" ]]; then leaderPanePid="$(cat "${tmuxLogPath}.leader-pid")"; fi
+      printf '%%42\t0\t%s\\n' "$leaderPanePid"
+      ;;
     "#{pane_in_mode}") echo "0" ;;
     "#{pane_id}") echo "%42" ;;
     "#{pane_current_path}") pwd ;;
@@ -280,8 +287,15 @@ if [[ "$cmd" == "display-message" ]]; then
   esac
   exit 0
 fi
+if [[ "$cmd" == "list-panes" ]]; then
+  leaderPanePid="${leaderPanePid}"
+  if [[ -f "${tmuxLogPath}.leader-pid" ]]; then leaderPanePid="$(cat "${tmuxLogPath}.leader-pid")"; fi
+  printf '%%42\t0\t%s\t%s\t%s\n' "$leaderPanePid" "${tmuxSession}" "${teamOwnerId}"
+  exit 0
+fi
 if [[ "$cmd" == "capture-pane" ]]; then
   ${removePathOnCapture ? `rm -rf ${removePathOnCapture}` : ""}
+  ${leaderPanePidAfterCapture ? `printf '%s' '${leaderPanePidAfterCapture}' > "${tmuxLogPath}.leader-pid"` : ""}
   printf '%s\\n' ${captureText}
   exit 0
 fi
@@ -310,6 +324,27 @@ if [[ "$cmd" == "delete-buffer" ]]; then
   rm -f "${tmuxLogPath}.buffer"
   exit 0
 fi
+if [[ "$cmd" == "if-shell" ]]; then
+  target=""
+  condition=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      -F) condition="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  success="\${1:-}"
+  leaderPanePid="${leaderPanePid}"
+  if [[ -f "${tmuxLogPath}.leader-pid" ]]; then leaderPanePid="$(cat "${tmuxLogPath}.leader-pid")"; fi
+  if [[ "$target" == "%42" && "$condition" == *"#{pane_id},%42"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},""$leaderPanePid"* ]]; then
+    sink="\${success%% ; display-message -p __OMX_PANE_MUTATION_OK__*}"
+    eval "set -- $sink"
+    "$0" "$@"
+    printf '%s\\n' "__OMX_PANE_MUTATION_OK__"
+  fi
+  exit 0
+fi
 if [[ "$cmd" == "send-keys" ]]; then
   ${sendDelaySeconds > 0 ? `sleep ${sendDelaySeconds}` : ""}
   ${removePathOnSend ? `rm -rf ${removePathOnSend}` : ""}
@@ -332,6 +367,53 @@ esac
 ;;
 esac
 `;
+}
+
+async function seedWorkerStopTeamFixture(
+  cwd: string,
+  teamName: string,
+  workerNames: string[],
+): Promise<void> {
+  const stateDir = join(cwd, ".omx", "state");
+  process.env.OMX_TEAM_STATE_ROOT = stateDir;
+  await initTeamState(teamName, "worker Stop fixture", "executor", workerNames.length, cwd);
+  const teamDir = join(stateDir, "team", teamName);
+  const configPath = join(teamDir, "config.json");
+  const manifestPath = join(teamDir, "manifest.v2.json");
+  const config = JSON.parse(await readFile(configPath, "utf-8")) as Record<string, unknown>;
+  const manifest = JSON.parse(await readFile(manifestPath, "utf-8")) as Record<string, unknown>;
+  const workers = workerNames.map((name, offset) => ({
+    name,
+    index: offset + 1,
+    role: "executor",
+    assigned_tasks: [],
+    pid: 5000 + offset,
+    pane_id: `%${10 + offset}`,
+    working_dir: cwd,
+    team_state_root: stateDir,
+  }));
+  const shared = {
+    tmux_session: "omx-team-worker-stop",
+    worker_count: workers.length,
+    workers,
+    leader_pane_id: "%42",
+    hud_pane_id: null,
+    tmux_pane_owner_id: `team:${teamName}`,
+    resize_hook_name: null,
+    resize_hook_target: null,
+    next_worker_index: workers.length + 1,
+  };
+  await writeJson(configPath, { ...config, ...shared });
+  await writeJson(manifestPath, { ...manifest, ...shared });
+}
+
+async function initTempGitRepo(prefix: string): Promise<string> {
+  const cwd = await mkdtemp(join(tmpdir(), prefix));
+  execFileSync("git", ["init"], { cwd, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd, stdio: "ignore" });
+  return cwd;
+}
 }
 
 async function initTempGitRepo(prefix: string): Promise<string> {
@@ -10525,16 +10607,49 @@ export async function onHookEvent(event) {
 				join(binDir, "tmux"),
 				`#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\\n' "$*" >> ${JSON.stringify(tmuxLog)}
+createdPath=${JSON.stringify(join(cwd, "tmux-created"))}
+optionPath=${JSON.stringify(join(cwd, "tmux-option"))}
+commandPath=${JSON.stringify(join(cwd, "tmux-command"))}
+printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
 case "$1" in
   list-panes)
-    printf '%%1\\tcodex\\tcodex\\n'
+    if [[ "$*" == "list-panes -t %1 -F #{pane_id}" ]]; then
+      printf '%%1\n'
+      if [[ -f "$createdPath" ]]; then printf '%%9\n'; fi
+    elif [[ "$*" == "list-panes -a -F #{pane_id}" ]]; then
+      printf '%%1\n'
+      if [[ -f "$createdPath" ]]; then printf '%%9\n'; fi
+    elif [[ "$*" == *"#{pane_current_command}"*"#{pane_dead}"*"#{pane_pid}"* ]]; then
+      printf '%b\n' "%1\\x1fcodex\\x1f0\\x1f0\\x1f200\\x1f60\\x1f59\\x1f200\\x1f60\\x1fcodex\\x1f${cwd}\\x1f0\\x1f1001"
+      if [[ -f "$createdPath" ]]; then
+        printf '%b\n' "%9\\x1fnode\\x1f0\\x1f60\\x1f200\\x1f3\\x1f62\\x1f200\\x1f60\\x1fexec env OMX_SESSION_ID='sess-hud-1' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch --preset=focused\\x1f${cwd}\\x1f0\\x1f1009"
+      fi
+    elif [[ "$*" == *"#{pane_dead}"*"#{pane_pid}"* ]]; then
+      printf '%%1 0 1001\n'
+      if [[ -f "$createdPath" ]]; then printf '%%9 0 1009\n'; fi
+    elif [[ "$*" == *"#{pane_start_command}" ]]; then
+      printf '%%1\tcodex\n'
+      if [[ -f "$createdPath" ]]; then printf '%%9\t%s\n' "$(<"$commandPath")"; fi
+    else
+      printf '%b\n' "%1\\x1fcodex\\x1f0\\x1f0\\x1f200\\x1f60\\x1f59\\x1f200\\x1f60\\x1fcodex\\x1f${cwd}\\x1f0\\x1f1001"
+      if [[ -f "$createdPath" ]]; then
+        printf '%b\n' "%9\\x1fnode\\x1f0\\x1f60\\x1f200\\x1f3\\x1f62\\x1f200\\x1f60\\x1fexec env OMX_SESSION_ID='sess-hud-1' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch --preset=focused\\x1f${cwd}\\x1f0\\x1f1009"
+      fi
+    fi
+    ;;
+  set-option)
+    printf '%s' "$4" > "$optionPath"
+    ;;
+  show-options)
+    if [[ -f "$optionPath" ]]; then printf '%s\n' "$(<"$optionPath")"; fi
     ;;
   display-message)
-    printf '200\\t60\\n'
+    printf '200\t60\n'
     ;;
   split-window)
-    printf '%%9\\n'
+    touch "$createdPath"
+    printf '%s' "\${!#}" > "$commandPath"
+    printf '%%9\n'
     ;;
   resize-pane)
     ;;
@@ -10555,43 +10670,34 @@ esac
 				{ cwd },
 			);
 
-			assert.equal(result.omxEventName, "keyword-detector");
-			const tmuxCalls = await readFile(tmuxLog, "utf-8");
-			assert.match(tmuxCalls, /list-panes -t %1 -F/);
-			assert.match(
-				tmuxCalls,
-				new RegExp(`split-window -v -l ${HUD_TMUX_HEIGHT_LINES} -d -t %1 -c`),
-			);
-			assert.match(
-				tmuxCalls,
-				new RegExp(`resize-pane -t %9 -y ${HUD_TMUX_HEIGHT_LINES}`),
-			);
-			assert.match(
-				tmuxCalls,
-				/dist\/cli\/omx\.js' hud --watch --preset=focused/,
-			);
-			assert.doesNotMatch(tmuxCalls, /\/tmp\/codex-host-binary' hud --watch/);
-		} finally {
-			if (originalTmux === undefined) {
-				delete process.env.TMUX;
-			} else {
-				process.env.TMUX = originalTmux;
-			}
-			if (originalTmuxPane === undefined) {
-				delete process.env.TMUX_PANE;
-			} else {
-				process.env.TMUX_PANE = originalTmuxPane;
-			}
-			if (originalHudOwner === undefined) {
-				delete process.env[OMX_TMUX_HUD_OWNER_ENV];
-			} else {
-				process.env[OMX_TMUX_HUD_OWNER_ENV] = originalHudOwner;
-			}
-			process.env.PATH = originalPath;
-			process.argv = originalArgv;
-			await rm(cwd, { recursive: true, force: true });
-		}
-	});
+      assert.equal(result.omxEventName, "keyword-detector");
+      const tmuxCalls = await readFile(tmuxLog, "utf-8");
+      assert.match(tmuxCalls, /list-panes -t %1 -F/);
+      assert.match(tmuxCalls, new RegExp(`split-window -v -l ${HUD_TMUX_HEIGHT_LINES} -d -t %1 -c`));
+      assert.match(tmuxCalls, new RegExp(`resize-pane -t %9 -y ${HUD_TMUX_HEIGHT_LINES}`));
+      assert.match(tmuxCalls, /dist\/cli\/omx\.js' hud --watch '--preset=focused'/);
+      assert.doesNotMatch(tmuxCalls, /\/tmp\/codex-host-binary' hud --watch/);
+    } finally {
+      if (originalTmux === undefined) {
+        delete process.env.TMUX;
+      } else {
+        process.env.TMUX = originalTmux;
+      }
+      if (originalTmuxPane === undefined) {
+        delete process.env.TMUX_PANE;
+      } else {
+        process.env.TMUX_PANE = originalTmuxPane;
+      }
+      if (originalHudOwner === undefined) {
+        delete process.env[OMX_TMUX_HUD_OWNER_ENV];
+      } else {
+        process.env[OMX_TMUX_HUD_OWNER_ENV] = originalHudOwner;
+      }
+      process.env.PATH = originalPath;
+      process.argv = originalArgv;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 
 	it("skips prompt-submit HUD reconciliation during doctor smoke validation", async () => {
 		const cwd = await mkdtemp(
@@ -10669,11 +10775,47 @@ esac
 				join(binDir, "tmux"),
 				`#!/usr/bin/env bash
 set -euo pipefail
+createdPath=${JSON.stringify(join(cwd, "tmux-created"))}
+optionPath=${JSON.stringify(join(cwd, "tmux-option"))}
+commandPath=${JSON.stringify(join(cwd, "tmux-command"))}
 printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
 case "$1" in
   list-panes)
-    printf '%%1\tcodex\tcodex\n'
-    printf '%%2\tnode\texec env OMX_TMUX_HUD_OWNER='"'"'1'"'"' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='"'"'%%1'"'"' /node /omx.js hud --watch\n'
+    if [[ "$*" == "list-panes -t %1 -F #{pane_id}" ]]; then
+      printf '%%1\n'
+      printf '%%2\n'
+      if [[ -f "$createdPath" ]]; then printf '%%9\n'; fi
+    elif [[ "$*" == "list-panes -a -F #{pane_id}" ]]; then
+      printf '%%1\n'
+      printf '%%2\n'
+      if [[ -f "$createdPath" ]]; then printf '%%9\n'; fi
+    elif [[ "$*" == *"#{pane_current_command}"*"#{pane_dead}"*"#{pane_pid}"* ]]; then
+      printf '%b\n' "%1\\x1fcodex\\x1f0\\x1f0\\x1f200\\x1f60\\x1f59\\x1f200\\x1f60\\x1fcodex\\x1f${cwd}\\x1f0\\x1f2001"
+      printf '%b\n' "%2\\x1fnode\\x1f0\\x1f60\\x1f200\\x1f3\\x1f62\\x1f200\\x1f60\\x1fexec env OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch\\x1f${cwd}\\x1f0\\x1f2002"
+      if [[ -f "$createdPath" ]]; then
+        printf '%b\n' "%9\\x1fnode\\x1f0\\x1f60\\x1f200\\x1f3\\x1f62\\x1f200\\x1f60\\x1fexec env OMX_SESSION_ID='omx-canonical-hud-reuse' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch --preset=focused\\x1f${cwd}\\x1f0\\x1f2009"
+      fi
+    elif [[ "$*" == *"#{pane_dead}"*"#{pane_pid}"* ]]; then
+      printf '%%1 0 2001\n'
+      printf '%%2 0 2002\n'
+      if [[ -f "$createdPath" ]]; then printf '%%9 0 2009\n'; fi
+    elif [[ "$*" == *"#{pane_start_command}" ]]; then
+      printf '%%1\tcodex\n'
+      printf '%s\t%s\n' '%2' "exec env OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch"
+      if [[ -f "$createdPath" ]]; then printf '%%9\t%s\n' "$(<"$commandPath")"; fi
+    else
+      printf '%b\n' "%1\\x1fcodex\\x1f0\\x1f0\\x1f200\\x1f60\\x1f59\\x1f200\\x1f60\\x1fcodex\\x1f${cwd}\\x1f0\\x1f2001"
+      printf '%b\n' "%2\\x1fnode\\x1f0\\x1f60\\x1f200\\x1f3\\x1f62\\x1f200\\x1f60\\x1fexec env OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch\\x1f${cwd}\\x1f0\\x1f2002"
+      if [[ -f "$createdPath" ]]; then
+        printf '%b\n' "%9\\x1fnode\\x1f0\\x1f60\\x1f200\\x1f3\\x1f62\\x1f200\\x1f60\\x1fexec env OMX_SESSION_ID='omx-canonical-hud-reuse' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' /node /omx.js hud --watch --preset=focused\\x1f${cwd}\\x1f0\\x1f2009"
+      fi
+    fi
+    ;;
+  set-option)
+    printf '%s' "$4" > "$optionPath"
+    ;;
+  show-options)
+    if [[ -f "$optionPath" ]]; then printf '%s\n' "$(<"$optionPath")"; fi
     ;;
   display-message)
     printf '200\t60\n'
@@ -10681,6 +10823,8 @@ case "$1" in
   resize-pane)
     ;;
   split-window)
+    touch "$createdPath"
+    printf '%s' "\${!#}" > "$commandPath"
     printf '%%9\n'
     ;;
 esac
@@ -21704,7 +21848,7 @@ PY`,
       const fakeBinDir = join(cwd, "fake-bin");
       const tmuxLogPath = join(cwd, "tmux.log");
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { teamOwnerId: "team:worker-stop-team-terminal" }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       const workerDir = join(cwd, ".omx", "state", "team", "worker-stop-team-terminal", "workers", "worker-1");
       await writeJson(join(cwd, ".omx", "state", "team", "worker-stop-team-terminal", "config.json"), {
@@ -21719,6 +21863,7 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
       });
+      await seedWorkerStopTeamFixture(cwd, "worker-stop-team-terminal", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
         name: "worker-1",
         index: 1,
@@ -21799,7 +21944,7 @@ PY`,
       const fakeBinDir = join(cwd, "fake-bin");
       const tmuxLogPath = join(cwd, "tmux.log");
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { busyLeader: true }));
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { busyLeader: true, teamOwnerId: "team:worker-stop-team-busy-leader" }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       const stateDir = join(cwd, ".omx", "state");
       const teamDir = join(stateDir, "team", "worker-stop-team-busy-leader");
@@ -21816,6 +21961,7 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
       });
+      await seedWorkerStopTeamFixture(cwd, "worker-stop-team-busy-leader", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
         name: "worker-1",
         index: 1,
@@ -21881,7 +22027,7 @@ PY`,
       const fakeBinDir = join(cwd, "fake-bin");
       const tmuxLogPath = join(cwd, "tmux.log");
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { teamOwnerId: `team:${teamName}` }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       await writeJson(join(teamDir, "manifest.v2.json"), {
         name: teamName,
@@ -21892,6 +22038,7 @@ PY`,
           { name: "worker-2", index: 2, pane_id: "%11" },
         ],
       });
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1", "worker-2"]);
       process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
 
       const first = await maybeNudgeLeaderForAllowedWorkerStop({
@@ -21931,7 +22078,7 @@ PY`,
       const fakeBinDir = join(cwd, "fake-bin");
       const tmuxLogPath = join(cwd, "tmux.log");
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { sendDelayMs: 100 }));
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { sendDelayMs: 100, teamOwnerId: `team:${teamName}` }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       await writeJson(join(teamDir, "manifest.v2.json"), {
         name: teamName,
@@ -21942,6 +22089,7 @@ PY`,
           { name: "worker-2", index: 2, pane_id: "%11" },
         ],
       });
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1", "worker-2"]);
       process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
 
       const results = await Promise.all([
@@ -21969,6 +22117,61 @@ PY`,
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("fails closed for dual-file divergence before worker Stop leader delivery", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-dual-file-divergence-"));
+    const prevPath = process.env.PATH;
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const logsDir = join(cwd, ".omx", "logs");
+      const teamName = "stop-dual-divergence";
+      const teamDir = join(stateDir, "team", teamName);
+      const tmuxLogPath = join(cwd, "tmux.log");
+      const fakeBinDir = join(cwd, "fake-bin");
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { teamOwnerId: `team:${teamName}` }));
+      await chmod(join(fakeBinDir, "tmux"), 0o755);
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
+      const manifestPath = join(teamDir, "manifest.v2.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf-8"));
+      await writeJson(manifestPath, { ...manifest, leader_pane_id: "%99" });
+      process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
+
+      const result = await maybeNudgeLeaderForAllowedWorkerStop({ stateDir, logsDir, workerContext: { teamName, workerName: "worker-1" } });
+      assert.equal(result.result, "leader_authority_invalid");
+      assert.equal(existsSync(tmuxLogPath), false);
+    } finally {
+      if (typeof prevPath === "string") process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the leader pane ID is reused with a changed PID during worker Stop delivery", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-leader-pid-reuse-"));
+    const prevPath = process.env.PATH;
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const logsDir = join(cwd, ".omx", "logs");
+      const teamName = "worker-stop-leader-pid-reuse";
+      const tmuxLogPath = join(cwd, "tmux.log");
+      const fakeBinDir = join(cwd, "fake-bin");
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { teamOwnerId: `team:${teamName}`, leaderPanePid: 4242, leaderPanePidAfterCapture: 7777 }));
+      await chmod(join(fakeBinDir, "tmux"), 0o755);
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
+      process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
+
+      const result = await maybeNudgeLeaderForAllowedWorkerStop({ stateDir, logsDir, workerContext: { teamName, workerName: "worker-1" } });
+      assert.equal(result.result, "deferred");
+      assert.doesNotMatch(await readFile(tmuxLogPath, "utf-8"), /(?:clear|paste-buffer|send-keys)/);
+    } finally {
+      if (typeof prevPath === "string") process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 
   it("skips worker Stop leader nudge when team state is missing or shut down", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-worker-missing-team-"));
@@ -22022,6 +22225,7 @@ PY`,
         join(fakeBinDir, "tmux"),
         buildWorkerStopFakeTmux(tmuxLogPath, {
           busyLeader: true,
+          teamOwnerId: `team:${teamName}`,
           captureText:
             `[OMX] worker-1 native Stop allowed. Run \`omx team status ${teamName}\`, read worker messages/results, then assign next task, reconcile completion, or shut down. [OMX_TMUX_INJECT]\n`
             + "• Working… (esc to interrupt)",
@@ -22034,6 +22238,7 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-2", index: 2, pane_id: "%11" }],
       });
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-2"]);
       process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
 
       const result = await maybeNudgeLeaderForAllowedWorkerStop({
@@ -22073,8 +22278,10 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
       });
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
+      await rm(join(teamDir, "workers"), { recursive: true, force: true });
       await writeFile(join(teamDir, "workers"), "not a directory");
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { teamOwnerId: `team:${teamName}` }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
 
@@ -22122,7 +22329,8 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
       });
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { removePathOnSend: teamDir }));
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { removePathOnSend: teamDir, teamOwnerId: `team:${teamName}` }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       process.env.PATH = `${fakeBinDir}:${prevPath || ""}`;
 
@@ -22132,10 +22340,8 @@ PY`,
         workerContext: { teamName, workerName: "worker-1" },
       });
 
-      assert.equal(result.result, "sent");
+      assert.equal(result.result, "team_state_gone_or_shutdown");
       assert.equal(existsSync(teamDir), false, "worker Stop delivery must not recreate removed team state");
-      const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      assert.match(tmuxLog, /send-keys -t %42 -l \[OMX\] worker-1 native Stop allowed/);
     } finally {
       if (typeof prevPath === "string") process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -22160,12 +22366,14 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
       });
+      await seedWorkerStopTeamFixture(cwd, teamName, ["worker-1"]);
       await writeFile(
         join(fakeBinDir, "tmux"),
         buildWorkerStopFakeTmux(tmuxLogPath, {
           currentCommand: "bash",
           captureText: "$ ",
           removePathOnCapture: teamDir,
+          teamOwnerId: `team:${teamName}`,
         }),
       );
       await chmod(join(fakeBinDir, "tmux"), 0o755);
@@ -22220,7 +22428,7 @@ PY`,
       );
       const fakeBinDir = join(cwd, "fake-bin");
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(join(cwd, "tmux.log"), { failSend: true }));
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(join(cwd, "tmux.log"), { failSend: true, teamOwnerId: "team:worker-stop-helper-fail" }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       const stateDir = join(cwd, ".omx", "state");
       const workerDir = join(stateDir, "team", "worker-stop-helper-fail", "workers", "worker-1");
@@ -22236,6 +22444,7 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
       });
+      await seedWorkerStopTeamFixture(cwd, "worker-stop-helper-fail", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
         name: "worker-1",
         assigned_tasks: ["1"],
@@ -22463,7 +22672,7 @@ PY`,
       const fakeBinDir = join(cwd, "fake-bin");
       const tmuxLogPath = join(cwd, "tmux.log");
       await mkdir(fakeBinDir, { recursive: true });
-      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath));
+      await writeFile(join(fakeBinDir, "tmux"), buildWorkerStopFakeTmux(tmuxLogPath, { teamOwnerId: "team:internal-stop-team" }));
       await chmod(join(fakeBinDir, "tmux"), 0o755);
       const workerDir = join(stateDir, "team", "internal-stop-team", "workers", "worker-1");
       await writeJson(join(stateDir, "team", "internal-stop-team", "config.json"), {
@@ -22472,6 +22681,7 @@ PY`,
         leader_pane_id: "%42",
         workers: [{ name: "worker-1", index: 1, pane_id: "%10" }],
       });
+      await seedWorkerStopTeamFixture(cwd, "internal-stop-team", ["worker-1"]);
       await writeJson(join(workerDir, "identity.json"), {
         name: "worker-1",
         assigned_tasks: ["1"],
@@ -22626,6 +22836,38 @@ PY`,
         stopReason: "team_team-exec",
         systemMessage: "OMX team pipeline is still active at phase team-exec.",
       });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when canonical Stop fallback companion Team state is malformed or divergent", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-strict-companion-"));
+    const teamName = "strict-companion-team";
+    const sessionId = "sess-stop-team-strict-companion";
+    const configPath = join(cwd, ".omx", "state", "team", teamName, "config.json");
+    const stopPayload = {
+      hook_event_name: "Stop",
+      cwd,
+      session_id: sessionId,
+    };
+    try {
+      await initTeamState(teamName, "strict canonical companion", "executor", 1, cwd, undefined, {
+        ...process.env,
+        OMX_SESSION_ID: sessionId,
+      });
+      await writeFile(configPath, "{");
+      let result = await dispatchCodexNativeHook(stopPayload, { cwd });
+      assert.equal(result.outputJson, null, "a malformed config companion must not authorize Stop blocking");
+
+      await initTeamState(teamName, "strict canonical companion", "executor", 1, cwd, undefined, {
+        ...process.env,
+        OMX_SESSION_ID: sessionId,
+      });
+      const config = JSON.parse(await readFile(configPath, "utf-8")) as Record<string, unknown>;
+      await writeJson(configPath, { ...config, task: "divergent companion" });
+      result = await dispatchCodexNativeHook(stopPayload, { cwd });
+      assert.equal(result.outputJson, null, "a divergent config companion must not authorize Stop blocking");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -22940,7 +23182,7 @@ PY`,
     }
   });
 
-  it("returns Stop continuation output from canonical team state when manifest session ownership is missing", async () => {
+  it("does not authorize canonical Stop fallback when the manifest leader ownership is malformed", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-legacy-"));
     try {
       await initTeamState(
@@ -22972,13 +23214,7 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.deepEqual(result.outputJson, {
-        decision: "block",
-        reason:
-          `OMX team pipeline is still active (legacy-team) at phase team-exec; continue coordinating until the team reaches a terminal phase.${TEAM_STOP_COMMIT_GUIDANCE}`,
-        stopReason: "team_team-exec",
-        systemMessage: "OMX team pipeline is still active at phase team-exec.",
-      });
+      assert.equal(result.outputJson, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

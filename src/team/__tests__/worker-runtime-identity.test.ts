@@ -207,10 +207,29 @@ process.on('SIGTERM', () => process.exit(0));
           '    echo "tmux 3.2a"',
           '    ;;',
           '  split-window)',
+          '    : > "$0.created"',
+          '    split_command=""; for arg do split_command="$arg"; done',
+          '    printf "%s\\t%s\\n" "%31" "1000000031" > "$0.created-pane-pid"',
+          '    printf "%s\\t%s\\n" "%31" "$split_command" > "$0.created-pane-command"',
           '    echo "%31"',
           '    ;;',
+          '  set-option)',
+          '    [ "$2" != "-g" ] || printf "%s" "$4" > "$0.proof"',
+          '    ;;',
+          '  show-options)',
+          '    cat "$0.proof"; printf "\\n"',
+          '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    case "$*" in',
+          '      *"-a -F #{pane_id} #{pane_dead} #{pane_pid}"*) printf "%%11 0 42424\\n%%21 0 42424\\n"; [ ! -f "$0.created-pane-pid" ] || cat "$0.created-pane-pid" | while IFS="$(printf \'\\t\')" read -r pane pid; do printf "%s 0 %s\\n" "$pane" "$pid"; done ;;',
+          '      *"-a -F #{pane_id}\t#{pane_start_command}"*) printf "%%11\\tbash\\n%%21\\tbash\\n"; [ ! -f "$0.created-pane-command" ] || cat "$0.created-pane-command" ;;',
+          '      *"-a -F #{pane_id}"*) printf "%%11\\n%%21\\n"; [ ! -f "$0.created" ] || printf "%%31\\n" ;;',
+          '      *"#{@omx_team_pane_owner_id}"*) owner="team:${3#omx-team-}"; printf "%s\\t%s\\n" "%11" "$owner"; printf "%s\\t%s\\n" "%21" "$owner"; [ ! -f "$0.created" ] || printf "%s\\t%s\\n" "%31" "$owner" ;;',
+          '      *) echo "42424" ;;',
+          '    esac',
+          '    ;;',
+          '  if-shell)',
+          '    case "${6:-}" in *capture-pane*) printf "›\\n" ;; esac',
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -250,9 +269,12 @@ process.on('SIGTERM', () => process.exit(0));
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'manifest.v2.json');
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+      manifest.tmux_session = config.tmux_session;
+      manifest.leader_pane_id = config.leader_pane_id;
+      manifest.workers = config.workers;
       manifest.policy = {
-        ...(manifest.policy ?? {}),
+        ...((manifest.policy ?? {}) as Record<string, unknown>),
         dispatch_mode: 'transport_direct',
       };
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
@@ -308,10 +330,29 @@ process.on('SIGTERM', () => process.exit(0));
           '    echo "tmux 3.2a"',
           '    ;;',
           '  split-window)',
+          '    : > "$0.created"',
+          '    split_command=""; for arg do split_command="$arg"; done',
+          '    printf "%s\\t%s\\n" "%31" "1000000031" > "$0.created-pane-pid"',
+          '    printf "%s\\t%s\\n" "%31" "$split_command" > "$0.created-pane-command"',
           '    echo "%31"',
           '    ;;',
+          '  set-option)',
+          '    [ "$2" != "-g" ] || printf "%s" "$4" > "$0.proof"',
+          '    ;;',
+          '  show-options)',
+          '    cat "$0.proof"; printf "\\n"',
+          '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    case "$*" in',
+          '      *"-a -F #{pane_id} #{pane_dead} #{pane_pid}"*) printf "%%11 0 42424\\n%%21 0 42424\\n"; [ ! -f "$0.created-pane-pid" ] || cat "$0.created-pane-pid" | while IFS="$(printf \'\\t\')" read -r pane pid; do printf "%s 0 %s\\n" "$pane" "$pid"; done ;;',
+          '      *"-a -F #{pane_id}\t#{pane_start_command}"*) printf "%%11\\tbash\\n%%21\\tbash\\n"; [ ! -f "$0.created-pane-command" ] || cat "$0.created-pane-command" ;;',
+          '      *"-a -F #{pane_id}"*) printf "%%11\\n%%21\\n"; [ ! -f "$0.created" ] || printf "%%31\\n" ;;',
+          '      *"#{@omx_team_pane_owner_id}"*) owner="team:${3#omx-team-}"; printf "%s\\t%s\\n" "%11" "$owner"; printf "%s\\t%s\\n" "%21" "$owner"; [ ! -f "$0.created" ] || printf "%s\\t%s\\n" "%31" "$owner" ;;',
+          '      *) echo "42424" ;;',
+          '    esac',
+          '    ;;',
+          '  if-shell)',
+          '    case "${6:-}" in *capture-pane*) printf "›\\n" ;; esac',
           '    ;;',
           '  send-keys)',
           '    ;;',
@@ -349,9 +390,13 @@ process.on('SIGTERM', () => process.exit(0));
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'manifest.v2.json');
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+      manifest.tmux_session = config.tmux_session;
+      manifest.leader_pane_id = config.leader_pane_id;
+      manifest.workers = config.workers;
+      manifest.next_worker_index = config.next_worker_index;
       manifest.policy = {
-        ...(manifest.policy ?? {}),
+        ...((manifest.policy ?? {}) as Record<string, unknown>),
         dispatch_mode: 'transport_direct',
       };
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));

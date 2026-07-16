@@ -8,15 +8,16 @@
 
 import { existsSync } from 'fs';
 import { appendFile, mkdir, rename, rm, stat, writeFile } from 'fs/promises';
-import { dirname, join, relative } from 'path';
+import { dirname, join, relative, resolve } from 'path';
 import { DEFAULT_MARKER, paneHasActiveTask } from '../tmux-hook-engine.js';
 import { appendTeamDeliveryLog } from '../../team/delivery-log.js';
 import { safeString, asNumber, isTerminalPhase } from './utils.js';
 import { readJsonIfExists } from './state-io.js';
 import { logTmuxHookEvent } from './log.js';
 import { evaluatePaneInjectionReadiness, sendPaneInput } from './team-tmux-guard.js';
-import { resolvePaneTarget } from './tmux-injection.js';
-import { readTeamWorkersForIdleCheck } from './team-worker.js';
+import { migrateV1ToV2, readTeamStateOutcome } from '../../team/state.js';
+import { parseCanonicalTmuxPaneId } from '../../hud/tmux.js';
+import { runProcess } from './process-runner.js';
 
 const STOP_NUDGE_COOLDOWN_MS = 30_000;
 const SOURCE_TYPE = 'worker_stop';
@@ -35,6 +36,37 @@ async function teamStateAllowsWorkerStopNudge(stateDir, teamName) {
   if (currentPhase && isTerminalPhase(currentPhase)) return false;
 
   return true;
+}
+
+async function readLeaderPaneAuthority(teamName, cwd, expected = null) {
+  let outcome = await readTeamStateOutcome(teamName, cwd);
+  if (outcome.status === 'invalid' && outcome.source === 'manifest' && outcome.reason === 'incomplete') {
+    await migrateV1ToV2(teamName, cwd);
+    outcome = await readTeamStateOutcome(teamName, cwd);
+  }
+  if (outcome.status !== 'valid') return null;
+
+  const config = outcome.config;
+  const paneId = parseCanonicalTmuxPaneId(config?.leader_pane_id);
+  const tmuxSession = safeString(config?.tmux_session);
+  const ownerId = safeString(config?.tmux_pane_owner_id);
+  if (!paneId || paneId !== config?.leader_pane_id || !tmuxSession || !ownerId) return null;
+
+  try {
+    const result = await runProcess('tmux', ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}\t#{@omx_team_pane_owner_id}'], 2000);
+    const rawRows = safeString(result.stdout);
+    if (!rawRows || rawRows.includes('\r') || !rawRows.endsWith('\n') || rawRows.endsWith('\n\n')) return null;
+    const rows = rawRows.slice(0, -1).split('\n').map((line) => line.split('\t'));
+    const seenPaneIds = new Set();
+    if (rows.some((row) => row.length !== 5 || parseCanonicalTmuxPaneId(row[0]) !== row[0] || (row[1] !== '0' && row[1] !== '1') || !/^[1-9][0-9]*$/.test(row[2]) || !row[3] || !row[4] || seenPaneIds.has(row[0]) || !seenPaneIds.add(row[0]))) return null;
+    const row = rows.find(([id]) => id === paneId);
+    if (!row) return null;
+    const [, dead, panePid, sessionName, paneOwnerId] = row;
+    if (dead !== '0' || sessionName !== tmuxSession || paneOwnerId !== ownerId || (expected && (expected.paneId !== paneId || expected.panePid !== panePid || expected.tmuxSession !== tmuxSession || expected.ownerId !== ownerId))) return null;
+    return { config, paneId, panePid, tmuxSession, ownerId };
+  } catch {
+    return null;
+  }
 }
 
 async function acquireTeamStopNudgeLock(teamDir, nowMs, cooldownMs) {
@@ -134,18 +166,6 @@ function resolveWorkerStopCooldownMs() {
   return STOP_NUDGE_COOLDOWN_MS;
 }
 
-async function resolveCanonicalLeaderPaneId(leaderPaneId) {
-  const normalizedLeaderPaneId = safeString(leaderPaneId).trim();
-  if (!normalizedLeaderPaneId) return '';
-  try {
-    const resolved = await resolvePaneTarget({ type: 'pane', value: normalizedLeaderPaneId }, '', '', '', {});
-    const paneTarget = safeString(resolved?.paneTarget).trim();
-    if (paneTarget) return paneTarget;
-  } catch {
-    // Fall back to the recorded pane id; readiness guard remains authoritative.
-  }
-  return normalizedLeaderPaneId;
-}
 
 async function recordSuppressedWorkerStopNudge({
   logsDir,
@@ -301,10 +321,13 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
     return { ok: true, result: 'suppressed_cooldown' };
   }
 
-  const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
-  if (!teamInfo) return { ok: false, result: 'unresolved' };
-  ({ tmuxSession, leaderPaneId } = teamInfo);
-  const tmuxTarget = await resolveCanonicalLeaderPaneId(leaderPaneId);
+  const authorityCwd = resolve(stateDir, '..', '..');
+  const leaderAuthority = await readLeaderPaneAuthority(teamName, authorityCwd);
+  if (!leaderAuthority) return { ok: true, result: 'leader_authority_invalid' };
+  tmuxSession = leaderAuthority.tmuxSession;
+  leaderPaneId = leaderAuthority.paneId;
+  const assertLeaderAuthority = async () => Boolean(await readLeaderPaneAuthority(teamName, authorityCwd, leaderAuthority));
+  const tmuxTarget = leaderAuthority.paneId;
 
   if (!tmuxTarget) {
     if (!(await teamStateAllowsWorkerStopNudge(stateDir, teamName))) {
@@ -330,6 +353,7 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
     requireRunningAgent: true,
     requireReady: false,
     requireIdle: false,
+    assertPaneAuthority: assertLeaderAuthority,
   });
   if (!paneGuard.ok) {
     if (!(await teamStateAllowsWorkerStopNudge(stateDir, teamName))) {
@@ -367,6 +391,7 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
       prompt,
       submitKeyPresses: 2,
       submitDelayMs: 100,
+      assertPaneAuthority: assertLeaderAuthority,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
     const deliveryMode = leaderHasActiveTask ? 'steered' : 'sent';

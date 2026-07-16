@@ -1608,6 +1608,10 @@ case "$1" in
     ;;
   list-panes)
     case "$*" in
+      *"-a -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%11 0 1101\n%%12 0 1102\n%%13 0 1103\n%%14 0 1104\n"
+        exit 0
+        ;;
       *"-F #{pane_dead} #{pane_pid}"*)
         exit 1
         ;;

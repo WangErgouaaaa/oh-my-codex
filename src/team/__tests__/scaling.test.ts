@@ -214,7 +214,17 @@ async function writeReadyContextPack(
 async function writeSuccessfulScaleUpTmuxStub(
   fakeBinDir: string,
   tmuxLogPath: string,
+  deadAfterInitialLive = false,
+  options: {
+    malformedFirstPostSplitSnapshot?: boolean;
+    malformedLivenessBatch?: boolean;
+    recycleOperationMarker?: boolean;
+    recyclePidAtLivenessProbe?: number;
+    readyCapture?: boolean;
+  } = {},
 ): Promise<void> {
+  const splitCountPath = join(fakeBinDir, 'split-count');
+  const strictProbePath = join(fakeBinDir, 'strict-probe-count');
   const tmuxStubPath = join(fakeBinDir, 'tmux');
   await writeFile(
     tmuxStubPath,
@@ -226,16 +236,41 @@ async function writeSuccessfulScaleUpTmuxStub(
       '  -V)',
       '    echo "tmux 3.2a"',
       '    ;;',
+      '  set-option)',
+      '    case "${2:-}" in',
+      '      -g) printf "%s" "${4:-}" > "$0.option-${3:-}" ;;',
+      '      -p) : > "$0.owner-tagged" ;;',
+      '    esac',
+      '    ;;',
+      '  show-options)',
+      '    case "${2:-}" in',
+      '      -g) cat "$0.option-${4:-}"; printf "\\n" ;;',
+
+      '    esac',
+      '    ;;',
       '  split-window)',
-      '    echo "%31"',
+      `    count=0; if [ -f "${splitCountPath}" ]; then IFS= read -r count < "${splitCountPath}"; fi`,
+      `    count=$((count + 1)); printf '%s\\n' "$count" > "${splitCountPath}"`,
+      '    split_command=""; for arg do split_command="$arg"; done',
+
+      '    echo "%$((30 + count))"',
+      '    printf \'%%%s\\n\' "$((30 + count))" >> "$0.created-panes"',
+      '    printf \'%%%s\\t%s\\n\' "$((30 + count))" "$((1000000000 + 30 + count))" >> "$0.created-pane-pids"',
+      '    printf \'%%%s\\t%s\\n\' "$((30 + count))" "$split_command" >> "$0.created-pane-commands"',
+
+
       '    ;;',
-      '  list-panes)',
-      '    echo "42424"',
-      '    ;;',
+      ...tmuxAuthorityListPanesCase(
+        ['%11', '%21', '%12'],
+        '42424',
+        deadAfterInitialLive,
+        strictProbePath,
+        options,
+      ),
       '  send-keys)',
       '    ;;',
       '  capture-pane)',
-      '    echo ""',
+      `    echo "${options.readyCapture ? '›' : ''}"`,
       '    ;;',
       'esac',
       'exit 0',
@@ -245,6 +280,65 @@ async function writeSuccessfulScaleUpTmuxStub(
   await chmod(tmuxStubPath, 0o755);
   await writeFile(tmuxLogPath, '');
 }
+
+function tmuxAuthorityListPanesCase(
+  paneIds: readonly string[],
+  fallbackOutput = '42424',
+  deadAfterInitialLive = false,
+  strictProbePath = '',
+  options: {
+    malformedFirstPostSplitSnapshot?: boolean;
+    malformedLivenessBatch?: boolean;
+    recycleOperationMarker?: boolean;
+    recyclePidAtLivenessProbe?: number;
+    readyCapture?: boolean;
+    atomicSendFailure?: boolean;
+  } = {},
+): string[] {
+  const globalPaneFormat = paneIds.map((paneId) => `${paneId.replace('%', '%%')}\\n`).join('');
+  const ownedPaneFormat = paneIds.map((paneId) => `${paneId.replace('%', '%%')}\\t%s\\n`).join('');
+  const ownerArgs = paneIds.map(() => '"$owner"').join(' ');
+  const staticLivenessFormat = paneIds.map((paneId) => `${paneId.replace('%', '%%')} 0 42424\\n`).join('');
+  const createdLiveness = deadAfterInitialLive
+    ? `probe_count=0; if [ -f "${strictProbePath}" ]; then IFS= read -r probe_count < "${strictProbePath}"; fi; probe_count=$((probe_count + 1)); printf '%s\\n' "$probe_count" > "${strictProbePath}";`
+    : options.recyclePidAtLivenessProbe
+      ? `liveness_probe_count=0; if [ -f "$0.liveness-probe-count" ]; then IFS= read -r liveness_probe_count < "$0.liveness-probe-count"; fi; liveness_probe_count=$((liveness_probe_count + 1)); printf '%s\\n' "$liveness_probe_count" > "$0.liveness-probe-count";`
+      : '';
+  return [
+    '  set-option)',
+    '    if [ "${2:-}" = "-g" ] && [ -n "${3:-}" ]; then printf "%s" "${4:-}" > "$0.global-option-${3:-}"; fi',
+    '    ;;',
+    '  show-options)',
+    '    if [ "${2:-}" = "-g" ] && [ "${3:-}" = "-v" ]; then cat "$0.global-option-${4:-}"; printf "\\n"; else exit 1; fi',
+
+    '    ;;',
+    '  list-panes)',
+    '    case "${2:-}" in',
+    `      -a) case "\${4:-}" in '#{pane_id}\t#{pane_start_command}') if [ "${options.recycleOperationMarker === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf '%s\\tbash\\n' '%31'; elif [ -f "$0.created-pane-commands" ]; then printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\\tbash\\n' "$pane"; done; while IFS="$(printf '\\t')" read -r pane command; do printf '%s\\t%s\\n' "$pane" "$command"; done < "$0.created-pane-commands"; fi ;; '#{pane_id} #{pane_dead} #{pane_pid}') if [ "${options.malformedLivenessBatch === true ? '1' : '0'}" = 1 ] && [ -f "$0.owner-tagged" ]; then printf '%s 0 42424\\n\\n' '${paneIds[0]}'; else ${createdLiveness} printf "${staticLivenessFormat}"; if [ -f "$0.created-pane-pids" ]; then while IFS="$(printf '\\t')" read -r pane pid; do if [ "${deadAfterInitialLive ? '$probe_count' : '0'}" -ge 5 ]; then printf '%s 1 %s\\n' "$pane" "$pid"; else ${options.recyclePidAtLivenessProbe ? `if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe} ]; then pid=$((pid + 1)); fi;` : ''} printf '%s 0 %s\\n' "$pane" "$pid"; fi; done < "$0.created-pane-pids"; fi; fi ;; '#{pane_id} #{pane_dead}') printf "${globalPaneFormat}" | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s 0\\n' "$pane"; done; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do printf '%s 0\\n' "$pane"; done < "$0.created-panes"; fi ;; *) if [ "${options.malformedFirstPostSplitSnapshot === true ? '1' : '0'}" = 1 ] && [ -f "$0.created-panes" ] && [ ! -f "$0.malformed-post-snapshot" ]; then : > "$0.malformed-post-snapshot"; printf 'malformed\\n'; else printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; fi ;; esac ;;`,
+
+    '      -t)',
+    '        session="${3:-}"',
+    '        owner="team:${session#omx-team-}"',
+    `        case "\${5:-}" in '#{pane_id}') printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi ;; '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}') { printf "${globalPaneFormat}"; if [ -f "$0.created-panes" ]; then cat "$0.created-panes"; fi; } | while IFS= read -r pane; do [ -n "$pane" ] && printf '%s\\tbash\\tbash\\n' "$pane"; done ;; '#{pane_dead} #{pane_pid}') printf '0 42424\\n' ;; *) printf "${ownedPaneFormat}" ${ownerArgs}; if [ -f "$0.created-panes" ]; then while IFS= read -r pane; do printf '%s\\t%s\\n' "$pane" "$owner"; done < "$0.created-panes"; fi ;; esac`,
+    '        ;;',
+    `      *) echo "${fallbackOutput}" ;;`,
+    '    esac',
+    '    ;;',
+  '  if-shell)',
+    `    if [ "${options.recyclePidAtLivenessProbe === undefined ? '0' : '1'}" = 1 ] && [ -f "$0.liveness-probe-count" ]; then IFS= read -r liveness_probe_count < "$0.liveness-probe-count"; if [ "$liveness_probe_count" -ge ${options.recyclePidAtLivenessProbe ?? 0} ]; then case "\${5:-}" in *1000000031*) printf '%s\\n' '__omx_send_authority_rejected__'; exit 0 ;; esac; fi; fi`,
+    `    case "\${6:-}" in ${options.atomicSendFailure === true ? '*send-keys*) exit 1 ;; ' : ''}*capture-pane*) printf '%s\\n' '›' ;; esac`,
+    '    ;;',
+  ];
+}
+
+function tmuxCreatedPaneMarkerLine(paneId: string): string {
+  const panePid = `1000000${paneId.slice(1)}`;
+  return `    split_command=""; for arg do split_command="$arg"; done
+    printf '%s\\n' '${paneId}' >> "$0.created-panes"
+    printf '%s\\t%s\\n' '${paneId}' '${panePid}' >> "$0.created-pane-pids"
+    printf '%s\\t%s\\n' '${paneId}' "$split_command" >> "$0.created-pane-commands"`;
+}
+
 
 async function configureScaleUpTeamForDirectDispatch(teamName: string, cwd: string): Promise<void> {
   const config = await readTeamConfig(teamName, cwd);
@@ -639,6 +733,296 @@ describe('scaleUp', () => {
     }
   });
 
+  it('fails closed before scale-up pane commands for invalid persisted pane identities', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-invalid-panes-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-invalid-panes-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(tmuxStubPath, `#!/bin/sh
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  -V) echo 'tmux 3.2a' ;;
+esac
+`);
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+      const cases: Array<{ paneId: string; update: (manifest: Record<string, unknown>) => void }> = [
+        { paneId: '%01', update: (manifest) => { manifest.leader_pane_id = '%01'; } },
+        { paneId: '%4294967296', update: (manifest) => { manifest.hud_pane_id = '%4294967296'; } },
+        {
+          paneId: '%18446744073709551616',
+          update: (manifest) => {
+            (manifest.workers as Array<Record<string, unknown>>)[0]!.pane_id = '%18446744073709551616';
+          },
+        },
+      ];
+      for (const [index, testCase] of cases.entries()) {
+        const teamName = `scale-up-invalid-pane-${index + 1}`;
+        await initTeamState(teamName, 'task', 'executor', 1, cwd);
+        const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
+        const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+        testCase.update(manifest);
+        await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+        await writeFile(tmuxLogPath, '');
+
+        const result = await scaleUp(
+          teamName,
+          1,
+          'executor',
+          [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+          cwd,
+          { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+        );
+        assert.equal(result.ok, false);
+        const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+        assert.equal(commands.some((command) => command.includes(testCase.paneId)), false);
+        assert.equal(commands.some((command) => /^(split-window|set-option|list-panes|kill-pane|send-keys)\b/.test(command)), false);
+      }
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before scale-up mutations for recycled, unowned, mismatched, or wrong-session panes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-pane-authority-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-pane-authority-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      const cases: Array<{
+        name: string;
+        workerPaneId: string;
+        globalPaneIds: string[];
+        sessionRows: Array<[string, 'expected' | 'missing' | 'other']>;
+      }> = [
+        {
+          name: 'missing owner option',
+          workerPaneId: '%21',
+          globalPaneIds: ['%11', '%21'],
+          sessionRows: [['%11', 'expected'], ['%21', 'missing']],
+        },
+        {
+          name: 'mismatched owner option',
+          workerPaneId: '%21',
+          globalPaneIds: ['%11', '%21'],
+          sessionRows: [['%11', 'expected'], ['%21', 'other']],
+        },
+        {
+          name: 'wrong session membership',
+          workerPaneId: '%21',
+          globalPaneIds: ['%11', '%21'],
+          sessionRows: [['%11', 'expected']],
+        },
+        {
+          name: 'recycled unrelated pane',
+          workerPaneId: '%30',
+          globalPaneIds: ['%11', '%21', '%30'],
+          sessionRows: [['%11', 'expected'], ['%21', 'expected']],
+        },
+      ];
+      for (const [index, testCase] of cases.entries()) {
+        const globalPaneFormat = testCase.globalPaneIds
+          .map((paneId) => `${paneId.replace('%', '%%')}\\n`)
+          .join('');
+        const sessionCommands = testCase.sessionRows.map(([paneId, owner]) => {
+          const formatPaneId = paneId.replace('%', '%%');
+          if (owner === 'expected') return `        printf '${formatPaneId}\\t%s\\n' "$owner"`;
+          if (owner === 'missing') return `        printf '${formatPaneId}\\t\\n'`;
+          return `        printf '${formatPaneId}\\tteam:other\\n'`;
+        });
+        await writeFile(
+          tmuxStubPath,
+          [
+            '#!/bin/sh',
+            `printf '%s\\n' "$*" >> "${tmuxLogPath}"`,
+            'case "${1:-}" in',
+            '  -V)',
+            '    echo "tmux 3.2a"',
+            '    ;;',
+            '  list-panes)',
+            '    case "${2:-}" in',
+            `      -a) printf "${globalPaneFormat}" ;;`,
+            '      -t)',
+            '        session="${3:-}"',
+            '        owner="team:${session#omx-team-}"',
+            ...sessionCommands,
+            '        ;;',
+            '    esac',
+            '    ;;',
+            'esac',
+            '',
+          ].join('\n'),
+        );
+        await chmod(tmuxStubPath, 0o755);
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+        const teamName = `scale-up-pane-authority-${index + 1}`;
+        await initTeamState(teamName, 'task', 'executor', 1, cwd);
+        await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+        const config = await readTeamConfig(teamName, cwd);
+        assert.ok(config);
+        if (!config) throw new Error(`missing team config for ${teamName}`);
+        config.workers[0]!.pane_id = testCase.workerPaneId;
+        await saveTeamConfig(config, cwd);
+        await writeFile(tmuxLogPath, '');
+
+        const result = await scaleUp(
+          teamName,
+          1,
+          'executor',
+          [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+          cwd,
+          { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+        );
+        assert.deepEqual(result, { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' }, testCase.name);
+        assert.deepEqual(await readScaleUpTaskPayloads(teamName, cwd), [], testCase.name);
+        const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+        assert.ok(commands.includes('list-panes -a -F #{pane_id}'), testCase.name);
+        assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-')), testCase.name);
+        assert.equal(commands.some((command) => /^(split-window|set-option|send-keys|kill-pane)\b/.test(command)), false, testCase.name);
+      }
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('scales up through verified live Team-owned pane authority', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-owned-panes-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-owned-panes-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('scale-up-owned-panes', 'task', 'executor', 1, cwd);
+      await configureScaleUpTeamForDirectDispatch('scale-up-owned-panes', cwd);
+
+      const result = await scaleUp(
+        'scale-up-owned-panes',
+        1,
+        'executor',
+        [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+      assert.equal(result.ok, true);
+      const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-scale-up-owned-panes ')));
+      assert.ok(commands.some((command) => command.startsWith('split-window -v -t %21 ')));
+      assert.ok(commands.includes('set-option -p -t %31 @omx_team_pane_owner_id team:scale-up-owned-panes'));
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects ambiguous, noncanonical, and colliding fresh split output before pane authority', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-fresh-pane-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-fresh-pane-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      const cases = [
+        { name: 'multiline output', output: ['%31', '%32'] },
+        { name: 'duplicate output', output: ['%31', '%31'] },
+        { name: 'leading-zero output', output: ['%01'] },
+        { name: '32-bit overflow output', output: ['%4294967296'] },
+        { name: 'large overflow output', output: ['%18446744073709551616'] },
+        { name: 'leader collision', output: ['%11'] },
+        { name: 'HUD collision', output: ['%12'] },
+        { name: 'worker collision', output: ['%21'] },
+        { name: 'unrelated pre-existing pane', output: ['%30'] },
+      ];
+      for (const [index, testCase] of cases.entries()) {
+        await rm(`${tmuxStubPath}.created-panes`, { force: true });
+        await rm(`${tmuxStubPath}.created-pane-commands`, { force: true });
+        await rm(`${tmuxStubPath}.created-pane-pids`, { force: true });
+        await rm(tmuxStubPath, { force: true });
+        await writeFile(
+          tmuxStubPath,
+          [
+            '#!/bin/sh',
+            `printf '%s\\n' "$*" >> "${tmuxLogPath}"`,
+            'case "${1:-}" in',
+            '  -V)',
+            '    echo "tmux 3.2a"',
+            '    ;;',
+            '  split-window)',
+            `    printf '%s\\n' ${testCase.output.map((paneId) => `'${paneId}'`).join(' ')}`,
+            tmuxCreatedPaneMarkerLine('%31'),
+
+            '    ;;',
+            ...tmuxAuthorityListPanesCase(['%11', '%21', '%12', '%30']),
+            'esac',
+            '',
+          ].join('\n'),
+        );
+        await chmod(tmuxStubPath, 0o755);
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+        const teamName = `scale-up-fresh-pane-${index + 1}`;
+        await initTeamState(teamName, 'task', 'executor', 1, cwd);
+        await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+        if (testCase.name === 'HUD collision') {
+          const collisionConfig = await readTeamConfig(teamName, cwd);
+          assert.ok(collisionConfig);
+          if (!collisionConfig) throw new Error(`missing team config for ${teamName}`);
+          collisionConfig.hud_pane_id = '%12';
+          await saveTeamConfig(collisionConfig, cwd);
+        }
+        await writeFile(tmuxLogPath, '');
+
+        const result = await scaleUp(
+          teamName,
+          1,
+          'executor',
+          [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+          cwd,
+          { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+        );
+        assert.equal(result.ok, false, testCase.name);
+        const config = await readTeamConfig(teamName, cwd);
+        assert.equal(config?.workers.length, 1, testCase.name);
+        const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+        assert.ok(commands.some((command) => command === 'list-panes -a -F #{pane_id}'), testCase.name);
+        assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-')), testCase.name);
+        assert.ok(commands.some((command) => command.startsWith('split-window -v -t %21 ')), testCase.name);
+        assert.ok(commands.includes('kill-pane -t %31'), testCase.name);
+        assert.equal(commands.some((command) => command === 'kill-pane -t %11' || command === 'kill-pane -t %12' || command === 'kill-pane -t %21' || command === 'kill-pane -t %30'), false, testCase.name);
+        assert.equal(
+          commands.some((command) => command !== '-V'
+            && command !== 'list-panes -a -F #{pane_id}'
+            && command !== 'list-panes -a -F #{pane_id}\t#{pane_start_command}'
+            && command !== 'list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'
+            && !command.startsWith('list-panes -t omx-team-')
+            && !command.startsWith('set-option -g @omx_scale_split_owner_nonce_')
+            && !command.startsWith('show-options -g -v @omx_scale_split_owner_nonce_')
+            && !command.startsWith('split-window -v -t %21 ')
+            && command !== 'kill-pane -t %31'),
+          false,
+          testCase.name,
+        );
+      }
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects explicit mixed worker policy before scale-up creates worker state or a pane', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-explicit-policy-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-explicit-policy-bin-'));
@@ -760,10 +1144,9 @@ exit 0
           '    ;;',
           '  split-window)',
           '    echo "%31"',
+          tmuxCreatedPaneMarkerLine('%31'),
           '    ;;',
-          '  list-panes)',
-          '    echo "42424"',
-          '    ;;',
+          ...tmuxAuthorityListPanesCase(['%11', '%21']),
           '  send-keys)',
           '    ;;',
           '  capture-pane)',
@@ -993,6 +1376,7 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    ;;',
           '  split-window)',
           '    echo "%31"',
+          tmuxCreatedPaneMarkerLine('%31'),
           '    ;;',
           '  set-option)',
           '    case "$*" in',
@@ -1000,11 +1384,12 @@ printf '%s\\n' "$@" > '${capturePath}'
           '        echo "owner tag failed" >&2',
           '        exit 1',
           '        ;;',
+          '      "set-option -g "*) printf "%s" "${4:-}" > "$0.option-${3:-}" ;;',
           '    esac',
           '    ;;',
-          '  list-panes)',
-          '    echo "42424"',
-          '    ;;',
+          '  show-options) cat "$0.option-${4:-}"; printf "\\n" ;;',
+
+          ...tmuxAuthorityListPanesCase(['%11', '%21']),
           '  kill-pane|send-keys|capture-pane)',
           '    ;;',
           'esac',
@@ -1045,6 +1430,171 @@ printf '%s\\n' "$@" > '${capturePath}'
       else delete process.env.PATH;
       await rm(cwd, { recursive: true, force: true });
       await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back a worker that dies after its initial scale-up liveness probe', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-dead-worker-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-dead-worker-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, true);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('scale-up-dead-worker', 'task', 'executor', 1, cwd);
+      await configureScaleUpTeamForDirectDispatch('scale-up-dead-worker', cwd);
+      const result = await scaleUp(
+        'scale-up-dead-worker', 1, 'executor',
+        [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.error, /sustained tmux pane authority/);
+      assert.equal((await readTeamConfig('scale-up-dead-worker', cwd))?.workers.length, 1);
+      const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.equal(tmuxCommands.includes('kill-pane -t %31'), false, tmuxCommands.join('\n'));
+      assert.ok(!tmuxCommands.includes('kill-pane -t %11'));
+      assert.ok(!tmuxCommands.includes('kill-pane -t %21'));
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a marker-bound pane after a malformed first post-split snapshot', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-marker-recovery-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-marker-recovery-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, false, { malformedFirstPostSplitSnapshot: true });
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('scale-up-marker-recovery', 'task', 'executor', 1, cwd);
+      await configureScaleUpTeamForDirectDispatch('scale-up-marker-recovery', cwd);
+      const result = await scaleUp(
+        'scale-up-marker-recovery', 1, 'executor',
+        [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+      assert.equal(result.ok, true);
+      const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.ok(commands.filter((command) => command === 'list-panes -a -F #{pane_id}').length >= 4);
+      assert.ok(commands.some((command) => command === 'list-panes -a -F #{pane_id}\t#{pane_start_command}'));
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to kill a same-ID pane after its operation marker is recycled', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-marker-recycle-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-marker-recycle-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, false, { recycleOperationMarker: true });
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('scale-up-marker-recycle', 'task', 'executor', 1, cwd);
+      await configureScaleUpTeamForDirectDispatch('scale-up-marker-recycle', cwd);
+      const result = await scaleUp(
+        'scale-up-marker-recycle', 1, 'executor',
+        [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+      assert.equal(result.ok, false);
+      const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.equal(commands.includes('kill-pane -t %31'), false, commands.join('\n'));
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an atomic liveness batch containing a malformed non-target row', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-malformed-liveness-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-malformed-liveness-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const previousPath = process.env.PATH;
+    try {
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, false, { malformedLivenessBatch: true });
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('scale-up-malformed-liveness', 'task', 'executor', 1, cwd);
+      await configureScaleUpTeamForDirectDispatch('scale-up-malformed-liveness', cwd);
+      const result = await scaleUp(
+        'scale-up-malformed-liveness', 1, 'executor',
+        [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+      assert.equal(result.ok, false);
+      const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+      assert.ok(commands.includes('list-panes -a -F #{pane_id} #{pane_dead} #{pane_pid}'), commands.join('\n'));
+      assert.equal(commands.includes('kill-pane -t %31'), false, commands.join('\n'));
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when a verified split PID is recycled during readiness, dispatch, or pre-save', async () => {
+    const cases = [
+      { phase: 'readiness', recyclePidAtLivenessProbe: 11, readyCapture: true, skipReadyWait: false, expectDispatch: false },
+      { phase: 'dispatch', recyclePidAtLivenessProbe: 11, readyCapture: false, skipReadyWait: true, expectDispatch: false },
+      { phase: 'pre-save', recyclePidAtLivenessProbe: 22, readyCapture: false, skipReadyWait: true, expectDispatch: true },
+    ] as const;
+
+    for (const testCase of cases) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-scale-up-pid-recycle-${testCase.phase}-`));
+      const fakeBinDir = await mkdtemp(join(tmpdir(), `omx-scale-up-pid-recycle-${testCase.phase}-bin-`));
+      const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+      const previousPath = process.env.PATH;
+      try {
+        await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, false, testCase);
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+        const teamName = `scale-up-pid-recycle-${testCase.phase}`;
+        await initTeamState(teamName, 'task', 'executor', 1, cwd);
+        await configureScaleUpTeamForDirectDispatch(teamName, cwd);
+
+        const result = await scaleUp(
+          teamName,
+          1,
+          'executor',
+          [{ subject: 'new work', description: 'new work', owner: 'worker-2' }],
+          cwd,
+          {
+            OMX_TEAM_SCALING_ENABLED: '1',
+            ...(testCase.skipReadyWait ? { OMX_TEAM_SKIP_READY_WAIT: '1' } : {}),
+          },
+        );
+        assert.equal(result.ok, false, testCase.phase);
+        const config = await readTeamConfig(teamName, cwd);
+        assert.equal(config?.workers.length, 1, testCase.phase);
+        const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+        assert.equal(commands.some((command) => command.startsWith('kill-pane -t %31')), false, commands.join('\n'));
+        assert.equal(commands.some((command) => command.startsWith('if-shell -F -t %31 ') && command.includes('#{==:#{pane_id},%31}') && command.includes('#{==:#{pane_dead},0}') && command.includes('#{==:#{pane_pid},1000000031}') && command.includes('send-keys -t %31') && command.includes('display-message -p "__omx_send_authority_rejected__"')), testCase.expectDispatch, commands.join('\n'));
+        assert.equal(
+          existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'workers', 'worker-2', 'identity.json')),
+          false,
+          testCase.phase,
+        );
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        await rm(cwd, { recursive: true, force: true });
+        await rm(fakeBinDir, { recursive: true, force: true });
+      }
     }
   });
 
@@ -1483,10 +2033,9 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    ;;',
           '  split-window)',
           '    echo "%31"',
+          tmuxCreatedPaneMarkerLine('%31'),
           '    ;;',
-          '  list-panes)',
-          '    echo "42424"',
-          '    ;;',
+          ...tmuxAuthorityListPanesCase(['%11', '%21']),
           '  send-keys)',
           '    ;;',
           '  capture-pane)',
@@ -1601,10 +2150,9 @@ set -eu
     ;;
   split-window)
     echo "%31"
+${tmuxCreatedPaneMarkerLine('%31')}
     ;;
-  list-panes)
-    echo "42424"
-    ;;
+${tmuxAuthorityListPanesCase(['%11', '%21'], '42424', false, '', { atomicSendFailure: true }).join('\n')}
   send-keys)
     exit 1
     ;;
@@ -1685,10 +2233,9 @@ set -eu
     ;;
   split-window)
     echo "%31"
+${tmuxCreatedPaneMarkerLine('%31')}
     ;;
-  list-panes)
-    echo "42424"
-    ;;
+${tmuxAuthorityListPanesCase(['%11', '%21']).join('\n')}
   capture-pane)
     echo ""
     ;;
@@ -1774,10 +2321,9 @@ case "\${1:-}" in
     ;;
   split-window)
     echo "%31"
+${tmuxCreatedPaneMarkerLine('%31')}
     ;;
-  list-panes)
-    echo "42424"
-    ;;
+${tmuxAuthorityListPanesCase(['%11', '%21']).join('\n')}
   capture-pane)
     echo ""
     ;;
@@ -1857,10 +2403,9 @@ case "\${1:-}" in
     ;;
   split-window)
     echo "%31"
+${tmuxCreatedPaneMarkerLine('%31')}
     ;;
-  list-panes)
-    echo "42424"
-    ;;
+${tmuxAuthorityListPanesCase(['%11', '%21']).join('\n')}
   capture-pane)
     echo ""
     ;;
@@ -1943,10 +2488,9 @@ case "\${1:-}" in
     ;;
   split-window)
     echo "%31"
+${tmuxCreatedPaneMarkerLine('%31')}
     ;;
-  list-panes)
-    echo "42424"
-    ;;
+${tmuxAuthorityListPanesCase(['%11', '%21']).join('\n')}
   capture-pane)
     echo ""
     ;;
@@ -2018,10 +2562,9 @@ exit 0
           '    ;;',
           '  split-window)',
           '    echo "%41"',
+          tmuxCreatedPaneMarkerLine('%41'),
           '    ;;',
-          '  list-panes)',
-          '    echo "45454"',
-          '    ;;',
+          ...tmuxAuthorityListPanesCase(['%11', '%21'], '45454'),
           '  capture-pane)',
           '    echo ""',
           '    ;;',
@@ -2119,10 +2662,9 @@ exit 0
           '    ;;',
           '  split-window)',
           '    echo "%42"',
+          tmuxCreatedPaneMarkerLine('%42'),
           '    ;;',
-          '  list-panes)',
-          '    echo "46464"',
-          '    ;;',
+          ...tmuxAuthorityListPanesCase(['%11', '%21'], '46464'),
           '  capture-pane)',
           '    echo ""',
           '    ;;',
@@ -2297,7 +2839,31 @@ describe('scaleDown', () => {
 describe('scaleDown worktree AGENTS cleanup', () => {
   it('removes generated worktree-root AGENTS during scale-down', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-worktree-agents-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-worktree-agents-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+
     try {
+      await writeFile(
+        tmuxStubPath,
+        [
+          '#!/bin/sh',
+          'case "${1:-}" in',
+          '  list-panes)',
+          '    case "${2:-}" in',
+          "      -a) case \"\${4:-}\" in '#{pane_id}') printf '%%11\\n%%21\\n%%22\\n' ;; '#{pane_id} #{pane_dead} #{pane_pid}') printf '%%11 0 42421\\n%%21 0 42422\\n%%22 0 42423\\n' ;; '#{pane_id}\\t#{pane_start_command}') printf '%%11\\tbash\\n%%21\\tbash\\n%%22\\tbash\\n' ;; *) exit 1 ;; esac ;;",
+          "      -t) case \"\${5:-}\" in '#{pane_id}') printf '%%11\\n%%21\\n%%22\\n' ;; '#{pane_id} #{pane_dead} #{pane_pid}') printf '%%11 0 42421\\n%%21 0 42422\\n%%22 0 42423\\n' ;; '#{pane_id}\\t#{pane_current_command}\\t#{pane_start_command}') printf '%%11\\tbash\\tbash\\n%%21\\tbash\\tbash\\n%%22\\tbash\\tbash\\n' ;; '#{pane_dead} #{pane_pid}') printf '0 42423\\n' ;; *) printf '%%11\\tteam:scale-down-worktree\\n%%21\\tteam:scale-down-worktree\\n%%22\\tteam:scale-down-worktree\\n' ;; esac ;;",
+          '    esac',
+          '    ;;',
+          '  kill-pane) exit 0 ;;',
+          "  show-option) printf 'team:scale-down-worktree\\n' ;;",
+          'esac',
+          '',
+        ].join('\n'),
+      );
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
       await initTeamState('scale-down-worktree', 'task', 'executor', 2, cwd, undefined, process.env, {
         workspace_mode: 'worktree',
         leader_cwd: cwd,
@@ -2319,7 +2885,22 @@ describe('scaleDown worktree AGENTS cleanup', () => {
       assert.ok(config);
       if (!config) return;
       config.workers[1]!.worktree_path = worktree;
+      config.tmux_session = 'omx-team-scale-down-worktree';
+      config.tmux_pane_owner_id = 'team:scale-down-worktree';
+      config.leader_pane_id = '%11';
+      config.workers[0]!.pane_id = '%21';
+      config.workers[1]!.pane_id = '%22';
+      config.workers[0]!.pid = 42422;
+      config.workers[1]!.pid = 42423;
       await saveTeamConfig(config, cwd);
+      const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-down-worktree', 'manifest.v2.json');
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+      manifest.tmux_session = config.tmux_session;
+      manifest.tmux_pane_owner_id = config.tmux_pane_owner_id;
+      manifest.leader_pane_id = config.leader_pane_id;
+      manifest.hud_pane_id = config.hud_pane_id;
+      manifest.workers = config.workers;
+      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
       const result = await scaleDown(
         'scale-down-worktree',
@@ -2327,44 +2908,162 @@ describe('scaleDown worktree AGENTS cleanup', () => {
         { workerNames: ['worker-2'], force: true },
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, true, JSON.stringify(result));
       if (!result.ok) return;
 
       assert.equal(await readFile(join(worktree, 'AGENTS.md'), 'utf-8'), '# Tracked root instructions\n');
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'scale-down-worktree', 'workers', 'worker-2', 'root-agents-backup.json')), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
 });
 
 describe('scaleDown teardown hardening', () => {
-  it('scaleDown removes workers when pane is already dead or missing', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-dead-'));
+  it('fails closed when a persisted scale-down pane is no longer globally live', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-stale-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-stale-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
     try {
-      await initTeamState('dead-pane', 'task', 'executor', 2, cwd);
-      const config = await readTeamConfig('dead-pane', cwd);
+      await writeFile(tmuxStubPath, `#!/bin/sh
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  list-panes) printf '%%11\n%%21\n' ;;
+esac
+`);
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('stale-pane', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('stale-pane', cwd);
       assert.ok(config);
       if (!config) return;
 
       config.workers[1]!.pane_id = '%404';
       await saveTeamConfig(config, cwd);
-
       const result = await scaleDown(
-        'dead-pane',
+        'stale-pane',
         cwd,
         { workerNames: ['worker-2'], force: true },
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
-      assert.equal(result.ok, true);
-      if (!result.ok) return;
-      assert.deepEqual(result.removedWorkers, ['worker-2']);
-
-      const updated = await readTeamConfig('dead-pane', cwd);
-      assert.ok(updated);
-      assert.equal(updated?.workers.some((worker) => worker.name === 'worker-2'), false);
+      assert.deepEqual(result, { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' });
+      const updated = await readTeamConfig('stale-pane', cwd);
+      assert.equal(updated?.workers.some((worker) => worker.name === 'worker-2'), true);
+      assert.equal((await readFile(tmuxLogPath, 'utf-8')).includes('kill-pane'), false);
     } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
       await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before scale-down drain or kill for unowned, mismatched, wrong-session, or recycled panes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-pane-authority-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-pane-authority-bin-'));
+    const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      const cases: Array<{
+        name: string;
+        workerPaneId: string;
+        globalPaneIds: string[];
+        sessionRows: Array<[string, 'expected' | 'missing' | 'other']>;
+      }> = [
+        {
+          name: 'missing owner option',
+          workerPaneId: '%22',
+          globalPaneIds: ['%11', '%21', '%22'],
+          sessionRows: [['%11', 'expected'], ['%21', 'expected'], ['%22', 'missing']],
+        },
+        {
+          name: 'mismatched owner option',
+          workerPaneId: '%22',
+          globalPaneIds: ['%11', '%21', '%22'],
+          sessionRows: [['%11', 'expected'], ['%21', 'expected'], ['%22', 'other']],
+        },
+        {
+          name: 'wrong session membership',
+          workerPaneId: '%22',
+          globalPaneIds: ['%11', '%21', '%22'],
+          sessionRows: [['%11', 'expected'], ['%21', 'expected']],
+        },
+        {
+          name: 'recycled unrelated pane',
+          workerPaneId: '%30',
+          globalPaneIds: ['%11', '%21', '%22', '%30'],
+          sessionRows: [['%11', 'expected'], ['%21', 'expected'], ['%22', 'expected']],
+        },
+      ];
+      for (const [index, testCase] of cases.entries()) {
+        const globalPaneFormat = testCase.globalPaneIds
+          .map((paneId) => `${paneId.replace('%', '%%')}\\n`)
+          .join('');
+        const sessionCommands = testCase.sessionRows.map(([paneId, owner]) => {
+          const formatPaneId = paneId.replace('%', '%%');
+          if (owner === 'expected') return `        printf '${formatPaneId}\\t%s\\n' "$owner"`;
+          if (owner === 'missing') return `        printf '${formatPaneId}\\t\\n'`;
+          return `        printf '${formatPaneId}\\tteam:other\\n'`;
+        });
+        await writeFile(
+          tmuxStubPath,
+          [
+            '#!/bin/sh',
+            `printf '%s\\n' "$*" >> "${tmuxLogPath}"`,
+            'case "${1:-}" in',
+            '  list-panes)',
+            '    case "${2:-}" in',
+            `      -a) printf "${globalPaneFormat}" ;;`,
+            '      -t)',
+            '        session="${3:-}"',
+            '        owner="team:${session#omx-team-}"',
+            ...sessionCommands,
+            '        ;;',
+            '    esac',
+            '    ;;',
+            'esac',
+            '',
+          ].join('\n'),
+        );
+        await chmod(tmuxStubPath, 0o755);
+        process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+
+        const teamName = `scale-down-pane-authority-${index + 1}`;
+        await initTeamState(teamName, 'task', 'executor', 2, cwd);
+        const config = await readTeamConfig(teamName, cwd);
+        assert.ok(config);
+        if (!config) throw new Error(`missing team config for ${teamName}`);
+        config.tmux_session = `omx-team-${teamName}`;
+        config.leader_pane_id = '%11';
+        config.workers[0]!.pane_id = '%21';
+        config.workers[1]!.pane_id = testCase.workerPaneId;
+        await saveTeamConfig(config, cwd);
+        await writeFile(tmuxLogPath, '');
+
+        const result = await scaleDown(
+          teamName,
+          cwd,
+          { workerNames: ['worker-2'], force: true },
+          { OMX_TEAM_SCALING_ENABLED: '1' },
+        );
+        assert.deepEqual(result, { ok: false, error: 'failed_to_validate_team_tmux_pane_authority' }, testCase.name);
+        assert.equal((await readTeamConfig(teamName, cwd))?.workers.length, 2, testCase.name);
+        const commands = await readScaleUpTmuxLogCommands(tmuxLogPath);
+        assert.ok(commands.includes('list-panes -a -F #{pane_id}'), testCase.name);
+        assert.ok(commands.some((command) => command.startsWith('list-panes -t omx-team-')), testCase.name);
+        assert.equal(commands.some((command) => /^(kill-pane|send-keys|set-option)\b/.test(command)), false, testCase.name);
+      }
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
 
@@ -2379,8 +3078,27 @@ describe('scaleDown teardown hardening', () => {
         tmuxStubPath,
         `#!/bin/sh
 set -eu
-printf '%s\\n' "$*" >> "${tmuxLogPath}"
-exit 0
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  list-panes)
+    case "\${2:-}" in
+      -a) case "\${4:-}" in
+        '#{pane_id}') printf '%%11\n%%12\n%%13\n%%14\n%%15\n%%16\n' ;;
+        '#{pane_id} #{pane_dead} #{pane_pid}') printf '%%11 0 10011\n%%12 0 10012\n%%13 0 10013\n%%14 0 10014\n%%15 0 10015\n%%16 0 10016\n' ;;
+        '#{pane_id}\t#{pane_start_command}') printf '%%11\tbash\n%%12\tbash\n%%13\tbash\n%%14\tbash\n%%15\tbash\n%%16\tbash\n' ;;
+        *) exit 1 ;;
+      esac ;;
+      -t) case "\${5:-}" in
+        '#{pane_id}') printf '%%11\n%%12\n%%13\n%%14\n%%15\n%%16\n' ;;
+        '#{pane_id} #{pane_dead} #{pane_pid}') printf '%%11 0 10011\n%%12 0 10012\n%%13 0 10013\n%%14 0 10014\n%%15 0 10015\n%%16 0 10016\n' ;;
+        '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}') printf '%%11\tbash\tbash\n%%12\tbash\tbash\n%%13\tbash\tbash\n%%14\tbash\tbash\n%%15\tbash\tbash\n%%16\tbash\tbash\n' ;;
+        '#{pane_dead} #{pane_pid}') printf '0 10015\n' ;;
+        *) printf '%%11\tteam:exclusions\n%%12\tteam:exclusions\n%%13\tteam:exclusions\n%%14\tteam:exclusions\n%%15\tteam:exclusions\n%%16\tteam:exclusions\n' ;;
+      esac ;;
+    esac
+    ;;
+  show-option) printf 'team:exclusions\n' ;;
+esac
 `,
       );
       await writeFile(tmuxLogPath, '');
@@ -2393,11 +3111,24 @@ exit 0
       if (!config) return;
       config.leader_pane_id = '%11';
       config.hud_pane_id = '%12';
-      config.workers[0]!.pane_id = '%11';
-      config.workers[1]!.pane_id = '%12';
-      config.workers[2]!.pane_id = '%13';
-      config.workers[3]!.pane_id = '%14';
+      config.workers[0]!.pane_id = '%13';
+      config.workers[1]!.pane_id = '%14';
+      config.workers[2]!.pane_id = '%15';
+      config.workers[3]!.pane_id = '%16';
+      config.tmux_pane_owner_id = 'team:exclusions';
+      config.workers[0]!.pid = 10013;
+      config.workers[1]!.pid = 10014;
+      config.workers[2]!.pid = 10015;
+      config.workers[3]!.pid = 10016;
       await saveTeamConfig(config, cwd);
+      const manifestPath = join(cwd, '.omx', 'state', 'team', 'exclusions', 'manifest.v2.json');
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+      manifest.tmux_session = config.tmux_session;
+      manifest.tmux_pane_owner_id = config.tmux_pane_owner_id;
+      manifest.leader_pane_id = config.leader_pane_id;
+      manifest.hud_pane_id = config.hud_pane_id;
+      manifest.workers = config.workers;
+      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
       const result = await scaleDown(
         'exclusions',
@@ -2405,12 +3136,12 @@ exit 0
         { workerNames: ['worker-1', 'worker-2', 'worker-3'], force: true },
         { OMX_TEAM_SCALING_ENABLED: '1' },
       );
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, true, JSON.stringify(result));
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
       assert.doesNotMatch(tmuxLog, /kill-pane -t %12/);
-      assert.match(tmuxLog, /kill-pane -t %13/);
+      assert.match(tmuxLog, /kill-pane -t %15/);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

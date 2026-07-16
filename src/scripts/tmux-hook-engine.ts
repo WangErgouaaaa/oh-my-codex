@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
+import { parseCanonicalTmuxPaneId } from '../hud/tmux.js';
 
 export const DEFAULT_ALLOWED_MODES = ['ralph', 'ultrawork', 'team'];
 export const DEFAULT_MARKER = '[OMX_TMUX_INJECT]';
@@ -37,15 +38,17 @@ export function normalizeTmuxHookConfig(raw: any): any {
     ? raw.allowed_modes.filter((mode: any) => typeof mode === 'string' && mode.trim() !== '')
     : [];
 
-  const targetValue = raw.target && typeof raw.target === 'object' && typeof raw.target.value === 'string'
-    ? raw.target.value.trim()
+  const rawTargetValue = raw.target && typeof raw.target === 'object' && typeof raw.target.value === 'string'
+    ? raw.target.value
     : '';
+  const targetValue = rawTargetValue.trim();
   const targetValueLower = targetValue.toLowerCase();
   const targetIsValid = raw.target
     && typeof raw.target === 'object'
     && (raw.target.type === 'session' || raw.target.type === 'pane')
     && targetValue !== ''
-    && !PLACEHOLDER_TARGET_VALUES.has(targetValueLower);
+    && !PLACEHOLDER_TARGET_VALUES.has(targetValueLower)
+    && (raw.target.type !== 'pane' || parseCanonicalTmuxPaneId(rawTargetValue) === rawTargetValue);
 
   const cooldown = asPositiveInteger(raw.cooldown_ms);
   const maxPerPane = asPositiveInteger(raw.max_injections_per_pane);
@@ -65,7 +68,7 @@ export function normalizeTmuxHookConfig(raw: any): any {
     enabled: raw.enabled === true,
     valid: targetIsValid,
     reason: targetIsValid ? 'ok' : 'invalid_target',
-    target: targetIsValid ? { type: raw.target.type, value: raw.target.value } : null,
+    target: targetIsValid ? { type: raw.target.type, value: rawTargetValue } : null,
     allowed_modes: allowedModes.length > 0 ? allowedModes : DEFAULT_ALLOWED_MODES,
     cooldown_ms: cooldown === null ? 15000 : cooldown,
     // Canonical setting is per-pane. Keep max_injections_per_session as legacy alias.
@@ -203,55 +206,69 @@ function isHudStartCommand(startCommand: string): boolean {
  * use this instead of raw `process.env.TMUX_PANE`.
  */
 export function resolveCodexPane(): string {
-  const envPane = (process.env.TMUX_PANE || '').trim();
+  const rawEnvPane = process.env.TMUX_PANE;
+  const envPane = parseCanonicalTmuxPaneId(rawEnvPane);
   const tmuxCommand = resolveTmuxBinaryForPlatform() || 'tmux';
+  // An explicitly supplied pane identifier is an authority input, not a hint.
+  // Never trim, normalize, or fall back after a malformed value.
+  if (rawEnvPane !== undefined && rawEnvPane !== '' && envPane !== rawEnvPane) return '';
   if (!envPane) return '';
 
   try {
+    const observedPane = parseCanonicalTmuxPaneId(execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_id}'], {
+      encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
+    }).replace(/\r?\n$/, ''));
+    if (observedPane !== envPane) return '';
     const cmd = execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_current_command}'], {
       encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
-    }).trim().toLowerCase();
+    }).replace(/\r?\n$/, '').toLowerCase();
     const startCmd = execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#{pane_start_command}'], {
       encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
-    }).trim().toLowerCase();
+    }).replace(/\r?\n$/, '').toLowerCase();
     const base = cmd.split('/').pop()?.replace(/^-/, '') || '';
-    if (AGENT_COMMANDS.has(base) && !isHudStartCommand(startCmd)) {
-      return envPane;
-    }
-    if (!SHELL_COMMANDS.has(base)) {
-      // Not a shell and not a known agent (e.g. claude CLI) — fall through to
-      // session scan so we can still reject HUD or locate a codex pane.
-    }
+    if (AGENT_COMMANDS.has(base) && !isHudStartCommand(startCmd)) return observedPane;
   } catch {
-    // Fall through to session scan instead of guessing.
+    // A failed direct read is not trusted; the atomic session snapshot below may
+    // still identify a separate Codex pane.
   }
 
   try {
     const sessionName = execFileSync(tmuxCommand, ['display-message', '-t', envPane, '-p', '#S'], {
-      encoding: 'utf-8', timeout: 2000,
-      windowsHide: true,
-    }).trim();
+      encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32',
+    }).replace(/\r?\n$/, '');
     if (!sessionName) return '';
-
-    const panes = execFileSync(tmuxCommand, [
+    const detailedOutput = execFileSync(tmuxCommand, [
       'list-panes', '-s', '-t', sessionName,
       '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}',
-    ], { encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32' }).trim().split('\n');
+    ], { encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32' }).replace(/\r?\n$/, '');
+    const idOnlyOutput = execFileSync(tmuxCommand, [
+      'list-panes', '-s', '-t', sessionName, '-F', '#{pane_id}',
+    ], { encoding: 'utf-8', timeout: 2000, windowsHide: process.platform === 'win32' }).replace(/\r?\n$/, '');
+    if (detailedOutput === '' || idOnlyOutput === '') return '';
 
-    for (const line of panes) {
+    const detailedPaneIds = new Set<string>();
+    const candidates: string[] = [];
+    for (const rawLine of detailedOutput.split('\n')) {
+      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
       const parts = line.split('\t');
-      const paneId = parts[0];
-      const startCmd = (parts[2] || '').toLowerCase();
-      if (!paneId) continue;
-      if (startCmd.includes('codex') && !isHudStartCommand(startCmd)) {
-        return paneId;
-      }
+      const paneId = parseCanonicalTmuxPaneId(parts[0]);
+      if (parts.length !== 3 || !paneId || paneId !== parts[0] || detailedPaneIds.has(paneId)) return '';
+      detailedPaneIds.add(paneId);
+      const startCmd = parts[2]!.toLowerCase();
+      if (startCmd.includes('codex') && !isHudStartCommand(startCmd)) candidates.push(paneId);
     }
+    const idOnlyPaneIds = new Set<string>();
+    for (const rawLine of idOnlyOutput.split('\n')) {
+      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+      const paneId = parseCanonicalTmuxPaneId(line);
+      if (!paneId || paneId !== line || idOnlyPaneIds.has(paneId)) return '';
+      idOnlyPaneIds.add(paneId);
+    }
+    if (detailedPaneIds.size !== idOnlyPaneIds.size || [...detailedPaneIds].some((paneId) => !idOnlyPaneIds.has(paneId))) return '';
+    return candidates.length === 1 ? candidates[0]! : '';
   } catch {
-    // Fall through
+    return '';
   }
-
-  return '';
 }
 
 export function normalizeTmuxCapture(value: any): string {

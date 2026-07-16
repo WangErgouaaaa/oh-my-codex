@@ -23,7 +23,8 @@ import { uninstall } from "./uninstall.js";
 import { version } from "./version.js";
 import { tmuxHookCommand } from "./tmux-hook.js";
 import { hooksCommand } from "./hooks.js";
-import { hudCommand } from "../hud/index.js";
+import { buildHudStartupCommand, hudCommand } from "../hud/index.js";
+
 import { sidecarCommand } from "../sidecar/index.js";
 import { teamCommand } from "./team.js";
 import { ralphCommand } from "./ralph.js";
@@ -149,6 +150,7 @@ import {
   isNativeWindows,
   isTmuxAvailable,
   mitigateCopyModeUnderlineArtifacts,
+  type HudResizeHookPaneIncarnations,
 } from "../team/tmux-session.js";
 import { getPackageRoot } from "../utils/package.js";
 import { codexConfigPath, omxRoot, rememberOmxLaunchContext, resolveOmxCliEntryPath } from "../utils/paths.js";
@@ -161,15 +163,22 @@ import { readUltragoalState } from "../hud/state.js";
 import {
   createHudWatchPane as createSharedHudWatchPane,
   killTmuxPane as killSharedTmuxPane,
-  listCurrentWindowHudPaneIds,
+  findHudWatchPaneIds,
+  isHudWatchPane,
   listCurrentWindowPanes,
   buildHudRuntimeEnv,
   parsePaneIdFromTmuxOutput,
   reapDeadHudPanes,
+  readHudPaneOwner,
   registerHudResizeHook,
   OMX_TMUX_HUD_LEADER_PANE_ENV,
+  parseCanonicalTmuxPaneId,
+  rollbackHudWatchPaneAuthority,
+  verifyHudWatchPaneAuthority,
   type RegisterHudResizeHookOptions,
+  type TmuxPaneSnapshot,
   readCurrentWindowSize,
+  readActiveTmuxPaneId,
   resizeTmuxPane,
   unregisterHudResizeHook,
 } from "../hud/tmux.js";
@@ -1417,14 +1426,95 @@ function execTmuxFileSync(
   }) as string;
 }
 
-function readTmuxEnvValueForTarget(targetPaneId: string): string | undefined {
-  if (!targetPaneId.startsWith("%")) return undefined;
+function parseExactTmuxFrame(raw: string): string | null {
+  if (!raw || raw.includes("\r") || !raw.endsWith("\n") || raw.endsWith("\n\n")) return null;
+  return raw.slice(0, -1) || null;
+}
+
+function parseExactTmuxScalar(raw: string): string | null {
+  const value = parseExactTmuxFrame(raw);
+  return value && !value.includes("\n") ? value : null;
+}
+
+function readStrictTmuxPaneIncarnations(): Map<string, string> | null {
   try {
-    const raw = execTmuxFileSync(
-      ["display-message", "-p", "-t", targetPaneId, "#{socket_path},#{pid},#{session_id}"],
+    const output = execTmuxFileSync(['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}'], { encoding: 'utf-8' });
+    const framed = parseExactTmuxFrame(output);
+    if (!framed) return null;
+    const incarnations = new Map<string, string>();
+    for (const line of framed.split('\n')) {
+      const match = /^(%0|%[1-9][0-9]*) 0 ([1-9][0-9]*)$/.exec(line);
+      const paneId = match?.[1] ? parseCanonicalTmuxPaneId(match[1]) : null;
+      if (!paneId || !match?.[2] || incarnations.has(paneId)) return null;
+      incarnations.set(paneId, match[2]);
+    }
+    return incarnations;
+  } catch {
+    return null;
+  }
+}
+function hasFreshTmuxPaneIncarnation(paneId: string, expectedPanePid: string | undefined): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  return Boolean(canonicalPaneId && /^[1-9][0-9]*$/.test(expectedPanePid ?? '') && readStrictTmuxPaneIncarnations()?.get(canonicalPaneId) === expectedPanePid);
+}
+
+function hasFreshInsideTmuxHudPaneAuthority(
+  paneId: string,
+  currentPaneId: string,
+  sessionId: string,
+  expectedPanePid: string | undefined,
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId || !/^[1-9][0-9]*$/.test(expectedPanePid ?? '')) return false;
+  const matchesOwner = (): boolean => findHudWatchPaneIds(
+    listCurrentWindowPanes(undefined, currentPaneId),
+    currentPaneId,
+    { sessionId, leaderPaneId: currentPaneId },
+  ).filter((candidatePaneId) => candidatePaneId === canonicalPaneId).length === 1;
+  const matchesLiveIncarnation = (): boolean => readStrictTmuxPaneIncarnations()?.get(canonicalPaneId) === expectedPanePid;
+  return matchesOwner() && matchesLiveIncarnation() && matchesOwner() && matchesLiveIncarnation();
+}
+
+function hasFreshDeadHudPaneAuthority(
+  paneId: string,
+  expectedPane: TmuxPaneSnapshot,
+  currentPaneId: string,
+  expectedPanePid: string | undefined,
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId || !/^[1-9][0-9]*$/.test(expectedPanePid ?? '')) return false;
+  const expectedOwner = readHudPaneOwner(expectedPane);
+  const matchesIncarnation = (): boolean => {
+    const panes = listCurrentWindowPanes(undefined, currentPaneId);
+    const paneIds = new Set<string>();
+    if (!panes.length || !panes.every((candidate) => {
+      const canonicalCandidatePaneId = parseCanonicalTmuxPaneId(candidate.paneId);
+      if (!canonicalCandidatePaneId || canonicalCandidatePaneId !== candidate.paneId || paneIds.has(canonicalCandidatePaneId)) return false;
+      paneIds.add(canonicalCandidatePaneId);
+      return true;
+    }) || !paneIds.has(currentPaneId)) return false;
+    const pane = panes.find((candidate) => candidate.paneId === canonicalPaneId);
+    if (!pane || !isHudWatchPane(pane)) return false;
+    const owner = readHudPaneOwner(pane);
+    return pane.startCommand === expectedPane.startCommand
+      && pane.currentCommand === expectedPane.currentCommand
+      && pane.currentPath === expectedPane.currentPath
+      && owner.sessionId === expectedOwner.sessionId
+      && owner.leaderPaneId === expectedOwner.leaderPaneId;
+  };
+  const matchesLiveIncarnation = (): boolean => readStrictTmuxPaneIncarnations()?.get(canonicalPaneId) === expectedPanePid;
+  return matchesIncarnation() && matchesLiveIncarnation() && matchesIncarnation() && matchesLiveIncarnation();
+}
+
+function readTmuxEnvValueForTarget(targetPaneId: string): string | undefined {
+  const canonicalTargetPaneId = parseCanonicalTmuxPaneId(targetPaneId);
+  if (!canonicalTargetPaneId) return undefined;
+  try {
+    const raw = parseExactTmuxScalar(execTmuxFileSync(
+      ["display-message", "-p", "-t", canonicalTargetPaneId, "#{socket_path},#{pid},#{session_id}"],
       { encoding: "utf-8" },
-    ).trim();
-    return raw.replace(/,\$(\d+)$/, ",$1") || undefined;
+    ));
+    return raw?.replace(/,\$(\d+)$/, ",$1") || undefined;
   } catch {
     return undefined;
   }
@@ -1443,11 +1533,12 @@ export function buildInsideTmuxHudHookEnv(
   currentPaneId: string | undefined,
   omxRootOverride?: string,
 ): NodeJS.ProcessEnv {
+  const canonicalCurrentPaneId = parseCanonicalTmuxPaneId(currentPaneId);
   return {
     ...baseEnv,
     OMX_SESSION_ID: sessionId,
     [OMX_TMUX_HUD_OWNER_ENV]: "1",
-    ...(currentPaneId ? { [OMX_TMUX_HUD_LEADER_PANE_ENV]: currentPaneId } : {}),
+    ...(canonicalCurrentPaneId ? { [OMX_TMUX_HUD_LEADER_PANE_ENV]: canonicalCurrentPaneId } : {}),
     ...(omxRootOverride ? { OMX_ROOT: omxRootOverride } : {}),
   };
 }
@@ -1461,18 +1552,19 @@ export function registerInsideTmuxHudResizeHook(options: {
   baseEnv?: NodeJS.ProcessEnv;
   register?: HudResizeHookRegistrar;
 }): boolean {
-  const { hudPaneId, currentPaneId } = options;
-  if (!hudPaneId || !currentPaneId) return false;
+  const canonicalHudPaneId = parseCanonicalTmuxPaneId(options.hudPaneId);
+  const canonicalCurrentPaneId = parseCanonicalTmuxPaneId(options.currentPaneId);
+  if (!canonicalHudPaneId || !canonicalCurrentPaneId) return false;
   return (options.register ?? registerHudResizeHook)(
-    hudPaneId,
-    currentPaneId,
+    canonicalHudPaneId,
+    canonicalCurrentPaneId,
     HUD_TMUX_HEIGHT_LINES,
     {
       cwd: options.cwd,
       env: buildInsideTmuxHudHookEnv(
         options.baseEnv ?? process.env,
         options.sessionId,
-        currentPaneId,
+        canonicalCurrentPaneId,
         options.omxRootOverride,
       ),
     },
@@ -1487,10 +1579,11 @@ export function buildDetachedHudHookEnv(
   omxBin: string,
   omxRootOverride?: string,
 ): NodeJS.ProcessEnv {
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(detachedLeaderPaneId);
   return {
     ...baseEnv,
     TMUX: tmuxEnvValue,
-    TMUX_PANE: detachedLeaderPaneId,
+    ...(canonicalLeaderPaneId ? { TMUX_PANE: canonicalLeaderPaneId } : {}),
     OMX_SESSION_ID: sessionId,
     [OMX_TMUX_HUD_OWNER_ENV]: "1",
     ...(omxRootOverride ? { OMX_ROOT: omxRootOverride } : {}),
@@ -1509,20 +1602,21 @@ export function registerDetachedHudLayoutReconcileHook(options: {
   readTmuxEnvValue?: (targetPaneId: string) => string | undefined;
   register?: HudResizeHookRegistrar;
 }): boolean {
-  const { hudPaneId, detachedLeaderPaneId } = options;
-  if (!hudPaneId || !detachedLeaderPaneId) return false;
-  const tmuxEnvValue = (options.readTmuxEnvValue ?? readTmuxEnvValueForTarget)(detachedLeaderPaneId);
+  const canonicalHudPaneId = parseCanonicalTmuxPaneId(options.hudPaneId);
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(options.detachedLeaderPaneId);
+  if (!canonicalHudPaneId || !canonicalLeaderPaneId) return false;
+  const tmuxEnvValue = (options.readTmuxEnvValue ?? readTmuxEnvValueForTarget)(canonicalLeaderPaneId);
   if (!tmuxEnvValue) return false;
   return (options.register ?? registerHudResizeHook)(
-    hudPaneId,
-    detachedLeaderPaneId,
+    canonicalHudPaneId,
+    canonicalLeaderPaneId,
     HUD_TMUX_HEIGHT_LINES,
     {
       cwd: options.cwd,
       env: buildDetachedHudHookEnv(
         options.baseEnv ?? process.env,
         options.sessionId,
-        detachedLeaderPaneId,
+        canonicalLeaderPaneId,
         tmuxEnvValue,
         options.omxBin,
         options.omxRootOverride,
@@ -1534,25 +1628,50 @@ export function registerDetachedHudLayoutReconcileHook(options: {
 export const DETACHED_TMUX_HISTORY_LIMIT = 500;
 const TMUX_HOOK_INDEX_MAX = 1_000_000;
 
+function buildTmuxPaneIncarnationCondition(paneId: string, panePid: string): string {
+  return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
+}
+
+function buildAtomicTmuxPaneMutationArgs(
+  paneId: string,
+  panePid: string,
+  mutation: string,
+): string[] {
+  return [
+    "if-shell",
+    "-F",
+    "-t",
+    paneId,
+    buildTmuxPaneIncarnationCondition(paneId, panePid),
+    mutation,
+    "",
+  ];
+}
+
 function setDetachedTmuxSessionHistoryLimit(
   sessionName: string,
-  leaderPaneId?: string | null,
+  leaderPaneId: string | null | undefined,
+  leaderPanePid: string | undefined,
 ): void {
-  const boundedHistoryLimit = String(DETACHED_TMUX_HISTORY_LIMIT);
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
+  if (!canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(leaderPanePid ?? '')) return;
+  const exactLeaderPanePid = leaderPanePid!;
+
+  const mutationArgs = buildAtomicTmuxPaneMutationArgs(
+    canonicalLeaderPaneId,
+    exactLeaderPanePid,
+    `set-option -q -t ${sessionName} history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`,
+  );
+  const paneMutationArgs = buildAtomicTmuxPaneMutationArgs(
+    canonicalLeaderPaneId,
+    exactLeaderPanePid,
+    `set-option -pq -t ${canonicalLeaderPaneId} history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`,
+  );
+
   try {
-    execTmuxFileSync(
-      ["set-option", "-q", "-t", sessionName, "history-limit", boundedHistoryLimit],
-      { stdio: "ignore" },
-    );
-  } catch (err) {
-    logCliOperationFailure(err);
-  }
-  if (!leaderPaneId) return;
-  try {
-    execTmuxFileSync(
-      ["set-option", "-pq", "-t", leaderPaneId, "history-limit", boundedHistoryLimit],
-      { stdio: "ignore" },
-    );
+    execTmuxFileSync(mutationArgs, { stdio: "ignore" });
+    execTmuxFileSync(paneMutationArgs, { stdio: "ignore" });
+
   } catch (err) {
     logCliOperationFailure(err);
   }
@@ -1561,19 +1680,25 @@ function setDetachedTmuxSessionHistoryLimit(
 function clearDetachedTmuxSessionHistoryIfUnattached(
   sessionName: string,
   leaderPaneId: string,
+  leaderPanePid: string | undefined,
 ): void {
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
+  if (!canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(leaderPanePid ?? '')) return;
+  const exactLeaderPanePid = leaderPanePid!;
+
   try {
-    const attached = execTmuxFileSync(
-      ["display-message", "-p", "-t", sessionName, "#{session_attached}"],
-      {
-        stdio: ["ignore", "pipe", "ignore"],
-        encoding: "utf-8",
-      },
-    ).trim();
-    if (attached !== "0") return;
-    execTmuxFileSync(["clear-history", "-t", leaderPaneId], {
-      stdio: "ignore",
-    });
+    const condition = buildTmuxPaneIncarnationCondition(canonicalLeaderPaneId, exactLeaderPanePid);
+    const mutation = `if-shell -F -t ${sessionName} '#{==:#{session_attached},0}' 'clear-history -t ${canonicalLeaderPaneId}' ''`;
+    execTmuxFileSync([
+      "if-shell",
+      "-F",
+      "-t",
+      canonicalLeaderPaneId,
+      condition,
+      mutation,
+      "",
+    ], { stdio: "ignore" });
+
   } catch (err) {
     logCliOperationFailure(err);
   }
@@ -1581,47 +1706,80 @@ function clearDetachedTmuxSessionHistoryIfUnattached(
 
 function readTmuxSessionInstanceId(sessionName: string): string | null {
   try {
-    return execTmuxFileSync(
+    return parseExactTmuxScalar(execTmuxFileSync(
       ["show-options", "-qv", "-t", sessionName, OMX_INSTANCE_OPTION],
       {
         stdio: ["ignore", "pipe", "ignore"],
         encoding: "utf-8",
       },
-    ).trim();
+    ));
   } catch {
     return null;
   }
 }
 
 function tmuxPaneBelongsToSession(paneId: string, sessionName: string): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId) return false;
   try {
-    const paneSessionName = execTmuxFileSync(
-      ["display-message", "-p", "-t", paneId, "#{session_name}"],
+    const paneSessionName = parseExactTmuxScalar(execTmuxFileSync(
+      ["display-message", "-p", "-t", canonicalPaneId, "#{session_name}"],
       {
         stdio: ["ignore", "pipe", "ignore"],
         encoding: "utf-8",
       },
-    ).trim();
+    ));
     return paneSessionName === sessionName;
   } catch {
     return false;
   }
 }
 
-function buildDetachedHistoryPruneHookCommand(leaderPaneId: string): string {
-  // The leader pane can be gone by the time the hook fires (e.g. crashed
-  // leader with a lingering session); suppress errors so tmux does not queue
-  // "(null):0: can't find pane" for the next attaching client.
-  return `if-shell -F '#{==:#{session_attached},0}' 'run-shell -b "tmux clear-history -t ${leaderPaneId} >/dev/null 2>&1 || true"'`;
+function buildDetachedHistoryPruneHookCommand(
+  leaderPaneId: string,
+  leaderPanePid?: string,
+  sessionName?: string,
+  hookSlot?: string | null,
+): string | null {
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
+  if (!canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(leaderPanePid ?? '')) return null;
+  const exactLeaderPanePid = leaderPanePid!;
+
+  const quote = isNativeWindows() ? quotePowerShellArg : quoteShellArg;
+  const tmuxExecutable = resolveTmuxExecutableForLaunch();
+  const tmux = isNativeWindows()
+    ? `& ${quote(tmuxExecutable.replace(/\\/g, '/'))}`
+    : 'tmux';
+  const identityOption = sessionName && hookSlot ? detachedHistoryHookIdentityOption(hookSlot) : '';
+  const identityToken = sessionName && hookSlot ? detachedHistoryHookIdentityToken(sessionName, canonicalLeaderPaneId) : '';
+  const unregister = sessionName && hookSlot
+    ? `${tmux} if-shell -F -t ${sessionName} ${quote(`#{==:${identityOption},${identityToken}}`)} ${quote(`${tmux} set-hook -u -t ${sessionName} ${hookSlot} \\; ${tmux} set-option -u -t ${sessionName} ${identityOption}`)} ${quote('')}`
+    : '';
+  const prune = `${tmux} if-shell -F -t ${canonicalLeaderPaneId} ${quote(buildTmuxPaneIncarnationCondition(canonicalLeaderPaneId, exactLeaderPanePid))} ${quote(`${tmux} clear-history -t ${canonicalLeaderPaneId}`)} ${quote(unregister)}`;
+  return `if-shell -F '#{==:#{session_attached},0}' 'run-shell -b ${quote(prune)}'`;
 }
 
-function buildDetachedHistoryPruneHookSlot(sessionName: string, leaderPaneId: string): string {
-  const key = `${sessionName}:${leaderPaneId}:omx-history-prune`;
+function buildDetachedHistoryPruneHookSlot(sessionName: string, leaderPaneId: string): string | null {
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
+  if (!canonicalLeaderPaneId) return null;
+  const key = `${sessionName}:${canonicalLeaderPaneId}:omx-history-prune`;
   let hash = 0;
   for (let i = 0; i < key.length; i++) {
     hash = ((hash << 5) - hash + key.charCodeAt(i)) | 0;
   }
   return `client-detached[${Math.abs(hash) % TMUX_HOOK_INDEX_MAX}]`;
+}
+
+function detachedHistoryHookIdentityOption(hookSlot: string): string {
+  const match = /^client-detached\[([0-9]+)\]$/.exec(hookSlot);
+  if (!match) throw new Error('invalid_tmux_hook_slot');
+  return `@omx_hook_identity_client_detached_${match[1]}`;
+}
+
+function detachedHistoryHookIdentityToken(sessionName: string, leaderPaneId: string): string {
+  let hash = 2166136261;
+  for (const char of `${sessionName}:${leaderPaneId}:omx-history-prune`) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  return `omx-${(hash >>> 0).toString(16)}`;
 }
 
 function hasErrnoCode(error: unknown, code: string): boolean {
@@ -2083,17 +2241,45 @@ export function buildHudPaneCleanupTargets(
   createdPaneId: string | null,
   leaderPaneId?: string,
 ): string[] {
-  const targets = new Set<string>(
-    existingPaneIds.filter((id) => id.startsWith("%")),
-  );
-  if (createdPaneId && createdPaneId.startsWith("%")) {
-    targets.add(createdPaneId);
+  const canonicalLeaderPaneId = leaderPaneId
+    ? parseCanonicalTmuxPaneId(leaderPaneId)
+    : null;
+  if (leaderPaneId && !canonicalLeaderPaneId) return [];
+
+  const targets = new Set<string>();
+  for (const rawPaneId of existingPaneIds) {
+    const paneId = parseCanonicalTmuxPaneId(rawPaneId);
+    if (!paneId || targets.has(paneId)) return [];
+    targets.add(paneId);
   }
-  // Guard: never kill the leader's own pane under any circumstances.
-  if (leaderPaneId && leaderPaneId.startsWith("%")) {
-    targets.delete(leaderPaneId);
+  if (createdPaneId) {
+    const canonicalCreatedPaneId = parseCanonicalTmuxPaneId(createdPaneId);
+    if (!canonicalCreatedPaneId || canonicalCreatedPaneId === canonicalLeaderPaneId) return [];
+    targets.add(canonicalCreatedPaneId);
   }
+  if (canonicalLeaderPaneId) targets.delete(canonicalLeaderPaneId);
   return [...targets];
+}
+
+function readGlobalTmuxPaneIdSnapshot(): Set<string> | null {
+  try {
+    const output = execTmuxFileSync(['list-panes', '-a', '-F', '#{pane_id}'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    });
+    const framed = parseExactTmuxFrame(output);
+    if (!framed) return null;
+    const paneIds = new Set<string>();
+    for (const line of framed.split('\n')) {
+      const paneId = parseCanonicalTmuxPaneId(line);
+      if (!paneId || paneId !== line || paneIds.has(paneId)) return null;
+      paneIds.add(paneId);
+    }
+    return paneIds.size > 0 ? paneIds : null;
+  } catch {
+    return null;
+  }
 }
 
 function isCrossPlatformAbsolutePath(raw: string): boolean {
@@ -2345,6 +2531,7 @@ interface MadmaxDetachedActiveRecord {
   tmux_session_name: string;
   session_id?: string;
   tmux_pane_id?: string;
+  tmux_pane_pid?: string;
 }
 
 function resolveMadmaxRunsRoot(env: NodeJS.ProcessEnv = process.env): string {
@@ -2444,6 +2631,13 @@ function readMadmaxDetachedActiveRecord(
     ) {
       return null;
     }
+    const hasPaneId = Object.hasOwn(parsed, "tmux_pane_id");
+    const hasPanePid = Object.hasOwn(parsed, "tmux_pane_pid");
+    const paneId = hasPaneId ? parseCanonicalTmuxPaneId(parsed.tmux_pane_id) : null;
+    const panePid = hasPanePid && typeof parsed.tmux_pane_pid === "string" && /^[1-9][0-9]*$/.test(parsed.tmux_pane_pid)
+      ? parsed.tmux_pane_pid
+      : null;
+    if (hasPaneId !== hasPanePid || (hasPaneId && (!paneId || !panePid))) return null;
     return {
       version: 1,
       context_key: parsed.context_key,
@@ -2453,7 +2647,7 @@ function readMadmaxDetachedActiveRecord(
       run_dir: parsed.run_dir,
       tmux_session_name: parsed.tmux_session_name,
       ...(typeof parsed.session_id === "string" ? { session_id: parsed.session_id } : {}),
-      ...(typeof parsed.tmux_pane_id === "string" ? { tmux_pane_id: parsed.tmux_pane_id } : {}),
+      ...(paneId && panePid ? { tmux_pane_id: paneId, tmux_pane_pid: panePid } : {}),
       ...(typeof parsed.worktree_cwd === "string" ? { worktree_cwd: parsed.worktree_cwd } : {}),
     };
   } catch {
@@ -2461,15 +2655,17 @@ function readMadmaxDetachedActiveRecord(
   }
 }
 
+function hasFreshMadmaxDetachedLeaderAuthority(record: MadmaxDetachedActiveRecord): boolean {
+  if (!record.session_id || !record.tmux_pane_id || !record.tmux_pane_pid) return false;
+  if (readTmuxSessionInstanceId(record.tmux_session_name) !== record.session_id) return false;
+  if (!tmuxPaneBelongsToSession(record.tmux_pane_id, record.tmux_session_name)) return false;
+  return readStrictTmuxPaneIncarnations()?.get(record.tmux_pane_id) === record.tmux_pane_pid;
+}
+
 function isReusableMadmaxDetachedActiveRecord(
   record: MadmaxDetachedActiveRecord,
 ): boolean {
-  if (!detachedTmuxSessionExists(record.tmux_session_name)) return false;
-  if (!record.session_id || !record.tmux_pane_id) return false;
-  if (readTmuxSessionInstanceId(record.tmux_session_name) !== record.session_id) {
-    return false;
-  }
-  return tmuxPaneBelongsToSession(record.tmux_pane_id, record.tmux_session_name);
+  return detachedTmuxSessionExists(record.tmux_session_name) && hasFreshMadmaxDetachedLeaderAuthority(record);
 }
 
 function detachedTmuxSessionExists(sessionName: string): boolean {
@@ -3676,8 +3872,10 @@ export function resolveNativeSessionName(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   if (env.TMUX) {
+    const rawTmuxPaneTarget = env.TMUX_PANE;
+    const tmuxPaneTarget = parseCanonicalTmuxPaneId(rawTmuxPaneTarget);
+    if (rawTmuxPaneTarget !== undefined && !tmuxPaneTarget) return buildTmuxSessionName(cwd, sessionId);
     try {
-      const tmuxPaneTarget = env.TMUX_PANE?.trim();
       const displayArgs = tmuxPaneTarget
         ? ["display-message", "-p", "-t", tmuxPaneTarget, "#S"]
         : ["display-message", "-p", "#S"];
@@ -3727,8 +3925,10 @@ function tagTmuxSessionWithInstance(sessionName: string, sessionId: string): voi
 
 function tagCurrentTmuxSessionWithInstance(sessionId: string): void {
   if (!process.env.TMUX) return;
+  const rawTmuxPaneTarget = process.env.TMUX_PANE;
+  const tmuxPaneTarget = parseCanonicalTmuxPaneId(rawTmuxPaneTarget);
+  if (rawTmuxPaneTarget !== undefined && !tmuxPaneTarget) return;
   try {
-    const tmuxPaneTarget = process.env.TMUX_PANE;
     const displayArgs = tmuxPaneTarget
       ? ["display-message", "-p", "-t", tmuxPaneTarget, "#S"]
       : ["display-message", "-p", "#S"];
@@ -3858,8 +4058,8 @@ export function buildDetachedTmuxSessionName(
 }
 
 function parseWindowIndexFromTmuxOutput(rawOutput: string): string | null {
-  const windowIndex = rawOutput.split("\n")[0]?.trim() || "";
-  return /^[0-9]+$/.test(windowIndex) ? windowIndex : null;
+  const windowIndex = parseExactTmuxScalar(rawOutput);
+  return windowIndex && /^[0-9]+$/.test(windowIndex) ? windowIndex : null;
 }
 
 export function detectDetachedSessionWindowIndex(sessionName: string): string | null {
@@ -4560,41 +4760,58 @@ export function buildDetachedSessionFinalizeSteps(
   nativeWindows = false,
   attachSession = true,
   leaderPaneId: string | null = null,
+  incarnations?: HudResizeHookPaneIncarnations,
 ): DetachedSessionTmuxStep[] {
   const steps: DetachedSessionTmuxStep[] = [];
-  if (!nativeWindows && leaderPaneId) {
-    steps.push({
-      name: "register-detached-history-prune-hook",
-      args: [
-        "set-hook",
-        "-t",
-        sessionName,
-        buildDetachedHistoryPruneHookSlot(sessionName, leaderPaneId),
-        buildDetachedHistoryPruneHookCommand(leaderPaneId),
-      ],
-    });
+  void nativeWindows;
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
+  if (canonicalLeaderPaneId && incarnations?.leaderPaneId === canonicalLeaderPaneId) {
+    const hookSlot = buildDetachedHistoryPruneHookSlot(sessionName, canonicalLeaderPaneId);
+    const hookCommand = buildDetachedHistoryPruneHookCommand(canonicalLeaderPaneId, incarnations.leaderPanePid, sessionName, hookSlot);
+    if (hookSlot && hookCommand) {
+      steps.push({
+        name: "register-detached-history-prune-hook",
+        args: [
+          "set-hook",
+          "-t",
+          sessionName,
+          hookSlot,
+          hookCommand,
+          "\\;",
+          "set-option",
+          "-t",
+          sessionName,
+          detachedHistoryHookIdentityOption(hookSlot),
+          detachedHistoryHookIdentityToken(sessionName, canonicalLeaderPaneId),
+        ],
+      });
+    }
   }
 
-  if (!nativeWindows && hudPaneId && hookWindowIndex) {
+  const canonicalHudPaneId = parseCanonicalTmuxPaneId(hudPaneId);
+  if (canonicalHudPaneId && hookWindowIndex && incarnations
+    && incarnations.hudPaneId === canonicalHudPaneId
+    && incarnations.leaderPaneId === canonicalLeaderPaneId) {
     const hookTarget = buildResizeHookTarget(sessionName, hookWindowIndex);
     const hookName = buildResizeHookName(
       "launch",
       sessionName,
       hookWindowIndex,
-      hudPaneId,
+      canonicalHudPaneId,
     );
     const clientAttachedHookName = buildClientAttachedReconcileHookName(
       "launch",
       sessionName,
       hookWindowIndex,
-      hudPaneId,
+      canonicalHudPaneId,
     );
     steps.push({
       name: "register-resize-hook",
       args: buildRegisterResizeHookArgs(
         hookTarget,
         hookName,
-        hudPaneId,
+        canonicalHudPaneId,
+        incarnations,
         HUD_TMUX_HEIGHT_LINES,
       ),
     });
@@ -4603,21 +4820,23 @@ export function buildDetachedSessionFinalizeSteps(
       args: buildRegisterClientAttachedReconcileArgs(
         hookTarget,
         clientAttachedHookName,
-        hudPaneId,
+        canonicalHudPaneId,
+        incarnations,
         HUD_TMUX_HEIGHT_LINES,
       ),
     });
     steps.push({
       name: "schedule-delayed-resize",
       args: buildScheduleDelayedHudResizeArgs(
-        hudPaneId,
+        canonicalHudPaneId,
+        incarnations,
         undefined,
         HUD_TMUX_HEIGHT_LINES,
       ),
     });
     steps.push({
       name: "reconcile-hud-resize",
-      args: buildReconcileHudResizeArgs(hudPaneId, HUD_TMUX_HEIGHT_LINES),
+      args: buildReconcileHudResizeArgs(canonicalHudPaneId, incarnations, HUD_TMUX_HEIGHT_LINES),
     });
   }
 
@@ -5290,22 +5509,27 @@ function runCodex(
   }
   const runtimeEnvOverlay = buildMadmaxWorktreeRuntimeEnvOverlay(runtimeContext);
   const omxRootOverride = runtimeContext?.omxRoot ?? resolveOmxRootForLaunch(cwd, process.env);
-  const currentPaneId = process.env.TMUX_PANE;
+  const rawCurrentPaneId = process.env.TMUX_PANE;
+  const currentPaneId = rawCurrentPaneId !== undefined
+    ? parseCanonicalTmuxPaneId(rawCurrentPaneId) ?? undefined
+    : readActiveTmuxPaneId() ?? undefined;
   const hudRuntimeRoot: HudRuntimeRootForLaunch = runtimeContext
     ? { omxRoot: runtimeContext.omxRoot, rootSource: 'omx-root-env' }
     : resolveHudRuntimeRootForLaunch(cwd, process.env);
-  const hudRuntimeEnv = {
+  const hudRuntimeEnv = Object.fromEntries(Object.entries({
     ...buildHudRuntimeEnv({
       sessionId,
       leaderPaneId: currentPaneId,
       ...hudRuntimeRoot,
     }).env,
     ...runtimeEnvOverlay,
-  };
-  const hudEnvArgs = Object.entries(hudRuntimeEnv).map(([key, value]) => `${key}=${value}`);
-  const hudCmd = nativeWindows
-    ? buildWindowsPromptCommand("node", [omxBin, "hud", "--watch"])
-    : buildTmuxPaneCommand("env", [...hudEnvArgs, "node", omxBin, "hud", "--watch"]);
+  }).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+  const hudCmd = buildHudStartupCommand(
+    omxBin,
+    hudRuntimeEnv,
+    undefined,
+    nativeWindows ? "win32" : process.platform,
+  );
   const inheritLeaderFlags = process.env[TEAM_INHERIT_LEADER_FLAGS_ENV] !== "0";
   const inheritedWorkerLaunchArgs = inheritLeaderFlags
     ? collectInheritableTeamWorkerArgsShared(launchArgs)
@@ -5356,10 +5580,54 @@ function runCodex(
   }
 
   if (launchPolicy === "inside-tmux") {
-    // Already in tmux: launch codex in current pane, HUD in bottom split
-    const currentWindowPanes = currentPaneId ? listCurrentWindowPanes(undefined, currentPaneId) : [];
+    // Already in tmux: launch codex in current pane, HUD in bottom split.
+    // A non-empty invalid TMUX_PANE must not fall back to implicit tmux authority.
+    if (rawCurrentPaneId && !currentPaneId) {
+      runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
+      return { postLaunchHandledExternally: false };
+    }
+
+    const globalPaneIdsBefore = readGlobalTmuxPaneIdSnapshot();
+    const globalPanePidsBefore = readStrictTmuxPaneIncarnations();
+    if (!currentPaneId || !globalPaneIdsBefore?.has(currentPaneId) || !globalPanePidsBefore?.has(currentPaneId)) {
+      runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
+      return { postLaunchHandledExternally: false };
+    }
+
+    const currentWindowPanes = listCurrentWindowPanes(undefined, currentPaneId);
+    const preSplitPaneIds = new Set(currentWindowPanes.map((pane) => pane.paneId));
+    const hasAuthoritativeCurrentWindowSnapshot = (
+      preSplitPaneIds.has(currentPaneId)
+      && [...preSplitPaneIds].every((paneId) => globalPaneIdsBefore.has(paneId))
+    );
+    if (!hasAuthoritativeCurrentWindowSnapshot) {
+      runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
+      return { postLaunchHandledExternally: false };
+    }
+
+    const staleHudPaneIds = findHudWatchPaneIds(
+      currentWindowPanes,
+      currentPaneId,
+      { sessionId, leaderPaneId: currentPaneId },
+    );
+    if (staleHudPaneIds.some((paneId) => !globalPaneIdsBefore.has(paneId))) {
+      runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
+      return { postLaunchHandledExternally: false };
+    }
+
+    const deadHudPanesById = new Map(
+      currentWindowPanes
+        .filter((pane) => isHudWatchPane(pane))
+        .map((pane) => [pane.paneId, pane]),
+    );
+    const deadHudPanePidsById = new Map(
+      [...deadHudPanesById.keys()].map((paneId) => [paneId, globalPanePidsBefore.get(paneId)]),
+    );
     reapDeadHudPanes(currentWindowPanes, {
       killPane: (paneId) => {
+        const expectedPane = deadHudPanesById.get(paneId);
+        if (!expectedPane || !globalPaneIdsBefore.has(paneId)) return false;
+        if (!hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) || !hasFreshDeadHudPaneAuthority(paneId, expectedPane, currentPaneId, deadHudPanePidsById.get(paneId))) return false;
         try {
           return killSharedTmuxPane(paneId);
         } catch (err) {
@@ -5369,28 +5637,30 @@ function runCodex(
       },
     });
 
-    const staleHudPaneIds = currentPaneId
-      ? listHudWatchPaneIdsInCurrentWindow(currentPaneId, { sessionId, leaderPaneId: currentPaneId })
-      : [];
-
     let hudPaneId: string | null = null;
+    let hudPanePid: string | undefined;
     const [keeperHudPaneId, ...duplicateHudPaneIds] = staleHudPaneIds;
     for (const paneId of duplicateHudPaneIds) {
-      killTmuxPane(paneId);
+      if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, globalPanePidsBefore.get(paneId))) killTmuxPane(paneId);
     }
 
     if (keeperHudPaneId) {
       hudPaneId = keeperHudPaneId;
+      hudPanePid = globalPanePidsBefore.get(hudPaneId);
       try {
-        resizeTmuxPane(hudPaneId, HUD_TMUX_HEIGHT_LINES);
-        registerInsideTmuxHudResizeHook({
-          hudPaneId,
-          currentPaneId,
-          cwd,
-          sessionId,
-          omxRootOverride,
-          baseEnv: runtimeHookEnv,
-        });
+        if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
+          resizeTmuxPane(hudPaneId, HUD_TMUX_HEIGHT_LINES);
+        }
+        if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
+          registerInsideTmuxHudResizeHook({
+            hudPaneId,
+            currentPaneId,
+            cwd,
+            sessionId,
+            omxRootOverride,
+            baseEnv: runtimeHookEnv,
+          });
+        }
       } catch (err) {
         logCliOperationFailure(err);
       }
@@ -5407,18 +5677,26 @@ function runCodex(
       hudPaneId = null;
     } else {
       try {
-        hudPaneId = createHudWatchPane(cwd, hudCmd, {
+        const candidateHudPaneId = createHudWatchPane(cwd, hudCmd, {
           heightLines: HUD_TMUX_HEIGHT_LINES,
           targetPaneId: currentPaneId,
         });
-        registerInsideTmuxHudResizeHook({
-          hudPaneId,
-          currentPaneId,
-          cwd,
-          sessionId,
-          omxRootOverride,
-          baseEnv: runtimeHookEnv,
-        });
+        hudPaneId = candidateHudPaneId && verifyHudWatchPaneAuthority(candidateHudPaneId)
+          ? candidateHudPaneId
+          : null;
+        hudPanePid = hudPaneId ? readStrictTmuxPaneIncarnations()?.get(hudPaneId) : undefined;
+        if (hudPaneId && !hudPanePid) hudPaneId = null;
+        if (candidateHudPaneId && !hudPaneId) rollbackHudWatchPaneAuthority(candidateHudPaneId);
+        if (hudPaneId && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
+          registerInsideTmuxHudResizeHook({
+            hudPaneId,
+            currentPaneId,
+            cwd,
+            sessionId,
+            omxRootOverride,
+            baseEnv: runtimeHookEnv,
+          });
+        }
       } catch (err) {
         logCliOperationFailure(err);
         // HUD split failed, continue without it
@@ -5430,9 +5708,8 @@ function runCodex(
     // Opt-out: set OMX_MOUSE=0. (closes #128)
     if (process.env.OMX_MOUSE !== "0") {
       try {
-        const tmuxPaneTarget = process.env.TMUX_PANE;
-        const displayArgs = tmuxPaneTarget
-          ? ["display-message", "-p", "-t", tmuxPaneTarget, "#S"]
+        const displayArgs = currentPaneId
+          ? ["display-message", "-p", "-t", currentPaneId, "#S"]
           : ["display-message", "-p", "#S"];
         const tmuxSession = execTmuxFileSync(displayArgs, {
           encoding: "utf-8",
@@ -5444,10 +5721,9 @@ function runCodex(
       }
     }
 
-    const activePaneId = process.env.TMUX_PANE?.trim();
-    if (activePaneId) {
+    if (currentPaneId) {
       try {
-        execTmuxFileSync(["display-message", "-p", "-t", activePaneId, "#S"], {
+        execTmuxFileSync(["display-message", "-p", "-t", currentPaneId, "#S"], {
           encoding: "utf-8",
         });
       } catch {}
@@ -5458,16 +5734,22 @@ function runCodex(
         runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
       });
     } finally {
-      if (currentPaneId) {
+      if (currentPaneId && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId))) {
         unregisterHudResizeHook(currentPaneId);
       }
-      const cleanupPaneIds = buildHudPaneCleanupTargets(
-        listHudWatchPaneIdsInCurrentWindow(currentPaneId, { sessionId, leaderPaneId: currentPaneId }),
-        hudPaneId,
-        currentPaneId,
-      );
+      const finalGlobalPaneIds = readGlobalTmuxPaneIdSnapshot();
+      const cleanupPaneIds = (
+        hudPaneId
+        && hudPanePid
+        && currentPaneId
+        && finalGlobalPaneIds?.has(currentPaneId)
+        && finalGlobalPaneIds.has(hudPaneId)
+        && hudPaneId !== currentPaneId
+      )
+        ? [hudPaneId]
+        : [];
       for (const paneId of cleanupPaneIds) {
-        killTmuxPane(paneId);
+        if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, hudPanePid)) killTmuxPane(paneId);
       }
     }
     return { postLaunchHandledExternally: false };
@@ -5498,14 +5780,22 @@ function runCodex(
         isReusableMadmaxDetachedActiveRecord(activeRecord)
       ) {
         cleanupCurrentMadmaxReuseRunRoot(process.env, runsRoot);
+        if (!hasFreshMadmaxDetachedLeaderAuthority(activeRecord)) {
+          throw new MadmaxDetachedReuseError("madmax detached leader authority changed before history mutation");
+        }
         setDetachedTmuxSessionHistoryLimit(
           activeRecord.tmux_session_name,
           activeRecord.tmux_pane_id!,
+          activeRecord.tmux_pane_pid,
         );
         if (!shouldAttachDetachedTmuxSession(process.env)) {
+          if (!hasFreshMadmaxDetachedLeaderAuthority(activeRecord)) {
+            throw new MadmaxDetachedReuseError("madmax detached leader authority changed before history cleanup");
+          }
           clearDetachedTmuxSessionHistoryIfUnattached(
             activeRecord.tmux_session_name,
             activeRecord.tmux_pane_id!,
+            activeRecord.tmux_pane_pid,
           );
           process.stderr.write(
             `[omx] madmax detached launch already active for this context; reusing ${activeRecord.tmux_session_name} without attaching because this launch is a Hermes MCP bridge.\n`,
@@ -5555,6 +5845,7 @@ function runCodex(
       let registeredClientAttachedHookName: string | null = null;
       let detachedParentEnvFilePath: string | undefined;
       let detachedLeaderPaneId: string | null = null;
+      let registeredHookIncarnations: HudResizeHookPaneIncarnations | undefined;
       try {
         // This path is the user-shell interactive launch: OMX creates a tmux
         // session and immediately attaches the user's terminal to it. If a tmux
@@ -5597,7 +5888,9 @@ function runCodex(
             const leaderPaneId = parsePaneIdFromTmuxOutput(output || "");
             if (leaderPaneId) {
               detachedLeaderPaneId = leaderPaneId;
-              setDetachedTmuxSessionHistoryLimit(sessionName, leaderPaneId);
+              const detachedLeaderPanePid = readStrictTmuxPaneIncarnations()?.get(leaderPaneId);
+              if (!detachedLeaderPanePid) throw new Error("detached leader pane authority unavailable");
+              setDetachedTmuxSessionHistoryLimit(sessionName, leaderPaneId, detachedLeaderPanePid);
               if (activeRecordPath && contextKey) {
                 writeMadmaxDetachedActiveRecord(activeRecordPath, {
                   version: 1,
@@ -5610,6 +5903,7 @@ function runCodex(
                   tmux_session_name: sessionName,
                   session_id: sessionId,
                   tmux_pane_id: leaderPaneId,
+                  tmux_pane_pid: detachedLeaderPanePid,
                 });
               }
               writeDetachedSessionBinding(leaderPaneId);
@@ -5642,6 +5936,12 @@ function runCodex(
                     hudPaneId,
                   )
                 : null;
+            const paneIncarnations = readStrictTmuxPaneIncarnations();
+            const leaderPanePid = detachedLeaderPaneId ? paneIncarnations?.get(detachedLeaderPaneId) : undefined;
+            const hudPanePid = hudPaneId ? paneIncarnations?.get(hudPaneId) : undefined;
+            const hookIncarnations = detachedLeaderPaneId && hudPaneId && leaderPanePid && hudPanePid
+              ? { leaderPaneId: detachedLeaderPaneId, leaderPanePid, hudPaneId, hudPanePid }
+              : undefined;
             const finalizeSteps = buildDetachedSessionFinalizeSteps(
               sessionName,
               hudPaneId,
@@ -5650,6 +5950,7 @@ function runCodex(
               nativeWindows,
               shouldAttachDetachedTmuxSession(process.env),
               detachedLeaderPaneId,
+              hookIncarnations,
             );
             if (nativeWindows && detachedWindowsCodexCmd) {
               scheduleDetachedWindowsCodexLaunch(
@@ -5691,6 +5992,7 @@ function runCodex(
               ) {
                 registeredHookTarget = hookTarget;
                 registeredHookName = hookName;
+                registeredHookIncarnations = hookIncarnations;
               }
               if (
                 finalizeStep.name === "register-client-attached-reconcile" &&
@@ -5721,12 +6023,23 @@ function runCodex(
           rmSync(activeRecordPath, { force: true });
         }
         if (createdDetachedSession) {
-          const rollbackSteps = buildDetachedSessionRollbackSteps(
-            sessionName,
-            registeredHookTarget,
-            registeredHookName,
-            registeredClientAttachedHookName,
-          );
+          const retainedHookAuthority = registeredHookIncarnations
+            && hasFreshTmuxPaneIncarnation(
+              registeredHookIncarnations.leaderPaneId,
+              registeredHookIncarnations.leaderPanePid,
+            )
+            && hasFreshTmuxPaneIncarnation(
+              registeredHookIncarnations.hudPaneId,
+              registeredHookIncarnations.hudPanePid,
+            );
+          const rollbackSteps = retainedHookAuthority
+            ? buildDetachedSessionRollbackSteps(
+                sessionName,
+                registeredHookTarget,
+                registeredHookName,
+                registeredClientAttachedHookName,
+              )
+            : [];
           for (const rollbackStep of rollbackSteps) {
             try {
               execTmuxFileSync(rollbackStep.args, { stdio: "ignore" });
@@ -5759,17 +6072,6 @@ function runCodex(
   }
 }
 
-function listHudWatchPaneIdsInCurrentWindow(
-  currentPaneId?: string,
-  owner: { sessionId?: string; leaderPaneId?: string } = {},
-): string[] {
-  try {
-    return listCurrentWindowHudPaneIds(currentPaneId, undefined, owner);
-  } catch (err) {
-    logCliOperationFailure(err);
-    return [];
-  }
-}
 
 /**
  * Decide whether an existing tmux window is too short to spend rows on a
@@ -5795,9 +6097,10 @@ function createHudWatchPane(
 }
 
 function killTmuxPane(paneId: string): void {
-  if (!paneId.startsWith("%")) return;
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId) return;
   try {
-    killSharedTmuxPane(paneId);
+    killSharedTmuxPane(canonicalPaneId);
   } catch (err) {
     logCliOperationFailure(err);
     // Pane may already be gone; ignore.

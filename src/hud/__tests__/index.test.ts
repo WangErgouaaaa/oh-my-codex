@@ -449,9 +449,9 @@ describe('runWatchMode', () => {
       isTTY: true,
       env: {
         TMUX: '1',
-        TMUX_PANE: '%hud',
+        TMUX_PANE: '%44',
         [OMX_TMUX_HUD_OWNER_ENV]: '1',
-        [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%leader',
+        [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%11',
       },
       readAllStateFn: async () => {
         callCount += 1;
@@ -499,13 +499,50 @@ describe('runWatchMode', () => {
     await promise;
 
     assert.deepEqual(resized, [
-      { paneId: '%hud', heightLines: 2 },
-      { paneId: '%hud', heightLines: 3 },
+      { paneId: '%44', heightLines: 2 },
+      { paneId: '%44', heightLines: 3 },
     ]);
     assert.deepEqual(registered, [
-      { hudPaneId: '%hud', leaderPaneId: '%leader', heightLines: 2 },
-      { hudPaneId: '%hud', leaderPaneId: '%leader', heightLines: 3 },
+      { hudPaneId: '%44', leaderPaneId: '%11', heightLines: 2 },
+      { hudPaneId: '%44', leaderPaneId: '%11', heightLines: 3 },
     ]);
+  });
+
+  it('rejects noncanonical HUD environment pane ids before resize or hook authority', async () => {
+    for (const env of [
+      { TMUX_PANE: '%01', leaderPaneId: '%11' },
+      { TMUX_PANE: '%4294967296', leaderPaneId: '%11' },
+      { TMUX_PANE: '%44', leaderPaneId: '%01' },
+    ]) {
+      let sigintHandler: (() => void) | undefined;
+      let resizeCalls = 0;
+      let hookCalls = 0;
+      const promise = runWatchMode('/tmp', WATCH_FLAGS, {
+        isTTY: true,
+        env: {
+          TMUX: '1',
+          TMUX_PANE: env.TMUX_PANE,
+          [OMX_TMUX_HUD_OWNER_ENV]: '1',
+          [OMX_TMUX_HUD_LEADER_PANE_ENV]: env.leaderPaneId,
+        },
+        readAllStateFn: async () => emptyCtx(),
+        readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+        renderHudFn: () => 'frame',
+        writeStdout: () => {},
+        writeStderr: () => {},
+        registerSigint: (handler) => { sigintHandler = handler; },
+        setIntervalFn: () => ({}) as ReturnType<typeof setInterval>,
+        clearIntervalFn: () => {},
+        resizeTmuxPaneFn: () => { resizeCalls += 1; return true; },
+        registerHudResizeHookFn: () => { hookCalls += 1; return true; },
+      });
+
+      await flush();
+      sigintHandler?.();
+      await promise;
+      assert.equal(resizeCalls, 0);
+      assert.equal(hookCalls, 0);
+    }
   });
 
   it('runs authority tick after each rendered frame', async () => {
@@ -630,6 +667,18 @@ if [[ "$1" == "display-message" && "$*" == *'#{session_id}'* ]]; then
   exit 0
 fi
 if [[ "$1" == "list-panes" ]]; then
+  if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+    printf '%s\n' '%1 0 101' '%2 0 202' '%3 0 303'
+    exit 0
+  fi
+  if [[ "$*" == *'#{pane_id} #{pane_dead}'* ]]; then
+    printf '%s\n' '%1 0' '%2 0' '%3 0'
+    exit 0
+  fi
+  if [[ "$*" == *'-F #{pane_id}' ]]; then
+    printf '%s\n' '%1' '%2' '%3'
+    exit 0
+  fi
   printf '%s\n' '%1	zsh	zsh'
   printf '%s\n' "%2	node	exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch"
   printf '%s\n' "%3	node	exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch"
@@ -681,6 +730,43 @@ exit 0
       await rm(tmp, { recursive: true, force: true });
     }
   });
+  it('fails closed when an enumerated HUD pane is dead before an existing-pane mutation', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'omx-hud-tmux-dead-pane-test-'));
+    const logPath = join(tmp, 'tmux.log');
+    const fakeBin = join(tmp, 'bin');
+    await mkdir(fakeBin);
+    const tmuxPath = join(fakeBin, 'tmux');
+    await writeFile(tmuxPath, `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
+if [[ "$1" == "list-panes" ]]; then
+  if [[ "$*" == *'#{pane_id} #{pane_dead}'* ]]; then printf '%1 0\n%2 1\n%3 1\n'; exit 0; fi
+  if [[ "$*" == *'-F #{pane_id}' ]]; then printf '%1\n%2\n%3\n'; exit 0; fi
+  printf '%1\tzsh\tzsh\n'
+  printf "%2\tnode\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch\n"
+  printf "%3\tnode\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch\n"
+  exit 0
+fi
+exit 0
+`);
+    await chmod(tmuxPath, 0o755);
+    const previousEnv = { PATH: process.env.PATH, TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE, OMX_SESSION_ID: process.env.OMX_SESSION_ID };
+    try {
+      process.env.PATH = `${fakeBin}${delimiter}${process.env.PATH ?? ''}`;
+      process.env.TMUX = '/tmp/tmux-1000/default,12345,0';
+      process.env.TMUX_PANE = '%1';
+      process.env.OMX_SESSION_ID = 'sess-a';
+      await hudCommand(['--tmux']);
+      const tmuxLog = await readFile(logPath, 'utf8');
+      assert.doesNotMatch(tmuxLog, /(?:kill-pane|resize-pane|set-hook)/);
+      assert.doesNotMatch(tmuxLog, /split-window/);
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (typeof value === 'string') process.env[key] = value;
+        else delete process.env[key];
+      }
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
   it('reuses a same-session HUD pane when TMUX_PANE is empty instead of splitting a duplicate', async () => {
     const tmp = await mkdtemp(join(tmpdir(), 'omx-hud-tmux-test-'));
     const logPath = join(tmp, 'tmux.log');
@@ -698,6 +784,18 @@ if [[ "$1" == "display-message" && "$*" == *'#{session_id}'* ]]; then
   exit 0
 fi
 if [[ "$1" == "list-panes" ]]; then
+  if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+    printf '%s\n' '%1 0 101' '%2 0 202'
+    exit 0
+  fi
+  if [[ "$*" == *'#{pane_id} #{pane_dead}'* ]]; then
+    printf '%s\n' '%1 0' '%2 0'
+    exit 0
+  fi
+  if [[ "$*" == *'-F #{pane_id}' ]]; then
+    printf '%s\n' '%1' '%2'
+    exit 0
+  fi
   printf '%s\\n' '%1	codex	codex'
   printf '%s\\n' "%2	node	exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch"
   exit 0
@@ -724,7 +822,7 @@ exit 0
     try {
       process.env.PATH = `${fakeBin}${delimiter}${process.env.PATH ?? ''}`;
       process.env.TMUX = '/tmp/tmux-1000/default,12345,0';
-      process.env.TMUX_PANE = '';
+      delete process.env.TMUX_PANE;
       process.env.OMX_SESSION_ID = 'sess-a';
       console.log = (message?: unknown) => { logs.push(String(message ?? '')); };
 
