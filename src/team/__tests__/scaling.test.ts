@@ -617,7 +617,7 @@ describe('withScalingLock', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-lock-'));
     try {
       await initTeamState('lock-test', 'task', 'executor', 1, cwd);
-      const lockDir = join(cwd, '.omx', 'state', 'team', 'lock-test', '.lock.scaling');
+      const lockDir = join(cwd, '.omx', 'state', '.team-locks', 'lock-test.scaling');
 
       const result = await withScalingLock('lock-test', cwd, async () => {
         // Lock should exist during execution

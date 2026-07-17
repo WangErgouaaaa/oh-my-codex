@@ -4093,8 +4093,8 @@ exit 0
       );
 
       await waitFor(async () => {
-        const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
-        return /paste-buffer -t %42 -b omx-ralph-input-[a-f0-9]+ -p -d/.test(tmuxLog);
+        const watcherLog = await readFile(logPath, 'utf-8').catch(() => '');
+        return watcherLog.includes('parent_gone_deferred_for_active_ralph');
       }, 4000, 50);
 
       assert.ok(isPidAlive(child.pid), 'expected watcher to stay alive while Ralph remains active');
