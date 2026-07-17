@@ -1330,7 +1330,37 @@ export function rollbackHudWatchPaneAuthority(paneId: string, execTmuxSync: Tmux
   const killed = mutateHudWatchPaneIfCurrent(canonicalPaneId, authority.panePid, `kill-pane -t ${canonicalPaneId}`, execTmuxSync);
   if (killed) hudSplitAuthorities.delete(canonicalPaneId);
   return killed;
+
 }
+
+function rollbackRecoveredHudSplitPane(
+  paneId: string,
+  proofOption: string,
+  proofValue: string,
+  operationMarker: string,
+  panePid?: string,
+  sessionId?: string,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (!canonicalPaneId || canonicalPaneId !== paneId) return false;
+  const pidCondition = panePid && /^[1-9][0-9]*$/.test(panePid) ? `#{&&:#{==:#{pane_pid},${panePid}},` : '';
+  const sessionCondition = sessionId && /^\$[0-9]+$/.test(sessionId) ? `#{&&:#{==:#{session_id},${sessionId}},` : '';
+  const closes = `${pidCondition ? '}' : ''}${sessionCondition ? '}' : ''}`;
+  const receipt = `__omx_hud_rollback_${randomUUID()}`;
+  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},${pidCondition}${sessionCondition}#{&&:#{==:#{${proofOption}},${proofValue}},#{m:*${operationMarker}*,#{pane_start_command}}}${closes}}`;
+  try {
+    return parseExactTmuxAuthorityScalar(execTmuxSync([
+      'if-shell', '-F', '-t', paneId,
+      condition,
+      `kill-pane -t ${paneId} \\; display-message -p ${receipt}`,
+      `display-message -p __omx_hud_rollback_rejected_${receipt}`,
+    ])) === receipt;
+  } catch {
+    return false;
+  }
+}
+
 
 export function createHudWatchPane(
   cwd: string,
@@ -1375,7 +1405,20 @@ export function createHudWatchPane(
     );
     const incarnation = paneId ? readHudPaneIncarnation(paneId, execTmuxSync) : null;
     const sessionId = paneId ? readHudPaneSessionIncarnation(paneId, execTmuxSync) : null;
-    if (!paneId || !incarnation || !sessionId) return null;
+    if (!paneId || !incarnation || !sessionId) {
+      if (paneId) {
+        rollbackRecoveredHudSplitPane(
+          paneId,
+          proofOption,
+          provisionalProof,
+          operationMarker,
+          incarnation?.panePid,
+          sessionId ?? undefined,
+          execTmuxSync,
+        );
+      }
+      return null;
+    }
 
     hudSplitAuthorities.set(paneId, {
       proofOption,
@@ -1404,7 +1447,28 @@ export function createHudWatchPane(
     }
     return paneId;
   } catch {
-    if (paneId) rollbackHudWatchPaneAuthority(paneId, execTmuxSync);
+    if (paneId) {
+      rollbackHudWatchPaneAuthority(paneId, execTmuxSync);
+    } else {
+      const recoveredPaneId = recoverHudSplitPaneId(
+        globalBefore,
+        targetBefore,
+        canonicalTargetPaneId,
+        operationMarker,
+        execTmuxSync,
+      );
+      if (recoveredPaneId) {
+        rollbackRecoveredHudSplitPane(
+          recoveredPaneId,
+          proofOption,
+          provisionalProof,
+          operationMarker,
+          undefined,
+          undefined,
+          execTmuxSync,
+        );
+      }
+    }
     return null;
   }
 }

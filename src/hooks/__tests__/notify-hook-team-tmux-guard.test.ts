@@ -104,6 +104,10 @@ function runSendPaneInputInChild(params: {
   queueFirstSubmit?: boolean;
   authorityResults?: boolean[];
   queueOnly?: boolean;
+  exactPaneId?: string;
+  expectedPanePid?: string | number;
+  expectedPaneOwnerId?: string;
+  expectedHudPaneId?: string;
 }) {
   const payload = JSON.stringify({
     paneTarget: params.paneTarget,
@@ -114,6 +118,10 @@ function runSendPaneInputInChild(params: {
     queueFirstSubmit: params.queueFirstSubmit,
     authorityResults: params.authorityResults,
     queueOnly: params.queueOnly,
+    exactPaneId: params.exactPaneId,
+    expectedPanePid: params.expectedPanePid,
+    expectedPaneOwnerId: params.expectedPaneOwnerId,
+    expectedHudPaneId: params.expectedHudPaneId,
   });
   const script = `
     const input = ${payload};
@@ -774,6 +782,64 @@ if [[ "$1" == "display-message" ]]; then printf '%%00\\t0\\t4242\\n'; fi
       assert.doesNotMatch(log, /(?:set-buffer|paste-buffer|send-keys|if-shell)/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it('rejects Team owner changes, HUD targets, and malformed receipts before downstream input', async () => {
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    const cases = [
+      ['owner takeover after readiness', `if [[ "$1" == "display-message" ]]; then count=0; [[ -f "__COUNT__" ]] && count=$(<"__COUNT__"); count=$((count + 1)); printf '%s' "$count" > "__COUNT__"; if [[ "$count" -eq 1 ]]; then printf '%%42\\t0\\t4242\\tteam:alpha\\n'; else printf '%%42\\t0\\t4242\\tteam:foreign\\n'; fi; fi`, { exactPaneId: '%42', expectedPanePid: 4242, expectedPaneOwnerId: 'team:alpha' }],
+      ['foreign owner', `if [[ "$1" == "display-message" ]]; then printf '%%42\\t0\\t4242\\tteam:foreign\\n'; fi`, { exactPaneId: '%42', expectedPanePid: 4242, expectedPaneOwnerId: 'team:alpha' }],
+      ['malformed receipt', `if [[ "$1" == "display-message" ]]; then printf '%%42\\t0\\t4242\\tteam:alpha\\n'; exit 0; fi
+if [[ "$1" == "set-buffer" ]]; then printf '%s' "${'${@: -1}'}" > "__BUFFER__"; fi
+if [[ "$1" == "show-buffer" ]]; then cat "__BUFFER__"; fi
+if [[ "$1" == "if-shell" ]]; then printf 'malformed\\n'; fi`, { exactPaneId: '%42', expectedPanePid: 4242, expectedPaneOwnerId: 'team:alpha' }],
+      ['HUD target', '', { exactPaneId: '%42', expectedPanePid: 4242, expectedPaneOwnerId: 'team:alpha', expectedHudPaneId: '%42' }],
+    ] as const;
+    for (const [name, behavior, authority] of cases) {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-team-authority-'));
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+      try {
+        await mkdir(fakeBinDir, { recursive: true });
+        await writeFile(join(fakeBinDir, 'tmux'), `#!/usr/bin/env bash
+set -eu
+printf '[%s]' "$@" >> "${tmuxLogPath}"
+printf '\n' >> "${tmuxLogPath}"
+${behavior.replaceAll('__BUFFER__', `${tmuxLogPath}.buffer`).replaceAll('__COUNT__', `${tmuxLogPath}.count`)}`);
+        await chmod(join(fakeBinDir, 'tmux'), 0o755);
+        const result = runSendPaneInputInChild({ fakeBinDir, moduleUrl, paneTarget: '%42', prompt: 'must not reach downstream input', submitKeyPresses: 1, typePrompt: name !== 'owner takeover after readiness', ...authority });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(JSON.parse(result.stdout).reason, 'pane_authority_invalid', name);
+        const log = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
+        assert.doesNotMatch(log, /\[if-shell\].*(?:paste-buffer|C-m)/, name);
+        if (name === 'HUD target') assert.equal(log, '');
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('rejects malformed Team operands before contacting tmux', async () => {
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    for (const authority of [
+      { exactPaneId: '%00', expectedPanePid: 4242 },
+      { exactPaneId: '%42', expectedPanePid: '04242' },
+      { exactPaneId: '%42', expectedPaneOwnerId: 'team:bad space' },
+    ]) {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-malformed-team-authority-'));
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+      try {
+        await mkdir(fakeBinDir, { recursive: true });
+        await writeFile(join(fakeBinDir, 'tmux'), `#!/usr/bin/env bash\nprintf '[%s]' "$@" >> "${tmuxLogPath}"\n`);
+        await chmod(join(fakeBinDir, 'tmux'), 0o755);
+        const result = runSendPaneInputInChild({ fakeBinDir, moduleUrl, paneTarget: '%42', prompt: 'must not sink', submitKeyPresses: 1, typePrompt: true, ...authority });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(JSON.parse(result.stdout).reason, 'pane_authority_invalid');
+        assert.equal(await readFile(tmuxLogPath, 'utf-8').catch(() => ''), '');
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
     }
   });
 });
