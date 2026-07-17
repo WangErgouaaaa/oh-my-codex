@@ -96,6 +96,12 @@ async function writeWorkerIdentityFixture(stateRoot: string, cwd: string, teamNa
     worktree_path: cwd,
     team_state_root: stateRoot,
   });
+  await writeJson(join(stateRoot, 'team', teamName, 'config.json'), {
+    name: teamName,
+    tmux_pane_owner_id: `team:${teamName}`,
+    hud_pane_id: '%98',
+    workers: [{ name: workerName, pane_id: '%99', pid: 4242 }],
+  });
 }
 
 function escapeRegex(value: string): string {
@@ -319,7 +325,8 @@ describe('notify-hook auto-nudge', () => {
 
       assert.ok(existsSync(tmuxLogPath), 'tmux should have been called');
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, defaultAutoNudgePattern('%99'), 'should send nudge response with injection marker');
+      const hookLog = await readFile(join(logsDir, `tmux-hook-${new Date().toISOString().split('T')[0]}.jsonl`), 'utf-8').catch(() => '');
+      assert.match(tmuxLog, defaultAutoNudgePattern('%99'), `should send nudge response with injection marker\n${hookLog}`);
       // Codex CLI needs C-m sent twice with a delay for reliable submission
       const cmMatches = tmuxLog.match(/if-shell -t %99 -F .*'send-keys'.*'%99'.*'C-m'.*display-message -p [a-f0-9]{32}/g);
       assert.ok(cmMatches && cmMatches.length >= 2, `should submit C-m twice through atomic receipts, got ${cmMatches?.length ?? 0}`);

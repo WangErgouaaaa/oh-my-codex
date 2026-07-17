@@ -693,8 +693,10 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
       if (teamWorkerBinding) {
         const captureGuard = await evaluatePaneInjectionReadiness(paneId, {
           skipIfScrolling: true,
-          requireReady: false,
           ...teamPaneOptions,
+          requireReady: false,
+          requireObservableState: false,
+          requireCaptureEvidence: false,
         });
         if (!captureGuard.ok) return;
         captured = captureGuard.paneCapture;
@@ -761,7 +763,13 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
       return;
     }
 
-    const paneGuard = await evaluatePaneInjectionReadiness(paneId, { skipIfScrolling: true, requireReady: false, ...teamPaneOptions });
+    const paneGuard = await evaluatePaneInjectionReadiness(paneId, {
+      skipIfScrolling: true,
+      ...teamPaneOptions,
+      requireReady: false,
+      requireObservableState: false,
+      requireCaptureEvidence: false,
+    });
     if (!paneGuard.ok) {
       await logTmuxHookEvent(logsDir, {
         timestamp: new Date().toISOString(),

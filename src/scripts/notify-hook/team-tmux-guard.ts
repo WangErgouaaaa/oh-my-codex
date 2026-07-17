@@ -48,6 +48,8 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   requireIdle = true,
   requireObservableState = false,
   requireCaptureEvidence = undefined,
+  exactPaneId = undefined,
+  expectedPanePid = undefined,
 } = {}): Promise<any> {
   const normalizedRequireObservableState = typeof requireCaptureEvidence === 'boolean' ? requireCaptureEvidence : requireObservableState;
   const requestedTarget = safeString(paneTarget);
@@ -58,6 +60,19 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
       sent: false,
       reason: 'missing_pane_target',
       paneTarget: '',
+      paneCurrentCommand: '',
+      paneCapture: '',
+    };
+  }
+  const capturedAuthority = await capturePaneInputAuthority(target);
+  if (!capturedAuthority
+    || (typeof exactPaneId === 'string' && exactPaneId !== capturedAuthority.paneTarget)
+    || (expectedPanePid !== undefined && String(expectedPanePid) !== capturedAuthority.panePid)) {
+    return {
+      ok: false,
+      sent: false,
+      reason: 'pane_authority_invalid',
+      paneTarget: target,
       paneCurrentCommand: '',
       paneCapture: '',
     };
@@ -90,6 +105,7 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
     paneCurrentCommand,
     paneCapture,
     readinessEvidence,
+    exactPaneProof: { paneId: capturedAuthority.paneTarget, pid: Number(capturedAuthority.panePid) },
   });
   try {
     const result = await runProcess('tmux', buildPaneCurrentCommandArgv(target), 3000);
