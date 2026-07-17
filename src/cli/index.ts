@@ -1658,9 +1658,20 @@ function buildTmuxPaneIncarnationCondition(paneId: string, panePid: string, sess
   return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${panePid}},${sessionCondition}}}}`;
 }
 
+function buildTmuxHudOwnerCondition(expectedOwner: InsideTmuxHudOwner): string | null {
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(expectedOwner.leaderPaneId);
+  if (typeof expectedOwner.sessionId !== "string" || !canonicalLeaderPaneId || !/^[A-Za-z0-9._-]+$/.test(expectedOwner.sessionId)) return null;
+  return `#{&&:#{m/r:(^|[[:space:]])${OMX_TMUX_HUD_OWNER_ENV}=1([[:space:]]|$),#{pane_start_command}},#{&&:#{m/r:(^|[[:space:]])OMX_SESSION_ID='${expectedOwner.sessionId}'([[:space:]]|$),#{pane_start_command}},#{m/r:(^|[[:space:]])${OMX_TMUX_HUD_LEADER_PANE_ENV}='${canonicalLeaderPaneId}'([[:space:]]|$),#{pane_start_command}}}}`;
+}
+
 export type InsideTmuxHudMutation =
   | { kind: "kill" }
   | { kind: "resize"; heightLines: number };
+
+export type InsideTmuxHudOwner = {
+  sessionId?: string;
+  leaderPaneId?: string;
+};
 
 function buildInsideTmuxHudMutationCommand(paneId: string, mutation: InsideTmuxHudMutation): string | null {
   if (mutation.kind === "kill") return `kill-pane -t ${paneId}`;
@@ -1669,11 +1680,12 @@ function buildInsideTmuxHudMutationCommand(paneId: string, mutation: InsideTmuxH
     : null;
 }
 
-/** Mutates an adopted HUD pane only when tmux still observes its exact pane/session incarnation and fresh receipt. */
+/** Mutates an adopted HUD pane only when tmux still observes its exact pane/session incarnation, owner tuple, and fresh receipt. */
 export function mutateInsideTmuxHudPane(
   paneId: string,
   panePid: string | undefined,
   receiptPaneId: string,
+  expectedOwner: InsideTmuxHudOwner,
   mutation: InsideTmuxHudMutation,
 ): boolean {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
@@ -1684,11 +1696,14 @@ export function mutateInsideTmuxHudPane(
   const receipt = randomUUID().replace(/-/g, "");
   if (!sessionIncarnation || !mutationCommand || !/^[a-f0-9]{32}$/.test(receipt)) return false;
   const incarnationCondition = buildTmuxPaneIncarnationCondition(canonicalPaneId, panePid!, sessionIncarnation);
-  const receiptCondition = `#{&&:${incarnationCondition},#{==:#{@omx_hud_mutation_receipt},${receipt}}}`;
+  const ownerCondition = buildTmuxHudOwnerCondition(expectedOwner);
+  if (!ownerCondition) return false;
+  const authorityCondition = `#{&&:${incarnationCondition},${ownerCondition}}`;
+  const receiptCondition = `#{&&:${authorityCondition},#{==:#{@omx_hud_mutation_receipt},${receipt}}}`;
   try {
     const stdout = execTmuxFileSync([
       "if-shell", "-F", "-t", canonicalPaneId,
-      incarnationCondition,
+      authorityCondition,
       `set-option -p -t ${canonicalPaneId} @omx_hud_mutation_receipt ${receipt} ; if-shell -F ${receiptCondition} '${mutationCommand} ; display-message -p -t ${canonicalReceiptPaneId} ${receipt}' ''`,
       "",
     ], { encoding: "utf-8" });
@@ -5749,10 +5764,11 @@ function runCodex(
     reapDeadHudPanes(currentWindowPanes, {
       killPane: (paneId) => {
         const expectedPane = deadHudPanesById.get(paneId);
-        if (!expectedPane || !globalPaneIdsBefore.has(paneId)) return false;
+        const expectedOwner = expectedPane && readHudPaneOwner(expectedPane);
+        if (!expectedPane || !expectedOwner || !globalPaneIdsBefore.has(paneId)) return false;
         if (!hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) || !hasFreshDeadHudPaneAuthority(paneId, expectedPane, currentPaneId, deadHudPanePidsById.get(paneId))) return false;
         try {
-          return mutateInsideTmuxHudPane(paneId, deadHudPanePidsById.get(paneId), currentPaneId, { kind: "kill" });
+          return mutateInsideTmuxHudPane(paneId, deadHudPanePidsById.get(paneId), currentPaneId, expectedOwner, { kind: "kill" });
 
         } catch (err) {
           logCliOperationFailure(err);
@@ -5761,11 +5777,17 @@ function runCodex(
       },
     });
 
+    const hudPaneOwnersById = new Map(
+      currentWindowPanes
+        .filter((pane) => isHudWatchPane(pane))
+        .map((pane) => [pane.paneId, readHudPaneOwner(pane)]),
+    );
     let hudPaneId: string | null = null;
     let hudPanePid: string | undefined;
     const [keeperHudPaneId, ...duplicateHudPaneIds] = staleHudPaneIds;
     for (const paneId of duplicateHudPaneIds) {
-      if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, globalPanePidsBefore.get(paneId))) mutateInsideTmuxHudPane(paneId, globalPanePidsBefore.get(paneId), currentPaneId, { kind: "kill" });
+      const expectedOwner = hudPaneOwnersById.get(paneId);
+      if (expectedOwner && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, globalPanePidsBefore.get(paneId))) mutateInsideTmuxHudPane(paneId, globalPanePidsBefore.get(paneId), currentPaneId, expectedOwner, { kind: "kill" });
 
     }
 
@@ -5773,8 +5795,9 @@ function runCodex(
       hudPaneId = keeperHudPaneId;
       hudPanePid = globalPanePidsBefore.get(hudPaneId);
       try {
-        if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
-          mutateInsideTmuxHudPane(hudPaneId, hudPanePid, currentPaneId, { kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES });
+        const expectedOwner = hudPaneOwnersById.get(hudPaneId);
+        if (expectedOwner && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
+          mutateInsideTmuxHudPane(hudPaneId, hudPanePid, currentPaneId, expectedOwner, { kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES });
 
         }
         if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
@@ -5875,7 +5898,8 @@ function runCodex(
         ? [hudPaneId]
         : [];
       for (const paneId of cleanupPaneIds) {
-        if (hudPanePid && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, hudPanePid)) mutateInsideTmuxHudPane(paneId, hudPanePid, currentPaneId, { kind: "kill" });
+        const expectedOwner = hudPaneOwnersById.get(paneId);
+        if (hudPanePid && expectedOwner && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, hudPanePid)) mutateInsideTmuxHudPane(paneId, hudPanePid, currentPaneId, expectedOwner, { kind: "kill" });
       }
     }
     return { postLaunchHandledExternally: false };
