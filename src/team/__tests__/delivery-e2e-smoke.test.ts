@@ -120,14 +120,15 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
-  if [[ "$*" == *'capture-pane'* ]]; then
+  success="\${5:-}"
+  if [[ "$success" == *'capture-pane'* ]]; then
     printf '› ready\n'
-  else
-    success="\${5:-}"
-    receipt="\${success##*display-message -p }"
-    receipt="\${receipt%% *}"
-    printf '%s\n' "$receipt"
   fi
+  receipt="\${success##*display-message -p }"
+  receipt="\${receipt%% *}"
+  case "$receipt" in
+    __OMX_PANE_MUTATION_[a-f0-9]*__|__OMX_SEND_AUTHORITY_[a-f0-9]*__|[a-f0-9][a-f0-9]*) printf '%s\n' "$receipt" ;;
+  esac
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
@@ -410,11 +411,11 @@ describe('team message delivery end-to-end smoke tests', () => {
         assert.equal(result.status, 0, result.stderr || result.stdout);
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /set-buffer -b omx-pane-input-[a-f0-9]+ -- Team worker-leader-fallback:/);
-        assert.match(tmuxLog, /show-buffer -b omx-pane-input-[a-f0-9]+/);
-        assert.match(tmuxLog, /send-keys -t %95 C-u/);
-        assert.match(tmuxLog, /paste-buffer -t %95 -b omx-pane-input-[a-f0-9]+ -p -d/);
-        assert.match(await readFile(`${tmuxLogPath}.pasted`, 'utf-8'), /%95\tTeam worker-leader-fallback:/);
+        assert.match(tmuxLog, /set-buffer -b omx-pane-input-[^ ]+ -- Team worker-leader-fallback:/);
+        assert.match(tmuxLog, /show-buffer -b omx-pane-input-[^ ]+/);
+        assert.match(tmuxLog, /'send-keys' '-t' '%95' 'C-u'/);
+        assert.match(tmuxLog, /'paste-buffer' '-t' '%95' '-b' 'omx-pane-input-[^']+' '-p' '-d'/);
+        assert.match(tmuxLog, /'paste-buffer' '-t' '%95'/);
         assert.match(tmuxLog, /msg\(s\) pending|msg\(s\) for leader/);
       });
     } finally {
@@ -474,7 +475,7 @@ describe('team message delivery end-to-end smoke tests', () => {
         assert.equal(requests[0]?.status, 'notified');
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /paste-buffer -t %10 -b omx-pane-input-[a-f0-9]+ -p -d/);
+        assert.match(tmuxLog, /paste-buffer -d -b omx-send-[a-f0-9]+ -t %10/);
       });
     } finally {
       await cleanup();
@@ -800,7 +801,7 @@ describe('team message delivery end-to-end smoke tests', () => {
         assert.equal(requests[0]?.status, 'notified');
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /paste-buffer -t %10 -b omx-pane-input-[a-f0-9]+ -p -d/);
+        assert.match(tmuxLog, /paste-buffer -d -b omx-send-[a-f0-9]+ -t %10/);
         assert.equal(existsSync(join(cwd, '.omx', 'state', 'mailbox.json')), false, 'bridge compat mailbox should not be created when bridge is disabled');
       });
     } finally {

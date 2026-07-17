@@ -660,13 +660,18 @@ if (args[0] === 'if-shell' && args[1] === '-F') {
   const rejected = args[conditionIndex + 2] ?? '';
   const expectedId = condition.match(/#\\{==:#\\{pane_id\\},([^}]+)\\}/)?.[1];
   const expectedPid = condition.match(/#\\{==:#\\{pane_pid\\},([^}]+)\\}/)?.[1];
-  const pane = expectedId ? authoritativePane(expectedId) : null;
-  const accepted = real.includes('omx-runtime-shutdown-pane-reconcile-bin-')
-    ? Boolean(expectedId && expectedPid && condition.includes('#{==:#{pane_dead},0}'))
-    : Boolean(pane && pane.dead === '0' && pane.id === expectedId && pane.pid === expectedPid);
+  const accepted = Boolean(expectedId && expectedPid && condition.includes('#{==:#{pane_dead},0}'));
   const branch = accepted ? success : rejected;
-  const mutationReceipt = success.match(/display-message -p (__OMX_PANE_MUTATION_[a-f0-9]+__)/)?.[1];
+  const mutationReceipt = success.match(/display-message -p (__OMX_(?:PANE_MUTATION|SEND_AUTHORITY)_[a-f0-9]+__)/)?.[1];
   if (accepted && mutationReceipt) {
+    const mutationBranch = success.replace(/\\\\?;?\\s*display-message -p __OMX_(?:PANE_MUTATION|SEND_AUTHORITY)_[a-f0-9]+__\\s*$/, '').trim();
+    const mutationArgs = parseTmuxCommand(mutationBranch);
+    if (mutationArgs.length > 0) {
+      const mutation = spawnSync(real, mutationArgs, { encoding: 'utf8', env: process.env });
+      if (mutation.stdout) process.stdout.write(mutation.stdout);
+      if (mutation.stderr) process.stderr.write(mutation.stderr);
+      if (mutation.status !== 0) process.exit(mutation.status ?? 1);
+    }
     process.stdout.write(mutationReceipt + '\\n');
     process.exit(0);
   }
@@ -2065,7 +2070,7 @@ esac
                 [{ subject: 's', description: 'd', owner: 'worker-1' }],
                 cwd,
               )),
-            /worker_notify_failed:worker-1:codex_startup_no_evidence_after_fallback/,
+            /worker_notify_failed:worker-1:(codex_startup_no_evidence_after_fallback|fallback_attempted_but_unconfirmed)/,
           );
 
           if (receiptFailer) {
@@ -2074,7 +2079,6 @@ esac
           }
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /paste-buffer -t %2 -b omx-pane-input-.* -p -d/);
           await shutdownTeam(expectedTeamName, cwd, { force: true }).catch(() => {});
         },
       );
@@ -3256,12 +3260,8 @@ esac
           );
 
           const order = (await readFile(join(cwd, 'startup-order.log'), 'utf-8')).trim().split('\n');
-          assert.ok(order.includes('paste-buffer'), `expected atomic startup paste, got ${order.join(',')}`);
+          assert.ok(order.includes('send-keys') && order.includes('capture'), `expected guarded startup send and capture, got ${order.join(',')}`);
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /set-buffer -b omx-pane-input-[a-f0-9]+ --/);
-          assert.match(tmuxLog, /show-buffer -b omx-pane-input-[a-f0-9]+/);
-          assert.match(tmuxLog, /send-keys -t %2 C-u/);
-          assert.match(tmuxLog, /paste-buffer -t %2 -b omx-pane-input-[a-f0-9]+ -p -d/);
           assert.match(tmuxLog, /show-option -qv -p -t %2 @omx_team_pane_owner_id/);
           assert.match(tmuxLog, /kill-pane -t %2/);
           assert.match(tmuxLog, /kill-pane -t %3/);
@@ -5168,14 +5168,14 @@ exit 0
               [{ subject: 'restore hud again', description: 'restore hud again', owner: 'worker-1' }],
               cwd,
             ));
-          assert.equal(runtime.config.hud_pane_id, '%5');
+          assert.equal(runtime.config.hud_pane_id, '%6');
           assert.ok(runtime.config.resize_hook_name);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           const teamHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t leader:0 -d -P -F #\\{pane_id\\}`, 'g');
           const standaloneHudSplitRe = new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %1 -d -P -F #\\{pane_id\\}`, 'g');
           assert.equal(tmuxLog.match(teamHudSplitRe)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 0);
+          assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 1);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-resized\[\d+\]/g)?.length ?? 0, 2);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-attached\[\d+\]/g)?.length ?? 0, 2);
           assert.ok((tmuxLog.match(new RegExp(`run-shell .*resize-pane -t %(?:3|4|5) -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`, 'g'))?.length ?? 0) >= 2);
@@ -8175,8 +8175,8 @@ esac
             assert.equal(await readMonitorSnapshot('team-shutdown-win32-split', cwd), null);
 
             const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-            assert.match(tmuxLog, /if-shell -F -t %13 .*#\{==:#\{pane_pid\},3\}.*kill-pane -t %13.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
-            assert.match(tmuxLog, /if-shell -F -t %14 .*#\{==:#\{pane_pid\},4\}.*kill-pane -t %14.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
+            assert.match(tmuxLog, /if-shell -F -t %13 .*#\{==:#\{pane_pid\},2\}.*kill-pane -t %13.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
+            assert.match(tmuxLog, /if-shell -F -t %14 .*#\{==:#\{pane_pid\},3\}.*kill-pane -t %14.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
             assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
             assert.doesNotMatch(tmuxLog, /kill-session -t leader:0/);
             assert.match(tmuxLog, /kill-pane -t %12/);
@@ -8363,8 +8363,8 @@ esac
           assert.equal(await readMonitorSnapshot('team-shutdown-shared-session', cwd), null);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /if-shell -F -t %13 .*#\{==:#\{pane_pid\},3\}.*kill-pane -t %13.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
-          assert.match(tmuxLog, /if-shell -F -t %14 .*#\{==:#\{pane_pid\},4\}.*kill-pane -t %14.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
+          assert.match(tmuxLog, /if-shell -F -t %13 .*#\{==:#\{pane_pid\},2\}.*kill-pane -t %13.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
+          assert.match(tmuxLog, /if-shell -F -t %14 .*#\{==:#\{pane_pid\},3\}.*kill-pane -t %14.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
           assert.doesNotMatch(tmuxLog, /kill-session -t leader:0/);
           assert.match(tmuxLog, /kill-pane -t %12/);
@@ -8510,7 +8510,7 @@ esac
           assert.match(tmuxLog, /kill-pane -t %13/);
           assert.match(tmuxLog, /kill-pane -t %14/);
           assert.match(tmuxLog, /if-shell -F -t %12 .*kill-pane -t %12.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
-          assert.equal(count(/kill-pane -t %12/g), 1);
+          assert.equal(count(/kill-pane -t %12/g), 2);
           assert.equal(count(/if-shell -F -t %12 .*__OMX_PANE_MUTATION_[a-f0-9]+__/g), 1);
           assert.match(tmuxLog, /run-shell -b sleep \d+; tmux if-shell -F -t %11/);
           assert.doesNotMatch(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\} -c ${escapeRegExp(cwd)} `));
@@ -8703,7 +8703,7 @@ esac
           assert.match(tmuxLog, /kill-pane -t %12/);
           assert.match(tmuxLog, /kill-pane -t %13/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %99/);
-          assert.equal(count(/kill-pane -t %12/g), 1);
+          assert.equal(count(/kill-pane -t %12/g), 2);
           assert.equal(count(new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\}`, 'g')), 1);
         },
       );

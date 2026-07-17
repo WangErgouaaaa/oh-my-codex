@@ -211,7 +211,7 @@ process.on('SIGTERM', () => process.exit(0));
           '    split_command=""; for arg do split_command="$arg"; done',
           '    printf "%s\\t%s\\n" "%31" "1000000031" > "$0.created-pane-pid"',
           '    printf "%s\\t%s\\n" "%31" "$split_command" > "$0.created-pane-command"',
-          '    printf "%s\\t%s\\t$1\\n" "%31" "1000000031"',
+          "    printf '%s\\t%s\\t$1\\n' '%31' '1000000031'",
           '    ;;',
           '  set-option)',
           '    [ "$2" != "-g" ] || printf "%s" "$4" > "$0.proof"',
@@ -232,7 +232,7 @@ process.on('SIGTERM', () => process.exit(0));
           "    printf '$1\\n'",
           '    ;;',
           '  if-shell)',
-          '    success="${6:-}"; receipt="${success##*display-message -p }"; receipt="${receipt%% *}"; case "$success" in *capture-pane*) printf "›\\n" ;; esac; case "$receipt" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf "%s\\n" "$receipt" ;; esac',
+          '    success="${6:-}"; receipt="${success##*display-message -p }"; receipt="${receipt%% *}"; case "$success" in *capture-pane*) printf "›\\n" ;; esac; case "$receipt" in __OMX_PANE_MUTATION_[a-f0-9]*__|__OMX_SEND_AUTHORITY_[a-f0-9]*__) printf "%s\\n" "$receipt" ;; esac',
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -290,7 +290,7 @@ process.on('SIGTERM', () => process.exit(0));
         cwd,
         { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
       );
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, true, JSON.stringify(result));
       if (!result.ok) return;
 
       const workerAgents = await readFile(join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'workers', 'worker-2', 'AGENTS.md'), 'utf-8');
@@ -337,7 +337,7 @@ process.on('SIGTERM', () => process.exit(0));
           '    split_command=""; for arg do split_command="$arg"; done',
           '    printf "%s\\t%s\\n" "%31" "1000000031" > "$0.created-pane-pid"',
           '    printf "%s\\t%s\\n" "%31" "$split_command" > "$0.created-pane-command"',
-          '    printf "%s\\t%s\\t$1\\n" "%31" "1000000031"',
+          "    printf '%s\\t%s\\t$1\\n' '%31' '1000000031'",
           '    ;;',
           '  set-option)',
           '    [ "$2" != "-g" ] || printf "%s" "$4" > "$0.proof"',
@@ -358,7 +358,7 @@ process.on('SIGTERM', () => process.exit(0));
           "    printf '$1\\n'",
           '    ;;',
           '  if-shell)',
-          '    success="${6:-}"; receipt="${success##*display-message -p }"; receipt="${receipt%% *}"; case "$success" in *capture-pane*) printf "›\\n" ;; esac; case "$receipt" in __OMX_PANE_MUTATION_[a-f0-9]*__) printf "%s\\n" "$receipt" ;; esac',
+          '    success="${6:-}"; receipt="${success##*display-message -p }"; receipt="${receipt%% *}"; case "$success" in *capture-pane*) printf "›\\n" ;; esac; case "$receipt" in __OMX_PANE_MUTATION_[a-f0-9]*__|__OMX_SEND_AUTHORITY_[a-f0-9]*__) printf "%s\\n" "$receipt" ;; esac',
           '    ;;',
           '  send-keys)',
           '    ;;',
@@ -420,7 +420,7 @@ process.on('SIGTERM', () => process.exit(0));
           OMX_TEAM_WORKER_INHERITED_MODEL: 'claude-sonnet-4-6',
         },
       );
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, true, JSON.stringify(result));
       if (!result.ok) return;
 
       const workerIdentity = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'workers', 'worker-3', 'identity.json'), 'utf-8')) as { worker_cli?: string; role?: string };
