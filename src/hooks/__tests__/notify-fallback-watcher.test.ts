@@ -1445,7 +1445,7 @@ describe('notify-fallback watcher', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /set-buffer -b [^\n]+ -- Team dispatch-team: leader stale, \d+ worker pane\(s\) still active\./);
+      assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}/);
 
       const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
       const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
@@ -1464,11 +1464,11 @@ describe('notify-fallback watcher', () => {
 
       const deliveryLogPath = join(wd, '.omx', 'logs', `team-delivery-${new Date().toISOString().slice(0, 10)}.jsonl`);
       const deliveryEntries = await readJsonLines(deliveryLogPath);
-      assert.ok(deliveryEntries.some((entry) =>
+      assert.equal(deliveryEntries.some((entry) =>
         entry.event === 'nudge_triggered'
         && entry.source === 'notify_fallback_watcher'
-        && entry.transport === 'send-keys'
-        && entry.result === 'sent'));
+        && entry.result === 'sent'), false,
+      'authority-only watcher must not record a sent nudge when exact leader ownership is unavailable');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1505,7 +1505,7 @@ describe('notify-fallback watcher', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /set-buffer -b [^\n]+ -- Team dispatch-team: leader stale, \d+ worker pane\(s\) still active\./);
+      assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -2826,8 +2826,8 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, livePane);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.match(tmuxLog, /paste-buffer -t %42 -b omx-ralph-input-[a-f0-9]+ -p -d/);
+      assert.doesNotMatch(tmuxLog, /paste-buffer -t %99 -b omx-ralph-input-/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3083,8 +3083,8 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, anchorPane);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.match(tmuxLog, /paste-buffer -t %99 -b omx-ralph-input-[a-f0-9]+ -p -d/);
+      assert.doesNotMatch(tmuxLog, /paste-buffer -t %42 -b omx-ralph-input-/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3154,8 +3154,8 @@ exit 0
       assert.equal(watcherState.ralph_continue_steer?.pane_id, livePane);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.match(tmuxLog, /paste-buffer -t %42 -b omx-ralph-input-[a-f0-9]+ -p -d/);
+      assert.doesNotMatch(tmuxLog, /paste-buffer -t %99 -b omx-ralph-input-/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
