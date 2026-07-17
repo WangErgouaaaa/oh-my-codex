@@ -8175,8 +8175,8 @@ esac
             assert.equal(await readMonitorSnapshot('team-shutdown-win32-split', cwd), null);
 
             const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-            assert.match(tmuxLog, /if-shell -F -t %13 .*#\{==:#\{pane_pid\},2\}.*kill-pane -t %13.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
-            assert.match(tmuxLog, /if-shell -F -t %14 .*#\{==:#\{pane_pid\},3\}.*kill-pane -t %14.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
+            assert.match(tmuxLog, /if-shell -F -t %13 .*#\{==:#\{pane_pid\},3\}.*kill-pane -t %13.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
+            assert.match(tmuxLog, /if-shell -F -t %14 .*#\{==:#\{pane_pid\},4\}.*kill-pane -t %14.*__OMX_PANE_MUTATION_[a-f0-9]+__/);
             assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
             assert.doesNotMatch(tmuxLog, /kill-session -t leader:0/);
             assert.match(tmuxLog, /kill-pane -t %12/);
