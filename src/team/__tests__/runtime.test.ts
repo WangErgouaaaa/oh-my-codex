@@ -7545,8 +7545,22 @@ case "$1" in
     echo "tmux 3.4"
     exit 0
     ;;
+  display-message)
+    case "$*" in
+      *"#{session_id}"*) echo '$1' ;;
+      *"#{pane_current_path}"*) echo "${cwd}" ;;
+    esac
+    exit 0
+    ;;
   list-panes)
     case "$*" in
+      *"-a -F #{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf "%%10 0 10\n%%11 0 11\n"
+        if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12 0 12\n"; fi
+        printf "%%13 0 13\n%%14 0 14\n%%15 0 15\n"
+        if [ -f "$restored_marker" ]; then printf "%%44 0 44\n"; fi
+        exit 0
+        ;;
       *"-a -F #{pane_id} #{pane_dead}"*)
         printf "%%10 0\n%%11 0\n"
         if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12 0\n"; fi
@@ -7610,6 +7624,22 @@ case "$1" in
         ;;
       *)
         exit 1
+        ;;
+    esac
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *"set-option -p -t %44 @omx_pane_instance_id"*)
+        for arg do
+          case "$arg" in
+            *"display-message -p "*)
+              receipt="\${arg##*display-message -p }"
+              receipt="\${receipt%% *}"
+              printf '%s\n' "$receipt"
+              ;;
+          esac
+        done
         ;;
     esac
     exit 0
@@ -8412,6 +8442,9 @@ case "$1" in
       *"#{pane_current_path}"*)
         echo "${leaderPaneCwd}"
         ;;
+      *"#{session_id}"*)
+        echo '$1'
+        ;;
     esac
     exit 0
     ;;
@@ -8421,7 +8454,7 @@ case "$1" in
         printf "%%11 0 1\n"
         if [ "$(cat "$team_hud_state")" = "present" ]; then printf "%%12 0 2\n"; fi
         printf "%%13 0 3\n%%14 0 4\n"
-        if [ -f "$restored_marker" ]; then printf "%%44 0 4\n"; fi
+        if [ -f "$restored_marker" ]; then printf "%%44 0 44\n"; fi
         exit 0
         ;;
       *"-a -F #{pane_id} #{pane_dead}"*)
@@ -8485,6 +8518,22 @@ case "$1" in
     ;;
   show-options)
     cat "$proof_state"
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *"set-option -p -t %44 @omx_pane_instance_id"*)
+        for arg do
+          case "$arg" in
+            *"display-message -p "*)
+              receipt="\${arg##*display-message -p }"
+              receipt="\${receipt%% *}"
+              printf '%s\n' "$receipt"
+              ;;
+          esac
+        done
+        ;;
+    esac
     exit 0
     ;;
   kill-pane)
