@@ -151,6 +151,16 @@ describe('notify-hook tmux target healing', () => {
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -287,6 +297,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -434,6 +454,16 @@ if [[ "$cmd" == "list-panes" ]]; then
   fi
   echo "can't find session: $target" >&2
   exit 1
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
 fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
@@ -719,6 +749,7 @@ exit 1
       const fakeBinDir = join(cwd, 'fake-bin');
       const fakeTmuxPath = join(fakeBinDir, 'tmux');
       const wrongSessionName = 'wrong-tagged-session';
+      const managedSessionName = buildTmuxSessionName(cwd, sessionId);
       const configPath = join(omxDir, 'tmux-hook.json');
       const hookStatePath = join(stateDir, 'tmux-hook-state.json');
 
@@ -746,10 +777,14 @@ cmd="$1"
 shift || true
 if [[ "$cmd" == "list-sessions" ]]; then
   printf "%s\t%s\n" "${wrongSessionName}" "omx-other-instance"
+  printf "%s\t%s\n" "${managedSessionName}" "${sessionId}"
   exit 0
-fi
 if [[ "$cmd" == "show-option" ]]; then
-  echo "omx-other-instance"
+  if [[ " $* " == *" -p "* ]]; then
+    echo "omx-other-instance"
+  else
+    echo "${sessionId}"
+  fi
   exit 0
 fi
 if [[ "$cmd" == "display-message" ]]; then
@@ -767,6 +802,7 @@ if [[ "$cmd" == "display-message" ]]; then
   if [[ "$format" == "#{pane_current_path}" && "$target" == "%42" ]]; then echo "${cwd}"; exit 0; fi
   if [[ "$format" == "#{pane_start_command}" && "$target" == "%42" ]]; then echo "codex"; exit 0; fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%42" ]]; then echo "codex"; exit 0; fi
+  if [[ "$format" == "#S" && -z "$target" ]]; then echo "${managedSessionName}"; exit 0; fi
   if [[ "$format" == "#S" && "$target" == "%42" ]]; then echo "${wrongSessionName}"; exit 0; fi
   exit 1
 fi
@@ -811,12 +847,13 @@ exit 1
           ...process.env,
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           OMX_TEAM_WORKER: '',
+          TMUX: '1',
         },
       });
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const hookState = await readJson<Record<string, unknown>>(hookStatePath);
-      assert.equal(hookState.last_reason, 'pane_instance_mismatch');
+      assert.equal(hookState.last_reason, 'missing_tmux_instance_authority');
       assert.equal(hookState.total_injections, 0);
     });
   });
@@ -872,6 +909,16 @@ if [[ "$cmd" == "list-panes" ]]; then
   fi
   echo "can't find session: $target" >&2
   exit 1
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
 fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
@@ -994,6 +1041,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1128,6 +1185,16 @@ if [[ "$cmd" == "list-panes" ]]; then
   echo "can't find session: $target" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1254,6 +1321,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1424,6 +1501,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1562,6 +1649,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1770,6 +1867,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1877,6 +1984,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -2001,6 +2118,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -2142,6 +2269,16 @@ exit 1
 set -eu
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${sessionId}\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""

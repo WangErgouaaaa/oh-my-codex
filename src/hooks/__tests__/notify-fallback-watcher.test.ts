@@ -337,7 +337,7 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "show-option" ]]; then
-  if [[ "$*" == *"@omx_pane_instance_id"* || "$*" == *"@omx_instance_id"* ]]; then
+  if true; then
     printf '%s\n' "\${OMX_SESSION_ID:-}"
   fi
   exit 0
@@ -430,9 +430,10 @@ function buildManagedRalphTmux(
     livePane: string;
     codexPanes?: Array<{ paneId: string; active?: boolean; currentCommand?: string; startCommand?: string }>;
     missingAnchor?: boolean;
+    instanceId: string;
   },
 ): string {
-  const { cwd, managedSessionName, anchorPane, livePane, codexPanes, missingAnchor = false } = options;
+  const { cwd, managedSessionName, anchorPane, livePane, codexPanes, missingAnchor = false, instanceId } = options;
   const panes = (codexPanes && codexPanes.length > 0)
     ? codexPanes
     : [{ paneId: livePane, active: true, currentCommand: 'codex', startCommand: 'codex' }];
@@ -529,6 +530,10 @@ ${paneCommandBranches}
   fi
   exit 0
 fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\t%s\n' "${managedSessionName}" "${instanceId}"
+  exit 0
+fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   format=""
@@ -549,6 +554,12 @@ if [[ "$cmd" == "list-panes" ]]; then
   fi
   echo "can't find session" >&2
   exit 1
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf '${instanceId}\n'
+  fi
+  exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
   printf '› \n'
@@ -2780,6 +2791,7 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildManagedRalphTmux(tmuxLogPath, {
         cwd: wd,
         managedSessionName,
+        instanceId: sessionId,
         anchorPane,
         livePane,
         codexPanes: [
@@ -2871,6 +2883,14 @@ if [[ "$cmd" == "if-shell" ]]; then
   if [[ -n "$pid" && "$condition" == *"#{pane_id},$target"* && "$condition" == *"#{pane_dead},0"* && "$condition" == *"#{pane_pid},$pid"* ]]; then
     receipt="\${thenCommand##*display-message -p }"; receipt="\${receipt%% *}"; printf '%s\n' "$receipt"
   fi
+  exit 0
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  printf '${sessionId}\n'
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '${managedSessionName}\t${sessionId}\n'
   exit 0
 fi
 if [[ "$cmd" == "display-message" ]]; then
@@ -3038,6 +3058,7 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildManagedRalphTmux(tmuxLogPath, {
         cwd: wd,
         managedSessionName,
+        instanceId: sessionId,
         anchorPane,
         livePane,
         codexPanes: [
@@ -3109,6 +3130,7 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildManagedRalphTmux(tmuxLogPath, {
         cwd: wd,
         managedSessionName,
+        instanceId: sessionId,
         anchorPane,
         livePane,
         codexPanes: [
@@ -3180,6 +3202,7 @@ exit 0
       await writeFile(join(fakeBinDir, 'tmux'), buildManagedRalphTmux(tmuxLogPath, {
         cwd: wd,
         managedSessionName,
+        instanceId: sessionId,
         anchorPane,
         livePane,
         codexPanes: [

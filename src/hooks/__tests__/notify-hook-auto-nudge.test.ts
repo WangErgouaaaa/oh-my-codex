@@ -128,6 +128,19 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="\$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if [[ "\${OMX_TEST_SESSION_DRIFT:-}" == "1" ]]; then exit 0; fi
+  printf 'sess-managed\n'
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  if [[ "\${OMX_TEST_SESSION_DRIFT:-}" == "1" ]]; then
+    printf '%s\tsess-managed\n' "\${OMX_EXPECTED_TMUX_SESSION_NAME}"
+  else
+    printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  fi
+  exit 0
+fi
 if [[ "\$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -188,7 +201,7 @@ if [[ "\$cmd" == "list-panes" ]]; then
       *) shift ;;
     esac
   done
-  if [[ -n "\$target" && "\$target" == "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}" ]]; then
+  if [[ -n "\$target" && ( "\$target" == "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}" || "\${OMX_TEST_SESSION_DRIFT:-}" == "1" ) ]]; then
     if [[ "\$format" == '#{pane_id}' ]]; then
       printf '%%99\\n'
     else
@@ -566,6 +579,8 @@ describe('notify-hook auto-nudge', () => {
       }, {
         OMX_SESSION_ID: 'sess-managed',
         OMX_TEST_TMUX_SESSION_NAME: mismatchedDetachedSessionName,
+        OMX_TEST_SESSION_DRIFT: '1',
+        OMX_EXPECTED_TMUX_SESSION_NAME: expectedManagedSessionName,
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
@@ -695,6 +710,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -844,6 +869,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -990,6 +1025,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1136,6 +1181,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1282,6 +1337,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1494,6 +1559,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1652,6 +1727,16 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -1759,7 +1844,17 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
-  if [[ "$cmd" == "display-message" ]]; then
+  if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'sess-managed\n'
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
+if [[ "$cmd" == "display-message" ]]; then
     target=""
     format=""
   while (($#)); do

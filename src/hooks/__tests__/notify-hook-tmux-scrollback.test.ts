@@ -115,6 +115,16 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported format: $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tomx-scroll-test\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
+  exit 0
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  if true; then
+    printf 'omx-scroll-test\n'
+  fi
+  exit 0
+fi
 if [[ "$cmd" == "capture-pane" ]]; then
   printf "› ready\n"
   exit 0
