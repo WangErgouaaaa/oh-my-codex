@@ -174,7 +174,6 @@ import {
   parseCanonicalTmuxPaneId,
   rollbackHudWatchPaneAuthority,
   verifyHudWatchPaneAuthority,
-  mutateHudWatchPaneIfCurrent,
 
   type RegisterHudResizeHookOptions,
   type TmuxPaneSnapshot,
@@ -4142,9 +4141,6 @@ export function detectDetachedSessionWindowIndex(sessionName: string): string | 
   }
 }
 
-function escapeShellDoubleQuotedValue(value: string): string {
-  return value.replace(/["\\$`]/g, "\\$&");
-}
 
 interface TmuxExtendedKeysLeaseHolderRecord {
   id: string;
@@ -4396,6 +4392,7 @@ function buildDetachedSessionLeaderCommand(
   projectLocalCodexHomeForCleanup?: string,
   runtimeCodexHomeForCleanup?: string,
   parentEnvFilePath?: string,
+  detachedLaunchProof?: string,
 ): string {
   const detachedPostLaunchHelper = sessionId
     ? `${buildDetachedSessionPostLaunchHelperCommand(cwd, sessionId, codexHomeOverride, projectLocalCodexHomeForCleanup, runtimeCodexHomeForCleanup)} >/dev/null 2>&1 || true;`
@@ -4424,7 +4421,9 @@ function buildDetachedSessionLeaderCommand(
     parentEnvCleanup,
     detachedPostLaunchHelper,
     'if [ "$status" -eq 0 ]; then',
-    `tmux kill-session -t "${escapeShellDoubleQuotedValue(sessionName)}" >/dev/null 2>&1 || true;`,
+    ...(detachedLaunchProof
+      ? [`tmux if-shell -F -t "$TMUX_PANE" "#{&&:#{==:#{session_name},${sessionName}},#{==:#{@omx_detached_launch_proof},${detachedLaunchProof}}}" "kill-session -t ${sessionName}" "" >/dev/null 2>&1 || true;`]
+      : []),
     "fi;",
     "exit $status;",
     "};",
@@ -4706,7 +4705,9 @@ export function buildDetachedSessionBootstrapSteps(
   sqliteHomeOverride?: string,
   parentEnvFilePath?: string,
   inheritedWorkerModel?: string | null,
+  detachedLaunchProof?: string,
 ): DetachedSessionTmuxStep[] {
+  const effectiveDetachedLaunchProof = detachedLaunchProof ?? randomUUID().replace(/-/g, "");
   const detachedLeaderCmd = nativeWindows
     ? "powershell.exe"
     : buildDetachedSessionLeaderCommand(
@@ -4718,6 +4719,7 @@ export function buildDetachedSessionBootstrapSteps(
         projectLocalCodexHomeForCleanup,
         runtimeCodexHomeForCleanup,
         parentEnvFilePath,
+        effectiveDetachedLaunchProof,
       );
   const resolvedEnvStateRoot = env.OMX_STATE_ROOT?.trim()
     ? resolveLaunchPath(cwd, env.OMX_STATE_ROOT.trim())
@@ -4926,33 +4928,87 @@ export function buildDetachedSessionFinalizeSteps(
   return steps;
 }
 
+const DETACHED_LAUNCH_PROOF_OPTION = "@omx_detached_launch_proof";
+
+type DetachedSessionAuthority = {
+  sessionId: string;
+  leaderPaneId: string;
+  leaderPanePid: string;
+  launchProof: string;
+};
+
+function captureDetachedSessionAuthority(
+  leaderPaneId: string,
+  launchProof: string,
+): DetachedSessionAuthority | null {
+  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
+  if (!canonicalLeaderPaneId || !/^[a-f0-9]{32}$/.test(launchProof)) return null;
+  try {
+    const snapshot = parseExactTmuxScalar(execTmuxFileSync(
+      ["display-message", "-p", "-t", canonicalLeaderPaneId, "#{session_id}\t#{pane_id}\t#{pane_pid}"],
+      { encoding: "utf-8" },
+    ));
+    const [sessionId, paneId, panePid] = snapshot?.split("\t") ?? [];
+    const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+    if (!sessionId || !isSafeTmuxFormatScalar(sessionId) || canonicalPaneId !== canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(panePid ?? "")) return null;
+    const condition = buildTmuxPaneIncarnationCondition(canonicalPaneId, panePid!, sessionId);
+    const receiptCondition = `#{&&:${condition},#{==:#{${DETACHED_LAUNCH_PROOF_OPTION}},${launchProof}}}`;
+    const output = execTmuxFileSync([
+      "if-shell", "-F", "-t", canonicalPaneId, condition,
+      `set-option -p -t ${canonicalPaneId} ${DETACHED_LAUNCH_PROOF_OPTION} ${launchProof} ; if-shell -F ${receiptCondition} ${quoteShellArg(`display-message -p -t ${canonicalPaneId} ${launchProof}`)} ''`,
+      "",
+    ], { encoding: "utf-8" });
+    return parseExactTmuxScalar(output) === launchProof
+      ? { sessionId, leaderPaneId: canonicalPaneId, leaderPanePid: panePid!, launchProof }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildRollbackHookCleanupCommand(args: string[]): string | null {
+  const [command, formatFlag, targetFlag, target, condition, mutation, fallback] = args;
+  if (
+    command !== "if-shell"
+    || formatFlag !== "-F"
+    || targetFlag !== "-t"
+    || !target
+    || !condition
+    || !mutation
+    || fallback !== ""
+  ) return null;
+  return `if-shell -F -t ${target} ${condition} ${quoteShellArg(mutation)} ''`;
+}
+
 export function buildDetachedSessionRollbackSteps(
   sessionName: string,
+  authority: DetachedSessionAuthority | null,
   hookTarget: string | null,
   hookName: string | null,
   clientAttachedHookName: string | null,
 ): DetachedSessionTmuxStep[] {
-  const steps: DetachedSessionTmuxStep[] = [];
-  if (hookTarget && clientAttachedHookName) {
-    steps.push({
-      name: "unregister-client-attached-reconcile",
-      args: buildUnregisterClientAttachedReconcileArgs(
-        hookTarget,
-        clientAttachedHookName,
-      ),
-    });
-  }
-  if (hookTarget && hookName) {
-    steps.push({
-      name: "unregister-resize-hook",
-      args: buildUnregisterResizeHookArgs(hookTarget, hookName),
-    });
-  }
-  steps.push({
-    name: "kill-session",
-    args: ["kill-session", "-t", sessionName],
-  });
-  return steps;
+  if (
+    !authority
+    || !isSafeTmuxFormatScalar(sessionName)
+    || !parseCanonicalTmuxPaneId(authority.leaderPaneId)
+    || !/^[1-9][0-9]*$/.test(authority.leaderPanePid)
+    || !isSafeTmuxFormatScalar(authority.sessionId)
+    || !/^[a-f0-9]{32}$/.test(authority.launchProof)
+  ) return [];
+  const condition = `#{&&:#{==:#{session_name},${sessionName}},#{&&:${buildTmuxPaneIncarnationCondition(authority.leaderPaneId, authority.leaderPanePid, authority.sessionId)},#{==:#{${DETACHED_LAUNCH_PROOF_OPTION}},${authority.launchProof}}}}`;
+  const cleanupCommands = [
+    ...(hookTarget && clientAttachedHookName
+      ? [buildRollbackHookCleanupCommand(buildUnregisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName))]
+      : []),
+    ...(hookTarget && hookName
+      ? [buildRollbackHookCleanupCommand(buildUnregisterResizeHookArgs(hookTarget, hookName))]
+      : []),
+    `kill-session -t ${sessionName}`,
+  ].filter((command): command is string => Boolean(command));
+  return [{
+    name: "rollback-detached-session",
+    args: ["if-shell", "-F", "-t", authority.leaderPaneId, condition, cleanupCommands.join(" ; "), ""],
+  }];
 }
 
 export function buildNotifyTempStartupMessages(
@@ -5696,7 +5752,7 @@ function runCodex(
         if (!expectedPane || !globalPaneIdsBefore.has(paneId)) return false;
         if (!hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) || !hasFreshDeadHudPaneAuthority(paneId, expectedPane, currentPaneId, deadHudPanePidsById.get(paneId))) return false;
         try {
-          return mutateHudWatchPaneIfCurrent(paneId, deadHudPanePidsById.get(paneId) ?? '', `kill-pane -t ${paneId}`);
+          return mutateInsideTmuxHudPane(paneId, deadHudPanePidsById.get(paneId), currentPaneId, { kind: "kill" });
 
         } catch (err) {
           logCliOperationFailure(err);
@@ -5709,7 +5765,7 @@ function runCodex(
     let hudPanePid: string | undefined;
     const [keeperHudPaneId, ...duplicateHudPaneIds] = staleHudPaneIds;
     for (const paneId of duplicateHudPaneIds) {
-      if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, globalPanePidsBefore.get(paneId))) mutateHudWatchPaneIfCurrent(paneId, globalPanePidsBefore.get(paneId) ?? '', `kill-pane -t ${paneId}`);
+      if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, globalPanePidsBefore.get(paneId))) mutateInsideTmuxHudPane(paneId, globalPanePidsBefore.get(paneId), currentPaneId, { kind: "kill" });
 
     }
 
@@ -5718,7 +5774,7 @@ function runCodex(
       hudPanePid = globalPanePidsBefore.get(hudPaneId);
       try {
         if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
-          mutateHudWatchPaneIfCurrent(hudPaneId, hudPanePid ?? '', `resize-pane -t ${hudPaneId} -y ${HUD_TMUX_HEIGHT_LINES}`);
+          mutateInsideTmuxHudPane(hudPaneId, hudPanePid, currentPaneId, { kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES });
 
         }
         if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
@@ -5819,7 +5875,7 @@ function runCodex(
         ? [hudPaneId]
         : [];
       for (const paneId of cleanupPaneIds) {
-        if (hudPanePid && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, hudPanePid)) mutateHudWatchPaneIfCurrent(paneId, hudPanePid, `kill-pane -t ${paneId}`);
+        if (hudPanePid && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, hudPanePid)) mutateInsideTmuxHudPane(paneId, hudPanePid, currentPaneId, { kind: "kill" });
       }
     }
     return { postLaunchHandledExternally: false };
@@ -5915,8 +5971,9 @@ function runCodex(
       let registeredClientAttachedHookName: string | null = null;
       let detachedParentEnvFilePath: string | undefined;
       let detachedLeaderPaneId: string | null = null;
-      let detachedLeaderPanePid: string | undefined;
       let registeredHookIncarnations: HudResizeHookPaneIncarnations | undefined;
+      let detachedSessionAuthority: DetachedSessionAuthority | null = null;
+      const detachedLaunchProof = randomUUID().replace(/-/g, "");
       try {
         // This path is the user-shell interactive launch: OMX creates a tmux
         // session and immediately attaches the user's terminal to it. If a tmux
@@ -5948,6 +6005,7 @@ function runCodex(
           sqliteHomeOverride,
           detachedParentEnvFilePath,
           inheritedWorkerModel,
+          detachedLaunchProof,
         );
         for (const step of bootstrapSteps) {
           const output = execTmuxFileSync(step.args, {
@@ -5958,11 +6016,11 @@ function runCodex(
             createdDetachedSession = true;
             const leaderPaneId = parsePaneIdFromTmuxOutput(output || "");
             if (leaderPaneId) {
-              detachedLeaderPaneId = leaderPaneId;
-              const leaderPanePid = readStrictTmuxPaneIncarnations()?.get(leaderPaneId);
-              detachedLeaderPanePid = leaderPanePid;
-              if (!leaderPanePid) throw new Error("detached leader pane authority unavailable");
-              setDetachedTmuxSessionHistoryLimit(sessionName, leaderPaneId, leaderPanePid);
+              const authority = captureDetachedSessionAuthority(leaderPaneId, detachedLaunchProof);
+              if (!authority) throw new Error("detached leader session authority unavailable");
+              detachedSessionAuthority = authority;
+              detachedLeaderPaneId = authority.leaderPaneId;
+              setDetachedTmuxSessionHistoryLimit(sessionName, authority.leaderPaneId, authority.leaderPanePid);
               if (activeRecordPath && contextKey) {
                 writeMadmaxDetachedActiveRecord(activeRecordPath, {
                   version: 1,
@@ -5974,8 +6032,8 @@ function runCodex(
                   run_dir: runtimeContext?.omxRoot ?? process.env.OMX_ROOT ?? cwd,
                   tmux_session_name: sessionName,
                   session_id: sessionId,
-                  tmux_pane_id: leaderPaneId,
-                  tmux_pane_pid: leaderPanePid,
+                  tmux_pane_id: authority.leaderPaneId,
+                  tmux_pane_pid: authority.leaderPanePid,
                 });
               }
               writeDetachedSessionBinding(leaderPaneId);
@@ -6024,10 +6082,13 @@ function runCodex(
               detachedLeaderPaneId,
               hookIncarnations,
             );
-            if (nativeWindows && detachedWindowsCodexCmd && detachedLeaderPaneId && detachedLeaderPanePid) {
+            if (nativeWindows && detachedWindowsCodexCmd && detachedSessionAuthority) {
               scheduleDetachedWindowsCodexLaunch(
-                detachedLeaderPaneId,
-                detachedLeaderPanePid,
+                detachedSessionAuthority.leaderPaneId,
+                detachedSessionAuthority.leaderPanePid,
+                sessionName,
+                detachedSessionAuthority.sessionId,
+                detachedSessionAuthority.launchProof,
                 detachedWindowsCodexCmd,
               );
             }
@@ -6105,14 +6166,13 @@ function runCodex(
               registeredHookIncarnations.hudPaneId,
               registeredHookIncarnations.hudPanePid,
             );
-          const rollbackSteps = retainedHookAuthority
-            ? buildDetachedSessionRollbackSteps(
-                sessionName,
-                registeredHookTarget,
-                registeredHookName,
-                registeredClientAttachedHookName,
-              )
-            : buildDetachedSessionRollbackSteps(sessionName, null, null, null);
+          const rollbackSteps = buildDetachedSessionRollbackSteps(
+            sessionName,
+            detachedSessionAuthority,
+            retainedHookAuthority ? registeredHookTarget : null,
+            retainedHookAuthority ? registeredHookName : null,
+            retainedHookAuthority ? registeredClientAttachedHookName : null,
+          );
           for (const rollbackStep of rollbackSteps) {
             try {
               execTmuxFileSync(rollbackStep.args, { stdio: "ignore" });
@@ -6251,21 +6311,31 @@ export function buildDetachedWindowsBootstrapScript(
   commandText: string,
   delayMs: number = WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS,
   tmuxCommand: string = resolveTmuxExecutableForLaunch(),
+  detachedAuthority?: Pick<DetachedSessionAuthority, "sessionId" | "launchProof"> & { sessionName: string },
 ): string {
   const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
   const delay =
     Number.isFinite(delayMs) && delayMs > 0
       ? Math.floor(delayMs)
       : WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS;
-  if (!canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(leaderPanePid)) return "";
+  if (
+    !canonicalLeaderPaneId
+    || !/^[1-9][0-9]*$/.test(leaderPanePid)
+    || (detachedAuthority && (!isSafeTmuxFormatScalar(detachedAuthority.sessionId) || !/^[a-f0-9]{32}$/.test(detachedAuthority.launchProof) || !isSafeTmuxFormatScalar(detachedAuthority.sessionName)))
+  ) return "";
 
   const receipt = randomUUID().replace(/-/g, "");
   const receiptOption = "@omx_windows_bootstrap_receipt";
   const incarnationCondition = buildTmuxPaneIncarnationCondition(
     canonicalLeaderPaneId,
     leaderPanePid,
+    detachedAuthority?.sessionId,
   );
-  const receiptCondition = `#{&&:${incarnationCondition},#{==:${receiptOption},${receipt}}}`;
+  const detachedCondition = detachedAuthority
+    ? `#{&&:#{==:#{session_name},${detachedAuthority.sessionName}},#{==:#{${DETACHED_LAUNCH_PROOF_OPTION}},${detachedAuthority.launchProof}}}`
+    : "1";
+  const launchCondition = `#{&&:${incarnationCondition},${detachedCondition}}`;
+  const receiptCondition = `#{&&:${launchCondition},#{==:${receiptOption},${receipt}}}`;
   const mutation = [
     `set-option -p -t ${canonicalLeaderPaneId} ${receiptOption} ${receipt}`,
     `if-shell -F ${receiptCondition} ${quoteShellArg(`send-keys -t ${canonicalLeaderPaneId} -l -- ${quoteShellArg(commandText)} ; send-keys -t ${canonicalLeaderPaneId} C-m ; display-message -p -t ${canonicalLeaderPaneId} ${receipt}`)} ''`,
@@ -6275,7 +6345,7 @@ export function buildDetachedWindowsBootstrapScript(
     "-F",
     "-t",
     canonicalLeaderPaneId,
-    incarnationCondition,
+    launchCondition,
     mutation,
     "",
   ];
@@ -6297,9 +6367,19 @@ export function buildDetachedWindowsBootstrapScript(
 function scheduleDetachedWindowsCodexLaunch(
   leaderPaneId: string,
   leaderPanePid: string,
+  sessionName: string,
+  sessionId: string,
+  launchProof: string,
   commandText: string,
 ): void {
-  const script = buildDetachedWindowsBootstrapScript(leaderPaneId, leaderPanePid, commandText);
+  const script = buildDetachedWindowsBootstrapScript(
+    leaderPaneId,
+    leaderPanePid,
+    commandText,
+    WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS,
+    resolveTmuxExecutableForLaunch(),
+    { sessionName, sessionId, launchProof },
+  );
   if (!script) return;
   const child = spawn(
     process.execPath,

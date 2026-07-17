@@ -293,6 +293,7 @@ exit 0
 
 function buildFakeTmuxWithListPanes(tmuxLogPath: string, listPaneLines: string[]): string {
   const paneIds = JSON.stringify(listPaneLines.map((line) => line.trim().split(/\s+/, 1)[0]));
+  const authorityRows = JSON.stringify(listPaneLines.filter((line) => line.includes('\t')));
   return `#!/usr/bin/env bash
 set -eu
 cd "$(dirname "${tmuxLogPath}")"
@@ -355,7 +356,7 @@ if [[ "$cmd" == "list-panes" ]]; then
     node -e 'const fs=require("fs"), root=".omx/state/team"; for (const name of fs.readdirSync(root)) { for (const file of ["manifest.v2.json","config.json"]) { try { const c=JSON.parse(fs.readFileSync(root+"/"+name+"/"+file,"utf8")); if (c.leader_pane_id) { console.log(c.leader_pane_id+" 12345"); process.exit(0); } } catch {} } }'
     exit 0
   fi
-  node -e 'const fs=require("fs"), ids=JSON.parse(process.argv[1]), root=".omx/state/team"; for (const name of fs.readdirSync(root)) { for (const file of ["manifest.v2.json","config.json"]) { try { const config=JSON.parse(fs.readFileSync(root+"/"+name+"/"+file, "utf8")); if (config.tmux_session) { for (const id of new Set([config.leader_pane_id, ...ids].filter(Boolean))) console.log([id, "0", "12345", config.tmux_session, config.tmux_pane_owner_id || "team:"+config.name].join("\\t")); process.exit(0); } } catch {} } }' '${paneIds}'
+  node -e 'const fs=require("fs"), ids=JSON.parse(process.argv[1]), rows=JSON.parse(process.argv[2]), root=".omx/state/team"; if (rows.length) { console.log(rows.join("\\n")); process.exit(0); } for (const name of fs.readdirSync(root)) { for (const file of ["manifest.v2.json","config.json"]) { try { const config=JSON.parse(fs.readFileSync(root+"/"+name+"/"+file,"utf8")); if (config.tmux_session) { const owner=config.tmux_pane_owner_id || "team:"+config.name; for (const id of new Set([config.leader_pane_id, ...ids].filter(Boolean))) console.log([id, "0", "12345", config.tmux_session, id === config.leader_pane_id ? owner : ""].join("\\t")); process.exit(0); } } catch {} } }' '${paneIds}' '${authorityRows}'
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
@@ -408,6 +409,79 @@ function runNotifyHook(
     },
   });
 }
+
+async function runLeaderAuthorityFixture(cwd: string, authorityRows: string[]): Promise<string> {
+  const teamName = 'leader-authority';
+  const stateDir = join(cwd, '.omx', 'state');
+  const fakeBinDir = join(cwd, 'fake-bin');
+  const tmuxLogPath = join(cwd, 'tmux.log');
+  await writeCanonicalTeamFixture(cwd, {
+    teamName,
+    sessionId: 'leader-authority-session',
+    ownerSessionId: 'leader-authority-session',
+    coarseState: 'active',
+  });
+  await mkdir(fakeBinDir, { recursive: true });
+  const fakeTmuxPath = join(fakeBinDir, 'tmux');
+  await writeFile(fakeTmuxPath, buildFakeTmuxWithListPanes(tmuxLogPath, authorityRows));
+  await chmod(fakeTmuxPath, 0o755);
+  await withProcessEnv({ PATH: `${fakeBinDir}:${process.env.PATH}` }, async () => {
+    await maybeNudgeTeamLeader({
+      cwd,
+      stateDir,
+      logsDir: join(cwd, '.omx', 'logs'),
+      preComputedLeaderStale: false,
+    });
+  });
+  return readFile(tmuxLogPath, 'utf-8').catch(() => '');
+}
+
+
+describe('notify-hook leader nudge pane authority parsing', () => {
+  const leaderRow = '%97\t0\t12345\tleader-authority:0\tteam:leader-authority';
+
+  it('nudges a valid leader despite unrelated live shells and unowned dead remain-on-exit panes', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const tmuxLog = await runLeaderAuthorityFixture(cwd, [
+        leaderRow,
+        '%42\t0\t23456\tunrelated:0\t',
+        '%43\t1\t23457\told-session:0\t',
+      ]);
+      assert.match(tmuxLog, /if-shell -t %97 -F/, 'valid leader authority should receive the nudge');
+    });
+  });
+
+  it('fails closed when the target authority row is malformed', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const tmuxLog = await runLeaderAuthorityFixture(cwd, ['%97\t0\tnot-a-pid\tleader-authority:0\tteam:leader-authority']);
+      assert.doesNotMatch(tmuxLog, /if-shell -t %97 -F/, 'malformed target authority must not inject');
+    });
+  });
+
+  it('fails closed when the target pane ID is duplicated', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const tmuxLog = await runLeaderAuthorityFixture(cwd, [leaderRow, leaderRow]);
+      assert.doesNotMatch(tmuxLog, /if-shell -t %97 -F/, 'duplicate target IDs must not inject');
+    });
+  });
+
+  it('fails closed when the target ID has a foreign owner', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const tmuxLog = await runLeaderAuthorityFixture(cwd, ['%97\t0\t12345\tleader-authority:0\tteam:foreign']);
+      assert.doesNotMatch(tmuxLog, /if-shell -t %97 -F/, 'same target ID with a foreign owner must not inject');
+    });
+  });
+
+  it('fails closed when the configured owner tags another pane', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const tmuxLog = await runLeaderAuthorityFixture(cwd, [
+        leaderRow,
+        '%44\t0\t23458\tleader-authority:0\tteam:leader-authority',
+      ]);
+      assert.doesNotMatch(tmuxLog, /if-shell -t %97 -F/, 'ambiguous owner tags must not inject');
+    });
+  });
+});
 
 describe('notify-hook leader-side authority handoff', () => {
   it('does not inject leader nudge from notify-hook when team is active and stale', async () => {

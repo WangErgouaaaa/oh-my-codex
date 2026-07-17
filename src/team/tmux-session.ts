@@ -646,7 +646,11 @@ function splitAndAdoptPane(
   if (!command) return null;
   markedSplitArgs[commandIndex] = writeSplitOperationMarkedCommand(command, operationMarker);
   const split = runTmux(markedSplitArgs);
-  if (!split.ok) return null;
+  if (!split.ok) {
+    const candidate = readPostSplitCandidate(preGlobal, preWindow, windowTarget, operationMarker);
+    if (candidate) rollbackRecoveredSplitPane(candidate, rollbackOption, rollbackProof, operationMarker);
+    return null;
+  }
 
   // The snapshots plus the operation-local start-command marker—not split
   // stdout—identify the only pane this operation may subsequently bind or
@@ -661,7 +665,19 @@ function splitAndAdoptPane(
     ? parseExactTmuxAuthorityScalar(sessionProbe.stdout)
     : null;
   const incarnation = candidate ? readPaneIncarnation(candidate) : null;
-  if (!candidate || !incarnation || !sessionId || !isSafeTmuxFormatOperand(sessionId)) return null;
+  if (!candidate || !incarnation || !sessionId || !isSafeTmuxFormatOperand(sessionId)) {
+    if (candidate) {
+      rollbackRecoveredSplitPane(
+        candidate,
+        rollbackOption,
+        rollbackProof,
+        operationMarker,
+        incarnation?.panePid,
+        sessionId ?? undefined,
+      );
+    }
+    return null;
+  }
 
   const provisionalAuthority: VerifiedSplitPane = {
     paneId: candidate,
@@ -734,6 +750,38 @@ function rollbackSplitPaneAuthority(authority: VerifiedSplitPane): boolean {
     'if-shell', '-F', '-t', authority.paneId,
     condition,
     `kill-pane -t ${authority.paneId} \\; display-message -p ${receipt}`,
+    `display-message -p __omx_split_rollback_rejected_${receipt}`,
+  ]);
+  return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;
+
+}
+
+/** Rolls back a recovered marked split before PID/session adoption is available. */
+function rollbackRecoveredSplitPane(
+  paneId: string,
+  rollbackOption: string,
+  rollbackProof: string,
+  operationMarker: string,
+  panePid?: string,
+  sessionId?: string,
+): boolean {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (
+    !canonicalPaneId
+    || canonicalPaneId !== paneId
+    || !isSafeTmuxFormatOperand(rollbackOption)
+    || !isSafeTmuxFormatOperand(rollbackProof)
+    || !/^[0-9a-f-]{36}$/.test(operationMarker)
+  ) return false;
+  const pidCondition = panePid && /^[1-9][0-9]*$/.test(panePid) ? `#{&&:#{==:#{pane_pid},${panePid}},` : '';
+  const sessionCondition = sessionId && isSafeTmuxFormatOperand(sessionId) ? `#{&&:#{==:#{session_id},${sessionId}},` : '';
+  const closes = `${pidCondition ? '}' : ''}${sessionCondition ? '}' : ''}`;
+  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},${pidCondition}${sessionCondition}#{&&:#{==:#{${rollbackOption}},${rollbackProof}},#{m:*${operationMarker}*,#{pane_start_command}}}${closes}}`;
+  const receipt = createMutationReceipt();
+  const result = runTmux([
+    'if-shell', '-F', '-t', paneId,
+    condition,
+    `kill-pane -t ${paneId} \\; display-message -p ${receipt}`,
     `display-message -p __omx_split_rollback_rejected_${receipt}`,
   ]);
   return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;

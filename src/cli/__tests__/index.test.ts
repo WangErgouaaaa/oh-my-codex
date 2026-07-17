@@ -4117,9 +4117,9 @@ exit 0
     );
     assert.match(source, /const globalPaneIdsBefore = readGlobalTmuxPaneIdSnapshot\(\);/);
     assert.match(source, /const \[keeperHudPaneId, \.\.\.duplicateHudPaneIds\] = staleHudPaneIds;/);
-    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateHudWatchPaneIfCurrent\(paneId, globalPanePidsBefore\.get\(paneId\) \?\? '', `kill-pane -t \$\{paneId\}`\);\s*\}/);
+    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateInsideTmuxHudPane\(paneId, globalPanePidsBefore\.get\(paneId\), currentPaneId, \{ kind: "kill" \}\);\s*\}/);
     assert.match(source, /if \(keeperHudPaneId\) \{\s*hudPaneId = keeperHudPaneId;/);
-    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateHudWatchPaneIfCurrent\(hudPaneId, hudPanePid \?\? '', `resize-pane -t \$\{hudPaneId\} -y \$\{HUD_TMUX_HEIGHT_LINES\}`\);\s*\}/);
+    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateInsideTmuxHudPane\(hudPaneId, hudPanePid, currentPaneId, \{ kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES \}\);\s*\}/);
     assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*registerInsideTmuxHudResizeHook/);
     assert.match(source, /return matchesOwner\(\) && matchesLiveIncarnation\(\) && matchesOwner\(\) && matchesLiveIncarnation\(\);/);
     assert.doesNotMatch(
@@ -4392,18 +4392,22 @@ exit 1
     assert.equal(steps[1]?.args.at(-1), hudCmd);
   });
 
-  it("buildDetachedWindowsBootstrapScript targets the captured leader pane atomically", () => {
+  it("buildDetachedWindowsBootstrapScript binds delayed input to the captured detached session authority", () => {
     const script = buildDetachedWindowsBootstrapScript(
       "%42",
       "1234",
       "powershell.exe -NoLogo -NoExit -EncodedCommand abc",
       2500,
       "C:\\Program Files\\psmux\\psmux.exe",
+      { sessionName: "omx-demo", sessionId: "$77", launchProof: "b".repeat(32) },
     );
     assert.match(script, /const tmuxCommand = "C:\\\\Program Files\\\\psmux\\\\psmux\.exe";/);
     assert.match(script, /const tmuxArgs = \["if-shell","-F","-t","%42"/);
     assert.match(script, /#\{==:#\{pane_id\},%42\}/);
     assert.match(script, /#\{==:#\{pane_pid\},1234\}/);
+    assert.match(script, /#\{==:#\{session_id\},\$77\}/);
+    assert.match(script, /#\{==:#\{session_name\},omx-demo\}/);
+    assert.match(script, /#\{==:#\{@omx_detached_launch_proof\},b{32}\}/);
     assert.match(script, /send-keys -t %42 -l --/);
     assert.match(script, /send-keys -t %42 C-m/);
     assert.match(script, /display-message -p -t %42 [a-f0-9]{32}/);
@@ -4467,8 +4471,10 @@ exit 0
     assert.match(leaderCmd!, /kill -TERM "\$omx_codex_pid"/);
     assert.match(leaderCmd!, /releaseTmuxExtendedKeysLease/);
     assert.match(leaderCmd!, /if \[ "\$status" -eq 0 \]; then/);
-    assert.match(leaderCmd!, /tmux kill-session -t/);
-    assert.match(leaderCmd!, /"omx-demo"/);
+    assert.match(leaderCmd!, /tmux if-shell -F -t "\$TMUX_PANE"/);
+    assert.match(leaderCmd!, /@omx_detached_launch_proof/);
+    assert.match(leaderCmd!, /"kill-session -t omx-demo"/);
+    assert.match(leaderCmd!, /#\{session_name\},omx-demo/);
     assert.match(leaderCmd!, /codex exited immediately with code 0/);
     assert.match(leaderCmd!, /codex exited with code/);
     assert.match(leaderCmd!, /detached tmux session is being kept open/);
@@ -4652,7 +4658,7 @@ exit 0
       assert.match(log, /tmux:show-options -sv extended-keys/);
       assert.match(log, /tmux:set-option -sq extended-keys always/);
       assert.match(log, /tmux:set-option -sq extended-keys off/);
-      assert.match(log, /tmux:kill-session -t omx-demo/);
+      assert.match(log, /tmux:if-shell .*@omx_detached_launch_proof.*kill-session -t omx-demo/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4867,7 +4873,7 @@ exit 0
       assert.match(result.stderr, /codex exited immediately with code 0 during startup/);
       assert.match(result.stderr, /detached tmux session is being kept open/);
       const log = await readFile(logPath, "utf-8");
-      assert.match(log, /tmux:kill-session -t omx-demo/);
+      assert.match(log, /tmux:if-shell .*@omx_detached_launch_proof.*kill-session -t omx-demo/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -5592,43 +5598,37 @@ exit 0
     );
   });
 
-  it("buildDetachedSessionRollbackSteps unregisters hooks before killing session", () => {
+  it("buildDetachedSessionRollbackSteps binds hook cleanup and session kill to the exact launched session", () => {
+    const authority = {
+      sessionId: "$42",
+      leaderPaneId: "%12",
+      leaderPanePid: "101",
+      launchProof: "a".repeat(32),
+    };
     const steps = buildDetachedSessionRollbackSteps(
       "omx-demo",
+      authority,
       "omx-demo:0",
       "omx_resize_launch_demo_0_12",
       "omx_attached_launch_demo_0_12",
     );
-    assert.deepEqual(
-      steps.map((step) => step.name),
-      [
-        "unregister-client-attached-reconcile",
-        "unregister-resize-hook",
-        "kill-session",
-      ],
-    );
-    for (const step of steps.slice(0, 2)) {
-      assert.equal(step.args[0], "if-shell");
-      assert.equal(step.args[1], "-F");
-      assert.equal(step.args[2], "-t");
-      assert.equal(step.args[3], "omx-demo:0");
-      assert.match(step.args.join(" "), /set-hook -u -t omx-demo:0/);
-      assert.match(step.args.join(" "), /#\{==:@omx_hook_identity_/);
-    }
-    assert.doesNotMatch(steps[1]?.args.join(" ") ?? "", /window-resized/);
-    assert.deepEqual(steps[2]?.args, ["kill-session", "-t", "omx-demo"]);
+    assert.deepEqual(steps.map((step) => step.name), ["rollback-detached-session"]);
+    const args = steps[0]?.args ?? [];
+    assert.deepEqual(args.slice(0, 4), ["if-shell", "-F", "-t", "%12"]);
+    assert.match(args[4] ?? "", /#\{==:#\{session_name\},omx-demo\}/);
+    assert.match(args[4] ?? "", /#\{==:#\{session_id\},\$42\}/);
+    assert.match(args[4] ?? "", /#\{==:#\{@omx_detached_launch_proof\},a{32}\}/);
+    assert.match(args[5] ?? "", /if-shell -F -t omx-demo:0 #\{==:@omx_hook_identity_client_attached_/);
+    assert.match(args[5] ?? "", /if-shell -F -t omx-demo:0 #\{==:@omx_hook_identity_client_resized_/);
+    assert.match(args[5] ?? "", /set-hook -u -t omx-demo:0 client-attached\[/);
+    assert.match(args[5] ?? "", /set-hook -u -t omx-demo:0 client-resized\[/);
+    assert.match(args[5] ?? "", /kill-session -t omx-demo/);
   });
 
-  it("buildDetachedSessionRollbackSteps only kills session when no hook metadata exists", () => {
-    const steps = buildDetachedSessionRollbackSteps(
-      "omx-demo",
-      null,
-      null,
-      null,
-    );
+  it("buildDetachedSessionRollbackSteps refuses to clean up without captured launch authority", () => {
     assert.deepEqual(
-      steps.map((step) => step.name),
-      ["kill-session"],
+      buildDetachedSessionRollbackSteps("omx-demo", null, null, null, null),
+      [],
     );
   });
 });

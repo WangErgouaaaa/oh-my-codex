@@ -5855,8 +5855,11 @@ esac
 
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.match(tmuxLog, /list-panes -a -F #\{pane_id\} #\{pane_dead\}/);
-          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
-          assert.doesNotMatch(tmuxLog, /kill-pane -t %1/);
+          assert.match(tmuxLog, /if-shell -F -t %2 #\{&&:#\{==:#\{pane_id\},%2\},#\{&&:#\{==:#\{pane_dead\},0\},/);
+          assert.match(tmuxLog, /#\{==:#\{@omx_split_rollback_[a-f0-9]+\},__OMX_PANE_MUTATION_[a-f0-9]+__/);
+          assert.match(tmuxLog, /#\{m:\*[0-9a-f-]{36}\*,#\{pane_start_command\}\}/);
+          assert.doesNotMatch(tmuxLog, /^kill-pane -t %2$/m);
+          assert.doesNotMatch(tmuxLog, /^kill-pane -t %1$/m);
         },
       );
     } finally {

@@ -139,7 +139,8 @@ if [[ "\$cmd" == "display-message" ]]; then
     esac
   done
   case "\$format" in
-    '#{pane_id}\t#{pane_dead}\t#{pane_pid}') printf '%s\\t0\\t4242\\n' "\$target" ;;
+    '#{pane_id}\t#{pane_dead}\t#{pane_pid}') printf '%s\t0\t4242\n' "\$target" ;;
+    '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{@omx_team_pane_owner_id}') printf '%s\t0\t4242\tteam:auto-nudge\n' "\$target" ;;
     '#{pane_id}') printf '%s\\n' "\$target" ;;
     '#{pane_in_mode}') printf '%s\\n' "${paneInMode}" ;;
     '#{pane_current_command}') printf 'node\\n' ;;
@@ -1423,6 +1424,7 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, defaultAutoNudgePattern('%99'), 'team-worker context should still send auto-nudge');
+      assert.match(tmuxLog, /if-shell -t %99 -F .*@omx_team_pane_owner_id.*team:auto-nudge/, 'every Team nudge sink must carry the persisted owner condition');
 
       const nudgeStatePath = join(workerStateRoot, 'auto-nudge-state.json');
       assert.ok(existsSync(nudgeStatePath), 'worker state root should receive auto-nudge state');
@@ -1504,6 +1506,10 @@ if [[ "$cmd" == "display-message" ]]; then
   done
   if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
     printf '%s\t0\t4242\n' "$target"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{@omx_team_pane_owner_id}" ]]; then
+    printf '%s\t0\t4242\tteam:auto-nudge\n' "$target"
     exit 0
   fi
   if [[ "$format" == "#S" && ( "$target" == "%99" || "$target" == "%100" ) ]]; then

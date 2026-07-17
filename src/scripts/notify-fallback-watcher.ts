@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { StringDecoder } from 'string_decoder';
-import { spawnPlatformCommandSync } from '../utils/platform-command.js';
+import { randomUUID } from 'node:crypto';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
 import {
   maybeAutoNudge,
@@ -20,6 +20,8 @@ import {
   readScopedJsonIfExists,
 } from './notify-hook/state-io.js';
 import { checkPaneReadyForTeamSendKeys } from './notify-hook/team-tmux-guard.js';
+import { runProcess } from './notify-hook/process-runner.js';
+import { parseCanonicalTmuxPaneId, parseExactTmuxAuthorityScalar } from '../hud/tmux.js';
 import {
   checkWorkerPanesAlive,
   isLeaderStale,
@@ -771,24 +773,45 @@ async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
   };
 }
 
-async function emitRalphContinueSteer(paneId: string, message: string): Promise<void> {
+async function emitRalphContinueSteer(paneId: string, message: string, managedSessionId: string): Promise<void> {
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  const sessionId = normalizeValidSessionId(managedSessionId);
+  if (!canonicalPaneId || canonicalPaneId !== paneId) {
+    throw new Error('managed pane authority invalid');
+  }
+
+  const paneSnapshot = await runProcess(
+    'tmux',
+    ['display-message', '-p', '-t', canonicalPaneId, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'],
+    3000,
+  );
+  const snapshot = safeString(paneSnapshot.stdout);
+  const match = /^([^\t\r\n]+)\t0\t([1-9][0-9]*)\n$/.exec(snapshot);
+  if (parseCanonicalTmuxPaneId(match?.[1]) !== canonicalPaneId || !match?.[2]) {
+    throw new Error('managed pane authority invalid');
+  }
+
   const markedText = `${message} ${DEFAULT_MARKER}`;
-  await new Promise<void>((resolve) => {
-    const { result: typed } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, '-l', markedText], { encoding: 'utf-8' });
-    if (typed.error) throw new Error(typed.error.message);
-    if (typed.status !== 0) throw new Error((typed.stderr || typed.stdout || '').trim() || 'tmux send-keys failed');
-    setTimeout(resolve, 100);
-  });
-  await new Promise<void>((resolve) => {
-    const { result: submitA } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
-    if (submitA.error) throw new Error(submitA.error.message);
-    if (submitA.status !== 0) throw new Error((submitA.stderr || submitA.stdout || '').trim() || 'tmux send-keys C-m failed');
-    setTimeout(resolve, 100);
-  });
-  const { result: submitB } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
-  if (submitB.error) throw new Error(submitB.error.message);
-  if (submitB.status !== 0) {
-    throw new Error((submitB.stderr || submitB.stdout || '').trim() || 'tmux send-keys C-m failed');
+  const bufferName = `omx-ralph-input-${randomUUID().replace(/-/g, '')}`;
+  const receipt = randomUUID().replace(/-/g, '');
+  if (!/^[a-f0-9]{32}$/.test(receipt)) throw new Error('invalid atomic input receipt');
+
+  try {
+    await runProcess('tmux', ['set-buffer', '-b', bufferName, '--', markedText], 3000);
+    const verified = await runProcess('tmux', ['show-buffer', '-b', bufferName], 3000);
+    if (verified.stdout !== markedText) throw new Error('tmux input buffer verification failed');
+
+    const sessionAuthority = sessionId
+      ? `#{||:#{==:#{@omx_pane_instance_id},${sessionId}},#{==:#{@omx_instance_id},${sessionId}}}`
+      : '1';
+    const authority = `#{&&:#{&&:#{==:#{pane_id},${canonicalPaneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${match[2]}}}},${sessionAuthority}}`;
+    const mutation = `send-keys -t ${canonicalPaneId} C-u; paste-buffer -t ${canonicalPaneId} -b ${bufferName} -p -d; send-keys -t ${canonicalPaneId} C-m; send-keys -t ${canonicalPaneId} C-m; display-message -p ${receipt}`;
+    const result = await runProcess('tmux', ['if-shell', '-t', canonicalPaneId, '-F', authority, mutation, ''], 3000);
+    if (parseExactTmuxAuthorityScalar(result.stdout) !== receipt) {
+      throw new Error('tmux atomic input authority receipt mismatch');
+    }
+  } finally {
+    await runProcess('tmux', ['delete-buffer', '-b', bufferName], 3000).catch(() => {});
   }
 }
 
@@ -1234,7 +1257,16 @@ async function runRalphContinueSteerTick(): Promise<void> {
       return { sent: false, skipped: true };
     }
 
-    await emitRalphContinueSteer(paneId, RALPH_CONTINUE_TEXT);
+    const managedPayload = await buildWatcherManagedPayload();
+    if (managedPayload && await resolveManagedPaneFromAnchor(paneId, cwd, managedPayload, { allowTeamWorker: false }) !== paneId) {
+      lastRalphContinueSteer.last_reason = 'pane_authority_invalid';
+      return { sent: false, skipped: true };
+    }
+    await emitRalphContinueSteer(
+      paneId,
+      RALPH_CONTINUE_TEXT,
+      managedPayload?.session_id || safeString(activeRalph.state?.owner_codex_session_id),
+    );
     await writeRalphSteerTimestamp(nowIso);
     lastRalphContinueSteer.last_sent_at = nowIso;
     lastRalphContinueSteer.shared_last_sent_at = nowIso;

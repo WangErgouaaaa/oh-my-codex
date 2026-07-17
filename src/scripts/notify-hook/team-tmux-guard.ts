@@ -40,6 +40,41 @@ export function mapPaneInjectionReadinessReason(reason: any): any {
   return reason === 'pane_running_shell' ? 'agent_not_running' : reason;
 }
 
+function parseExpectedPanePid(value: unknown): string | null {
+  const raw = safeString(value);
+  return /^[1-9][0-9]*$/.test(raw) && Number.isSafeInteger(Number(raw)) ? raw : null;
+}
+
+function parseExpectedPaneOwnerId(value: unknown): string | null {
+  const raw = safeString(value);
+  return /^[A-Za-z0-9][A-Za-z0-9_.:%-]*$/.test(raw) ? raw : null;
+}
+
+function validatePaneInjectionAuthority({
+  target,
+  exactPaneId,
+  expectedPanePid,
+  expectedPaneOwnerId,
+  expectedHudPaneId,
+}: any): { panePid?: string; paneOwnerId?: string } | null {
+  if (exactPaneId !== undefined && parseCanonicalTmuxPaneId(exactPaneId) !== target) return null;
+  if (expectedPanePid !== undefined) {
+    const panePid = parseExpectedPanePid(expectedPanePid);
+    if (!panePid) return null;
+  }
+  if (expectedPaneOwnerId !== undefined && expectedPaneOwnerId !== '') {
+    if (!parseExpectedPaneOwnerId(expectedPaneOwnerId)) return null;
+  }
+  if (expectedHudPaneId !== undefined && expectedHudPaneId !== '') {
+    const hudPaneId = parseCanonicalTmuxPaneId(expectedHudPaneId);
+    if (!hudPaneId || hudPaneId === target) return null;
+  }
+  return {
+    panePid: expectedPanePid === undefined ? undefined : String(expectedPanePid),
+    paneOwnerId: expectedPaneOwnerId ? String(expectedPaneOwnerId) : undefined,
+  };
+}
+
 export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   skipIfScrolling = false,
   captureLines = 80,
@@ -50,6 +85,8 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   requireCaptureEvidence = undefined,
   exactPaneId = undefined,
   expectedPanePid = undefined,
+  expectedPaneOwnerId = undefined,
+  expectedHudPaneId = undefined,
 } = {}): Promise<any> {
   const normalizedRequireObservableState = typeof requireCaptureEvidence === 'boolean' ? requireCaptureEvidence : requireObservableState;
   const requestedTarget = safeString(paneTarget);
@@ -64,10 +101,10 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
       paneCapture: '',
     };
   }
-  const capturedAuthority = await capturePaneInputAuthority(target);
+  const validatedAuthority = validatePaneInjectionAuthority({ target, exactPaneId, expectedPanePid, expectedPaneOwnerId, expectedHudPaneId });
+  const capturedAuthority = validatedAuthority && await capturePaneInputAuthority(target, validatedAuthority.paneOwnerId);
   if (!capturedAuthority
-    || (typeof exactPaneId === 'string' && exactPaneId !== capturedAuthority.paneTarget)
-    || (expectedPanePid !== undefined && String(expectedPanePid) !== capturedAuthority.panePid)) {
+    || (validatedAuthority.panePid !== undefined && validatedAuthority.panePid !== capturedAuthority.panePid)) {
     return {
       ok: false,
       sent: false,
@@ -172,46 +209,56 @@ export async function evaluatePaneInjectionReadiness(paneTarget: any, {
   }
 }
 
-function parseExactPaneAuthoritySnapshot(value: any): { paneId: string; panePid: string } | null {
+function parseExactPaneAuthoritySnapshot(value: any, expectedPaneOwnerId = ''): { paneId: string; panePid: string } | null {
   const raw = safeString(value);
   if (!raw || raw.includes('\r') || !raw.endsWith('\n') || raw.endsWith('\n\n')) return null;
-  const [rawPaneId, paneDead, panePid, ...extra] = raw.slice(0, -1).split('\t');
+  const fields = raw.slice(0, -1).split('\t');
+  const [rawPaneId, paneDead, panePid, paneOwnerId, ...extra] = fields;
   const paneId = parseCanonicalTmuxPaneId(rawPaneId);
   if (extra.length > 0 || !paneId || paneDead !== '0' || !/^[1-9][0-9]*$/.test(panePid)) return null;
+  if (expectedPaneOwnerId ? (fields.length !== 4 || paneOwnerId !== expectedPaneOwnerId) : fields.length !== 3) return null;
   return { paneId, panePid };
 }
 
-function paneAuthorityFormat(paneId: string, panePid: string): string {
-  return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
+function paneAuthorityFormat(paneId: string, panePid: string, expectedPaneOwnerId = ''): string {
+  const incarnation = `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
+  return expectedPaneOwnerId
+    ? `#{&&:${incarnation},#{==:#{@omx_team_pane_owner_id},${expectedPaneOwnerId}}}`
+    : incarnation;
 }
 
-async function runPaneMutationAtomically(paneId: string, panePid: string, command: string[]): Promise<boolean> {
+async function runPaneMutationAtomically(paneId: string, panePid: string, command: string[], expectedPaneOwnerId = ''): Promise<boolean> {
   const receipt = randomUUID().replace(/-/g, '');
   if (!/^[a-f0-9]{32}$/.test(receipt)) return false;
   const quoted = `${command.map((arg) => `'${arg.replace(/'/g, "\\'")}'`).join(' ')} ; display-message -p ${receipt}`;
 
   const result = await runProcess('tmux', [
-    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid), quoted, '',
+    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid, expectedPaneOwnerId), quoted, '',
   ], 3000);
   return parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
 
-async function confirmPaneAuthorityAtomically(paneId: string, panePid: string): Promise<boolean> {
+async function confirmPaneAuthorityAtomically(paneId: string, panePid: string, expectedPaneOwnerId = ''): Promise<boolean> {
   const receipt = randomUUID().replace(/-/g, '');
   if (!/^[a-f0-9]{32}$/.test(receipt)) return false;
   const result = await runProcess('tmux', [
-    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid), `display-message -p ${receipt}`, '',
+    'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid, expectedPaneOwnerId), `display-message -p ${receipt}`, '',
   ], 3000);
   return parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
 
 
-export async function capturePaneInputAuthority(paneTarget: any): Promise<{ paneTarget: string; panePid: string; assertPaneAuthority: () => Promise<boolean> } | null> {
+export async function capturePaneInputAuthority(paneTarget: any, expectedPaneOwnerId = ''): Promise<{ paneTarget: string; panePid: string; assertPaneAuthority: () => Promise<boolean> } | null> {
   const requestedTarget = safeString(paneTarget);
   const canonicalTarget = parseCanonicalTmuxPaneId(requestedTarget);
   if (!canonicalTarget || canonicalTarget !== requestedTarget) return null;
+  const ownerId = (expectedPaneOwnerId ? parseExpectedPaneOwnerId(expectedPaneOwnerId) : '') ?? '';
+  if (expectedPaneOwnerId && !ownerId) return null;
+  const authorityFormat = ownerId
+    ? '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{@omx_team_pane_owner_id}'
+    : '#{pane_id}\t#{pane_dead}\t#{pane_pid}';
   try {
-    const initial = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', canonicalTarget, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 3000)).stdout);
+    const initial = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', canonicalTarget, authorityFormat], 3000)).stdout, ownerId);
     if (!initial || initial.paneId !== canonicalTarget) return null;
     return {
       panePid: initial.panePid,
@@ -219,7 +266,7 @@ export async function capturePaneInputAuthority(paneTarget: any): Promise<{ pane
       paneTarget: initial.paneId,
       assertPaneAuthority: async () => {
         try {
-          const current = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', initial.paneId, '#{pane_id}\t#{pane_dead}\t#{pane_pid}'], 3000)).stdout);
+          const current = parseExactPaneAuthoritySnapshot((await runProcess('tmux', ['display-message', '-p', '-t', initial.paneId, authorityFormat], 3000)).stdout, ownerId);
           return current?.paneId === initial.paneId && current.panePid === initial.panePid;
         } catch {
           return false;
@@ -240,14 +287,22 @@ export async function sendPaneInput({
   typePrompt = true,
   queueFirstSubmit = false,
   assertPaneAuthority,
+  exactPaneId,
+  expectedPanePid,
+  expectedPaneOwnerId = '',
+  expectedHudPaneId = '',
 }: any): Promise<any> {
   const requestedTarget = safeString(paneTarget);
   const target = parseCanonicalTmuxPaneId(requestedTarget);
   if (!target || target !== requestedTarget) {
     return { ok: false, sent: false, reason: 'missing_pane_target', paneTarget: '' };
   }
-  const capturedAuthority = await capturePaneInputAuthority(target);
-  if (!capturedAuthority) {
+  const validatedAuthority = validatePaneInjectionAuthority({ target, exactPaneId, expectedPanePid, expectedPaneOwnerId, expectedHudPaneId });
+  if (!validatedAuthority) {
+    return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target };
+  }
+  const capturedAuthority = await capturePaneInputAuthority(target, validatedAuthority.paneOwnerId);
+  if (!capturedAuthority || (validatedAuthority.panePid !== undefined && validatedAuthority.panePid !== capturedAuthority.panePid)) {
     return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target };
   }
   const authoritativeTarget = capturedAuthority.paneTarget;
@@ -309,10 +364,10 @@ export async function sendPaneInput({
       }
       if (!(await requirePaneAuthority())) return authorityFailure();
       try {
-        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.clearComposerArgv))) return authorityFailure();
+        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.clearComposerArgv, expectedPaneOwnerId))) return authorityFailure();
 
         if (!(await requirePaneAuthority())) return authorityFailure();
-        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.pasteBufferArgv))) return authorityFailure();
+        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.pasteBufferArgv, expectedPaneOwnerId))) return authorityFailure();
 
 
       } catch (error) {
@@ -321,7 +376,7 @@ export async function sendPaneInput({
     }
     if (queueFirstSubmit && argv.submitArgv.length > 0) {
       if (!(await requirePaneAuthority())) return authorityFailure();
-      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, ['send-keys', '-t', authoritativeTarget, 'Tab']))) return authorityFailure();
+      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, ['send-keys', '-t', authoritativeTarget, 'Tab'], expectedPaneOwnerId))) return authorityFailure();
 
 
       if (submitDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
@@ -329,11 +384,11 @@ export async function sendPaneInput({
     for (const submit of argv.submitArgv) {
       if (submitDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
       if (!(await requirePaneAuthority())) return authorityFailure();
-      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, submit))) return authorityFailure();
+      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, submit, expectedPaneOwnerId))) return authorityFailure();
 
 
     }
-    if (!(await confirmPaneAuthorityAtomically(authoritativeTarget, capturedAuthority.panePid))) return authorityFailure();
+    if (!(await confirmPaneAuthorityAtomically(authoritativeTarget, capturedAuthority.panePid, expectedPaneOwnerId))) return authorityFailure();
 
     return { ok: true, sent: true, reason: 'sent', paneTarget: authoritativeTarget, argv };
   } catch (error) {

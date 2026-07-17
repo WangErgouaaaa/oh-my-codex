@@ -259,7 +259,7 @@ if [[ "$cmd" == "if-shell" ]]; then
     echo "send failed" >&2
     exit 1
   fi
-  if [[ -n "${options.failSendKeysMatch || ''}" && "$thenCommand" == *"${options.failSendKeysMatch || ''}"* ]]; then
+  if [[ -n "${options.failSendKeysMatch || ''}" && ("$thenCommand" == *"${options.failSendKeysMatch || ''}"* || ( -f "${tmuxLogPath}.buffer" && "$(cat "${tmuxLogPath}.buffer")" == *"${options.failSendKeysMatch || ''}"* )) ]]; then
     echo "send failed" >&2
     exit 1
   fi
@@ -3229,8 +3229,8 @@ exit 0
       assert.match(tmuxLog, /display-message -p -t %99 #{pane_id}\t#{pane_dead}\t#{pane_pid}/);
       assert.doesNotMatch(tmuxLog, /display-message -p -t %99 #S/);
       assert.match(tmuxLog, /list-panes -s -t .*sess-ralph-dead-anchor/);
-      assert.match(tmuxLog, /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/);
+      assert.match(tmuxLog, /paste-buffer -t %42 -b omx-ralph-input-[a-f0-9]+ -p -d/);
+      assert.doesNotMatch(tmuxLog, /paste-buffer -t %99 -b omx-ralph-input-/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -4094,7 +4094,7 @@ exit 0
 
       await waitFor(async () => {
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
-        return /send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/.test(tmuxLog);
+        return /paste-buffer -t %42 -b omx-ralph-input-[a-f0-9]+ -p -d/.test(tmuxLog);
       }, 4000, 50);
 
       assert.ok(isPidAlive(child.pid), 'expected watcher to stay alive while Ralph remains active');
@@ -4908,6 +4908,24 @@ setInterval(() => {}, 1000);
 
 });
 
+describe('Ralph fallback atomic input contract', () => {
+  it('uses one receipt-gated literal-buffer mutation with incarnation and managed-owner authority', async () => {
+    const source = await readFile(new URL('../../scripts/notify-fallback-watcher.js', import.meta.url), 'utf-8');
+    const atomicInput = /const mutation = `send-keys -t \$\{canonicalPaneId\} C-u; paste-buffer -t \$\{canonicalPaneId\} -b \$\{bufferName\} -p -d; send-keys -t \$\{canonicalPaneId\} C-m; send-keys -t \$\{canonicalPaneId\} C-m; display-message -p \$\{receipt\}`/;
+    assert.match(source, atomicInput);
+    assert.match(source, /set-buffer', '-b', bufferName, '--', markedText/);
+    assert.match(source, /verified\.stdout !== markedText/);
+    assert.match(source, /randomUUID\(\)\.replace\(\/-\/g, ''\)/);
+    assert.match(source, /parseExactTmuxAuthorityScalar\(result\.stdout\) !== receipt/);
+    assert.match(source, /if-shell', '-t', canonicalPaneId, '-F', authority, mutation, ''/);
+    assert.doesNotMatch(source, /runProcess\('tmux', \['send-keys'/);
+    assert.doesNotMatch(source, /runProcess\('tmux', \['paste-buffer'/);
+    assert.match(source, /#\{pane_pid\}/);
+    assert.match(source, /@omx_pane_instance_id/);
+    assert.match(source, /@omx_instance_id/);
+    assert.doesNotMatch(source, /spawnPlatformCommandSync\('tmux', \['send-keys'/);
+  });
+});
 describe('notify fallback delivery protocol wiring', () => {
   it('routes rollout completions through durable delivery authority before spawning', async () => {
     const source = await readFile(new URL('../../scripts/notify-fallback-watcher.js', import.meta.url), 'utf-8');

@@ -256,7 +256,7 @@ if [[ "$cmd" == "display-message" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   if [[ "$*" == *"#{pane_active}"* ]]; then
-    printf "%%2\t0\t2002\t1\tnode /pkg/dist/cli/omx.js hud --watch\n%%42\t0\t4242\t0\tcodex --model gpt-5\n"
+    printf "%%2\t0\t2002\t1\tnode /pkg/dist/cli/omx.js hud --watch\t\$1\tteam:sdk\tproof-1\n%%42\t0\t4242\t0\tcodex --model gpt-5\t\$1\tteam:sdk\tproof-1\n"
   elif [[ "$*" == *"#{pane_dead}"* ]]; then
     printf "%%2\t0\t2002\n%%42\t0\t4242\n"
   elif [[ "$*" == *"#{pane_id}"* ]]; then
@@ -318,7 +318,7 @@ case "$cmd" in
   display-message) printf 'devsess\\n' ;;
   list-panes)
     if [[ "$*" == *"#{pane_active}"* ]]; then
-      printf "%%42\\t0\\t4242\\t1\\tcodex --model gpt-5\\n"
+      printf "%%42\\t0\\t4242\\t1\\tcodex --model gpt-5\\t\\$1\\tteam:sdk\\tproof-1\\n"
     elif [[ "$*" == *"#{pane_dead}"* ]]; then
       printf "%%42\\t0\\t4242\\n"
     else
@@ -372,7 +372,7 @@ case "$cmd" in
   display-message) printf 'devsess\\n' ;;
   list-panes)
     if [[ "$*" == *"#{pane_active}"* ]]; then
-      printf "%%42\\t0\\t4242\\t1\\tcodex --model gpt-5\\n"
+      printf "%%42\\t0\\t4242\\t1\\tcodex --model gpt-5\\t\\$1\\tteam:sdk\\tproof-1\\n"
     elif [[ "$*" == *"#{pane_dead}"* ]]; then
       printf "%%42\\t0\\t4242\\n"
     else
@@ -386,12 +386,20 @@ case "$cmd" in
       if [[ "$*" == *"-r -p"* ]]; then
         [[ "$*" == *"#{==:#{bracket_paste_flag},1}"* ]] || exit 1
         if [[ "\${OMX_TEST_BRACKET_MODE:-1}" == "1" && "\${OMX_TEST_PID_REUSE:-0}" != "1" ]]; then
-          [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
-          printf 'paste\\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+          printf 'paste\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+          if [[ "\${OMX_TEST_DELIVERY_FAILURE:-}" == "after-first-submit" && "$*" == *"send-keys -t %42 C-m"* ]]; then
+            printf 'submit\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+          elif [[ -z "\${OMX_TEST_DELIVERY_FAILURE:-}" ]]; then
+            [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
+          fi
         fi
       elif [[ "\${OMX_TEST_PID_REUSE:-0}" != "1" ]]; then
-        [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
-        printf 'paste\\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+        printf 'paste\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+        if [[ "\${OMX_TEST_DELIVERY_FAILURE:-}" == "after-first-submit" && "$*" == *"send-keys -t %42 C-m"* ]]; then
+          printf 'submit\n' >> "$OMX_TEST_PASTE_EXECUTIONS"
+        elif [[ -z "\${OMX_TEST_DELIVERY_FAILURE:-}" ]]; then
+          [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
+        fi
       fi
     else
       [[ "$*" =~ display-message\\ -p\\ ([a-f0-9]{32}) ]] && printf '%s\n' "\${BASH_REMATCH[1]}"
@@ -443,6 +451,28 @@ esac
         process.env.OMX_TEST_BRACKET_MODE = 'malformed';
         const unavailableSingleLine = await sdk.tmux.sendKeys({ text: 'single line with unavailable bracket mode', paneId: '%42', cooldownMs: 0, submit: false });
         assert.equal(unavailableSingleLine.ok, true);
+        process.env.OMX_TEST_BRACKET_MODE = '1';
+        process.env.OMX_TEST_DELIVERY_FAILURE = 'after-paste';
+        const afterPaste = await sdk.tmux.sendKeys({ text: 'receipt lost after paste', paneId: '%42', cooldownMs: 0, submit: false });
+        assert.deepEqual(afterPaste, {
+          ok: false,
+          reason: 'delivery_ambiguous',
+          target: '%42',
+          paneId: '%42',
+          error: 'delivery_receipt_missing',
+        });
+        process.env.OMX_TEST_DELIVERY_FAILURE = 'after-first-submit';
+        const afterFirstSubmit = await sdk.tmux.sendKeys({ text: 'receipt lost after first submit', paneId: '%42', cooldownMs: 0 });
+        assert.equal(afterFirstSubmit.reason, 'delivery_ambiguous');
+        const retry = await sdk.tmux.sendKeys({ text: 'receipt lost after first submit', paneId: '%42', cooldownMs: 0 });
+        assert.equal(retry.reason, 'delivery_ambiguous');
+        const deliveryCommands = await readFile(commandLogPath, 'utf8');
+        assert.match(deliveryCommands, /#{==:#{session_id},\$1}/);
+        assert.match(deliveryCommands, /#{==:#{@omx_team_pane_owner_id},team:sdk}/);
+        assert.match(deliveryCommands, /#{==:#{@omx_pane_instance_id},proof-1}/);
+        assert.match(deliveryCommands, /paste-buffer[^\n]*send-keys -t %42 C-m ; send-keys -t %42 C-m ; display-message/);
+        assert.match(await readFile(pasteExecutionPath, 'utf8'), /submit/);
+        delete process.env.OMX_TEST_DELIVERY_FAILURE;
       } finally {
         if (typeof previousPath === 'string') process.env.PATH = previousPath;
         else delete process.env.PATH;
@@ -451,6 +481,7 @@ esac
         delete process.env.OMX_TEST_PASTE_EXECUTIONS;
         delete process.env.OMX_TEST_BRACKET_MODE;
         delete process.env.OMX_TEST_PID_REUSE;
+        delete process.env.OMX_TEST_DELIVERY_FAILURE;
         await rm(cwd, { recursive: true, force: true });
         await rm(fakeBinDir, { recursive: true, force: true });
       }
@@ -469,7 +500,7 @@ shift || true
 printf '%s [%s]\n' "$cmd" "$*" >> "$OMX_TEST_TMUX_LOG"
 if [[ "$cmd" == "display-message" ]]; then printf 'devsess\n'; exit 0; fi
 if [[ "$cmd" == "list-panes" ]]; then
-  if [[ "$*" == *"#{pane_active}"* ]]; then printf '%%42\t0\t4242\t1\tcodex\n';
+  if [[ "$*" == *"#{pane_active}"* ]]; then printf '%%42\t0\t4242\t1\tcodex\t$1\tteam:sdk\tproof-1\n';
   elif [[ "$*" == *"#{pane_dead}"* ]]; then printf '%%42\t0\t4242\n';
   else printf '%%42\n'; fi
   exit 0
@@ -555,8 +586,8 @@ if [[ "$cmd" == "list-panes" ]]; then
     elif [[ "\${OMX_TEST_CLASSIFICATION_DRIFT:-}" == "1" && "$detailed_count" -gt 1 ]]; then
       printf "%%42\t0\t4242\t1\tbash\n"
     else
-      printf "%%42\t0\t4242\t1\tcodex --model gpt-5\n"
-      [[ "\${OMX_TEST_MIXED_DEAD:-}" == "1" ]] && printf "%%77\t1\t0\t0\tremain-on-exit\\n"
+      printf "%%42\t0\t4242\t1\tcodex --model gpt-5\t\$1\tteam:sdk\tproof-1\n"
+      [[ "\${OMX_TEST_MIXED_DEAD:-}" == "1" ]] && printf "%%77\t1\t0\t0\tremain-on-exit\t\$1\tteam:sdk\tproof-1\n"
     fi
     case "\${OMX_TEST_DUPLICATE_DETAILED:-}" in
       dead-dead) printf "%%77\t1\t0\t0\tremain-on-exit\n%%77\t1\t0\t0\tremain-on-exit\n" ;;
