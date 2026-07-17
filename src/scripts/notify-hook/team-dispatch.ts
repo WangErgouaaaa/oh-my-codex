@@ -761,21 +761,20 @@ async function finalizeClaimedDispatchRequest({
         status: 'reconciliation-needed',
       });
     } else {
-      // No pane mutation was confirmed ambiguous. Keep pre-effect failures pending
-      // so a later hook invocation can retry once the transient condition clears.
-      request.status = 'pending';
-      request.last_reason = safeString(result.reason).trim() || 'dispatch_pre_effect_failed';
-      request.retryable = true;
-      summary.skipped += 1;
+      request.status = 'failed';
+      request.failed_at = nowIso;
+      request.last_reason = result.reason;
+      runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir, teamName);
+      summary.processed += 1;
+      summary.failed += 1;
       mutated = true;
       await appendDispatchLog(logsDir, {
-        type: 'dispatch_pre_effect_retry',
+        type: 'dispatch_failed',
         team: teamName,
         request_id: request.request_id,
         worker: request.to_worker,
         message_id: request.message_id || null,
-        reason: request.last_reason,
-        retryable: true,
+        reason: result.reason,
         ...buildDispatchAttemptEvidence(result),
       });
       await appendDeliveryTelemetry(logsDir, {
@@ -785,17 +784,19 @@ async function finalizeClaimedDispatchRequest({
         message_id: request.message_id || null,
         to_worker: request.to_worker,
         transport: 'send-keys',
-        result: 'retry',
-        reason: request.last_reason,
+        result: 'failed',
+        reason: result.reason,
       });
-      await emitOperationalHookEvent(cwd, 'retry-needed', {
+      await emitOperationalHookEvent(cwd, result.reason === LEADER_PANE_MISSING_DEFERRED_REASON ? 'handoff-needed' : 'failed', {
         team: teamName,
         worker: request.to_worker,
         request_id: request.request_id,
         message_id: request.message_id || null,
         command: request.trigger_message,
-        reason: request.last_reason,
-        status: 'retry-needed',
+        reason: result.reason,
+        ...(result.reason === LEADER_PANE_MISSING_DEFERRED_REASON
+          ? { status: 'handoff-needed' }
+          : { status: 'failed', error_summary: result.reason }),
       });
     }
 
