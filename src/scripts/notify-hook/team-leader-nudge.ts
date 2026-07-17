@@ -130,10 +130,26 @@ async function readLeaderPaneAuthority(teamName, cwd, expected = null) {
     const rawRows = safeString(result.stdout);
     if (!rawRows || rawRows.includes('\r') || !rawRows.endsWith('\n') || rawRows.endsWith('\n\n')) return null;
     const rows = rawRows.slice(0, -1).split('\n').map((line) => line.split('\t'));
-    const seenPaneIds = new Set();
-    if (rows.some((row) => row.length !== 5 || parseCanonicalTmuxPaneId(row[0]) !== row[0] || (row[1] !== '0' && row[1] !== '1') || !/^[1-9][0-9]*$/.test(row[2]) || !row[3] || !row[4] || seenPaneIds.has(row[0]) || !seenPaneIds.add(row[0]))) return null;
-    const row = rows.find(([id]) => id === paneId);
-    if (!row) return null;
+    const targetRows = rows.filter((row) => row[0] === paneId);
+    if (targetRows.length !== 1) return null;
+
+    const row = targetRows[0];
+    if (
+      row.length !== 5
+      || parseCanonicalTmuxPaneId(row[0]) !== paneId
+      || (row[1] !== '0' && row[1] !== '1')
+      || !/^[1-9][0-9]*$/.test(row[2])
+      || !row[3]
+      || !row[4]
+    ) return null;
+
+    // Other tmux panes are not leader authority. In particular, remain-on-exit
+    // rows without an OMX owner tag and ordinary shell panes must not invalidate
+    // an otherwise exact leader snapshot. A second pane carrying this team's
+    // owner tag, however, makes ownership ambiguous and fails closed.
+    const ownerRows = rows.filter((candidate) => candidate.length === 5 && candidate[4] === ownerId);
+    if (ownerRows.length !== 1 || ownerRows[0] !== row) return null;
+
     const [, dead, panePid, sessionName, paneOwnerId] = row;
     if (dead !== '0' || sessionName !== tmuxSession || paneOwnerId !== ownerId || (expected && (expected.paneId !== paneId || expected.panePid !== panePid || expected.tmuxSession !== tmuxSession || expected.ownerId !== ownerId))) return null;
     return { config, paneId, panePid, tmuxSession, ownerId };

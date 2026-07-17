@@ -419,6 +419,32 @@ function collectShutdownPaneIds(params: {
   return [...paneIds];
 }
 
+/** Revalidates the exact worker input authority before a trust/readiness key is sent. */
+function hasExactWorkerInputAuthority(params: {
+  sessionName: string;
+  workerIndex: number;
+  workerPaneId: string | undefined;
+  workerPanePid: string | number | undefined;
+  teamPaneOwnerId: string | null | undefined;
+  leaderPaneId: string | null | undefined;
+  hudPaneId: string | null | undefined;
+}): boolean {
+  const paneId = parseCanonicalTmuxPaneId(params.workerPaneId);
+  const expectedPid = String(params.workerPanePid ?? '');
+  const ownerId = typeof params.teamPaneOwnerId === 'string' ? params.teamPaneOwnerId.trim() : '';
+  const excludedPaneIds = new Set([params.leaderPaneId, params.hudPaneId].flatMap((candidate) => {
+    const canonical = parseCanonicalTmuxPaneId(candidate);
+    return canonical ? [canonical] : [];
+  }));
+  if (!paneId || !/^[1-9][0-9]*$/.test(expectedPid) || !ownerId || excludedPaneIds.has(paneId)) return false;
+  const owner = readPaneTeamOwnerTagResult(paneId);
+  return owner.status === 'value'
+    && owner.value === ownerId
+    && isTeamPaneIncarnationLive(paneId, expectedPid)
+    && listPaneIds(params.sessionName).includes(paneId)
+    && isWorkerPaneOpen(params.sessionName, params.workerIndex, paneId, expectedPid);
+}
+
 function shutdownAuthorityFingerprint(config: TeamConfig, leaderSessionId: string): string {
   return JSON.stringify({
     session: config.tmux_session,
@@ -3771,12 +3797,29 @@ export async function assignTask(
       });
       if (outcome.ok) break;
       if (attempt < maxAssignRetries && config.worker_launch_mode === 'interactive' && config.tmux_session) {
-        if (dismissTrustPromptIfPresent(config.tmux_session, workerInfo.index, workerInfo.pane_id)) {
+        const workerInputAuthority = (): boolean => hasExactWorkerInputAuthority({
+          sessionName: config.tmux_session!,
+          workerIndex: workerInfo.index,
+          workerPaneId: workerInfo.pane_id,
+          workerPanePid: workerInfo.pid,
+          teamPaneOwnerId: config.tmux_pane_owner_id,
+          leaderPaneId: config.leader_pane_id,
+          hudPaneId: config.hud_pane_id,
+        });
+        if (dismissTrustPromptIfPresent(
+          config.tmux_session,
+          workerInfo.index,
+          workerInfo.pane_id,
+          workerInfo.pid,
+          workerInputAuthority,
+        )) {
           waitForWorkerReady(
             config.tmux_session,
             workerInfo.index,
             resolveWorkerReadyTimeoutMs(process.env),
             workerInfo.pane_id,
+            workerInfo.pid,
+            workerInputAuthority,
           );
         } else {
           await new Promise<void>(r => setTimeout(r, assignRetryDelayS * 1000));

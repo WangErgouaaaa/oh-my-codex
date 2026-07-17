@@ -174,7 +174,6 @@ import {
   parseCanonicalTmuxPaneId,
   rollbackHudWatchPaneAuthority,
   verifyHudWatchPaneAuthority,
-  mutateHudWatchPaneIfCurrent,
 
   type RegisterHudResizeHookOptions,
   type TmuxPaneSnapshot,
@@ -5753,7 +5752,7 @@ function runCodex(
         if (!expectedPane || !globalPaneIdsBefore.has(paneId)) return false;
         if (!hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) || !hasFreshDeadHudPaneAuthority(paneId, expectedPane, currentPaneId, deadHudPanePidsById.get(paneId))) return false;
         try {
-          return mutateHudWatchPaneIfCurrent(paneId, deadHudPanePidsById.get(paneId) ?? '', `kill-pane -t ${paneId}`);
+          return mutateInsideTmuxHudPane(paneId, deadHudPanePidsById.get(paneId), currentPaneId, { kind: "kill" });
 
         } catch (err) {
           logCliOperationFailure(err);
@@ -5766,7 +5765,7 @@ function runCodex(
     let hudPanePid: string | undefined;
     const [keeperHudPaneId, ...duplicateHudPaneIds] = staleHudPaneIds;
     for (const paneId of duplicateHudPaneIds) {
-      if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, globalPanePidsBefore.get(paneId))) mutateHudWatchPaneIfCurrent(paneId, globalPanePidsBefore.get(paneId) ?? '', `kill-pane -t ${paneId}`);
+      if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, globalPanePidsBefore.get(paneId))) mutateInsideTmuxHudPane(paneId, globalPanePidsBefore.get(paneId), currentPaneId, { kind: "kill" });
 
     }
 
@@ -5775,7 +5774,7 @@ function runCodex(
       hudPanePid = globalPanePidsBefore.get(hudPaneId);
       try {
         if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
-          mutateHudWatchPaneIfCurrent(hudPaneId, hudPanePid ?? '', `resize-pane -t ${hudPaneId} -y ${HUD_TMUX_HEIGHT_LINES}`);
+          mutateInsideTmuxHudPane(hudPaneId, hudPanePid, currentPaneId, { kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES });
 
         }
         if (hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(hudPaneId, currentPaneId, sessionId, hudPanePid)) {
@@ -5876,7 +5875,7 @@ function runCodex(
         ? [hudPaneId]
         : [];
       for (const paneId of cleanupPaneIds) {
-        if (hudPanePid && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, hudPanePid)) mutateHudWatchPaneIfCurrent(paneId, hudPanePid, `kill-pane -t ${paneId}`);
+        if (hudPanePid && hasFreshTmuxPaneIncarnation(currentPaneId, globalPanePidsBefore.get(currentPaneId)) && hasFreshInsideTmuxHudPaneAuthority(paneId, currentPaneId, sessionId, hudPanePid)) mutateInsideTmuxHudPane(paneId, hudPanePid, currentPaneId, { kind: "kill" });
       }
     }
     return { postLaunchHandledExternally: false };

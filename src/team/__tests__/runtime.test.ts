@@ -3126,6 +3126,14 @@ esac
     assert.equal(saveIndex < readyIndex, true);
   });
 
+  it('binds assignment retry trust and readiness input to the exact worker authority', async () => {
+    const source = await readFile(join(process.cwd(), 'src', 'team', 'runtime.ts'), 'utf-8');
+    assert.match(source, /dismissTrustPromptIfPresent\(\s*config\.tmux_session,\s*workerInfo\.index,\s*workerInfo\.pane_id,\s*workerInfo\.pid,\s*workerInputAuthority,/m);
+    assert.match(source, /waitForWorkerReady\(\s*config\.tmux_session,\s*workerInfo\.index,\s*resolveWorkerReadyTimeoutMs\(process\.env\),\s*workerInfo\.pane_id,\s*workerInfo\.pid,\s*workerInputAuthority,/m);
+    assert.match(source, /owner\.value === ownerId\s*&& isTeamPaneIncarnationLive\(paneId, expectedPid\)\s*&& listPaneIds\(params\.sessionName\)\.includes\(paneId\)/m);
+    assert.match(source, /excludedPaneIds\.has\(paneId\)/);
+  });
+
 
   it('startTeam rejects startup direct trigger success when Codex startup evidence is missing', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-startup-direct-fast-'));

@@ -4117,9 +4117,9 @@ exit 0
     );
     assert.match(source, /const globalPaneIdsBefore = readGlobalTmuxPaneIdSnapshot\(\);/);
     assert.match(source, /const \[keeperHudPaneId, \.\.\.duplicateHudPaneIds\] = staleHudPaneIds;/);
-    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateHudWatchPaneIfCurrent\(paneId, globalPanePidsBefore\.get\(paneId\) \?\? '', `kill-pane -t \$\{paneId\}`\);\s*\}/);
+    assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateInsideTmuxHudPane\(paneId, globalPanePidsBefore\.get\(paneId\), currentPaneId, \{ kind: "kill" \}\);\s*\}/);
     assert.match(source, /if \(keeperHudPaneId\) \{\s*hudPaneId = keeperHudPaneId;/);
-    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateHudWatchPaneIfCurrent\(hudPaneId, hudPanePid \?\? '', `resize-pane -t \$\{hudPaneId\} -y \$\{HUD_TMUX_HEIGHT_LINES\}`\);\s*\}/);
+    assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateInsideTmuxHudPane\(hudPaneId, hudPanePid, currentPaneId, \{ kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES \}\);\s*\}/);
     assert.match(source, /if \(hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*registerInsideTmuxHudResizeHook/);
     assert.match(source, /return matchesOwner\(\) && matchesLiveIncarnation\(\) && matchesOwner\(\) && matchesLiveIncarnation\(\);/);
     assert.doesNotMatch(
@@ -4474,7 +4474,7 @@ exit 0
     assert.match(leaderCmd!, /tmux if-shell -F -t "\$TMUX_PANE"/);
     assert.match(leaderCmd!, /@omx_detached_launch_proof/);
     assert.match(leaderCmd!, /"kill-session -t omx-demo"/);
-    assert.match(leaderCmd!, /"omx-demo"/);
+    assert.match(leaderCmd!, /#\{session_name\},omx-demo/);
     assert.match(leaderCmd!, /codex exited immediately with code 0/);
     assert.match(leaderCmd!, /codex exited with code/);
     assert.match(leaderCmd!, /detached tmux session is being kept open/);
@@ -4658,7 +4658,7 @@ exit 0
       assert.match(log, /tmux:show-options -sv extended-keys/);
       assert.match(log, /tmux:set-option -sq extended-keys always/);
       assert.match(log, /tmux:set-option -sq extended-keys off/);
-      assert.match(log, /tmux:kill-session -t omx-demo/);
+      assert.match(log, /tmux:if-shell .*@omx_detached_launch_proof.*kill-session -t omx-demo/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4873,7 +4873,7 @@ exit 0
       assert.match(result.stderr, /codex exited immediately with code 0 during startup/);
       assert.match(result.stderr, /detached tmux session is being kept open/);
       const log = await readFile(logPath, "utf-8");
-      assert.match(log, /tmux:kill-session -t omx-demo/);
+      assert.match(log, /tmux:if-shell .*@omx_detached_launch_proof.*kill-session -t omx-demo/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

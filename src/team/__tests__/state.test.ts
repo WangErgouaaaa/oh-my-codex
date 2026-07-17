@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
+import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, rename, utimes } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
@@ -46,9 +46,11 @@ import {
   resolveDispatchLockTimeoutMs,
   writeTeamManifestV2,
   readTeamStateOutcome,
+  saveTeamConfig,
 } from '../state.js';
 
 import { normalizeDispatchRequest } from '../state/dispatch.js';
+import { withScalingLock as withScalingLeaseLock, withTeamLock } from '../state/locks.js';
 import { buildResizeHookName, buildUnregisterResizeHookArgs } from '../tmux-session.js';
 
 
@@ -2710,6 +2712,87 @@ exit 1
       assert.equal(snapshot?.integrationByWorker?.['worker-2']?.status, undefined);
       assert.equal(snapshot?.integrationByWorker?.['worker-2']?.last_integrated_head, 'def456');
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it('keeps live lease holders beyond the stale threshold and recovers dead leases', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lease-'));
+    const teamName = 'lease-test';
+    const staleMs = 60;
+    const deps = {
+      teamDir: (name: string, root: string) => join(root, '.omx', 'state', 'team', name),
+      taskClaimLockDir: (name: string, taskId: string, root: string) => join(root, '.omx', 'state', 'team', name, 'claims', `task-${taskId}.lock`),
+      mailboxLockDir: (name: string, worker: string, root: string) => join(root, '.omx', 'state', 'team', name, 'mailbox', `.lock-${worker}`),
+    };
+    const locks = [
+      { dir: join(cwd, '.omx', 'state', '.team-locks', `${teamName}.scaling`), acquire: (fn: () => Promise<void>) => withScalingLeaseLock(teamName, cwd, staleMs, deps, fn) },
+      { dir: join(cwd, '.omx', 'state', '.team-locks', `${teamName}.membership`), acquire: (fn: () => Promise<void>) => withTeamLock(teamName, cwd, staleMs, deps, fn) },
+    ];
+    try {
+      for (const lock of locks) {
+        let release!: () => void;
+        const heldUntilReleased = new Promise<void>((resolve) => { release = resolve; });
+        let entered!: () => void;
+        const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+        const holder = lock.acquire(async () => { entered(); await heldUntilReleased; });
+        await enteredPromise;
+        let contenderEntered = false;
+        const contender = lock.acquire(async () => { contenderEntered = true; });
+        await new Promise((resolve) => setTimeout(resolve, staleMs * 3));
+        assert.equal(contenderEntered, false, 'a live lease must prevent stale-mtime reclamation');
+        release();
+        await Promise.all([holder, contender]);
+
+        await mkdir(lock.dir, { recursive: true });
+        await writeFile(join(lock.dir, 'owner'), 'dead-holder');
+        await writeFile(join(lock.dir, 'lease'), 'dead-holder');
+        const staleAt = new Date(Date.now() - staleMs * 2);
+        await utimes(lock.dir, staleAt, staleAt);
+        await utimes(join(lock.dir, 'lease'), staleAt, staleAt);
+        let recovered = false;
+        await lock.acquire(async () => { recovered = true; });
+        assert.equal(recovered, true, 'an expired dead lease must be recovered');
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a failed canonical pair publish without exposing divergence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-pair-'));
+    const teamName = 'pair-test';
+    try {
+      await initTeamState(teamName, 'old task', 'executor', 1, cwd);
+      const root = join(cwd, '.omx', 'state', 'team', teamName);
+      const manifestPath = join(root, 'manifest.v2.json');
+      const config = await readTeamConfig(teamName, cwd);
+      assert.ok(config);
+      if (!config) throw new Error('missing config');
+      config.task = 'new task';
+      setWriteAtomicRenameForTests(async (from, to) => {
+        if (to === manifestPath) throw new Error('injected_manifest_publish_failure');
+        await rename(from, to);
+      });
+      await assert.rejects(() => saveTeamConfig(config, cwd), /injected_manifest_publish_failure/);
+      resetWriteAtomicRenameForTests();
+      const [recoveredConfig, recoveredManifest] = await Promise.all([
+        readTeamConfig(teamName, cwd),
+        readTeamManifestV2(teamName, cwd),
+      ]);
+      assert.equal(recoveredConfig?.task, 'old task');
+      assert.equal(recoveredManifest?.task, 'old task');
+      assert.equal(existsSync(join(root, '.canonical-state-transaction.json')), false);
+
+      config.task = 'successful task';
+      await saveTeamConfig(config, cwd);
+      const [savedConfig, savedManifest] = await Promise.all([
+        readTeamConfig(teamName, cwd),
+        readTeamManifestV2(teamName, cwd),
+      ]);
+      assert.equal(savedConfig?.task, 'successful task');
+      assert.equal(savedManifest?.task, 'successful task');
+    } finally {
+      resetWriteAtomicRenameForTests();
       await rm(cwd, { recursive: true, force: true });
     }
   });

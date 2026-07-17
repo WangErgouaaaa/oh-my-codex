@@ -1024,6 +1024,76 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
   }
 }
 
+type CanonicalStateTransaction = {
+  phase: 'prepared' | 'committed';
+  config: { oldBytes: string; newBytes: string };
+  manifest: { oldBytes: string; newBytes: string };
+};
+
+function canonicalStateTransactionPath(teamName: string, cwd: string): string {
+  return join(teamDir(teamName, cwd), '.canonical-state-transaction.json');
+}
+
+async function recoverCanonicalStateTransaction(teamName: string, cwd: string): Promise<void> {
+  const journalPath = canonicalStateTransactionPath(teamName, cwd);
+  let transaction: CanonicalStateTransaction;
+  try {
+    transaction = JSON.parse(await readFile(journalPath, 'utf8')) as CanonicalStateTransaction;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (
+    !transaction
+    || (transaction.phase !== 'prepared' && transaction.phase !== 'committed')
+    || typeof transaction.config?.oldBytes !== 'string'
+    || typeof transaction.config?.newBytes !== 'string'
+    || typeof transaction.manifest?.oldBytes !== 'string'
+    || typeof transaction.manifest?.newBytes !== 'string'
+  ) {
+    throw new Error(`invalid_canonical_state_transaction:${teamName}`);
+  }
+  const bytes = transaction.phase === 'committed'
+    ? { config: transaction.config.newBytes, manifest: transaction.manifest.newBytes }
+    : { config: transaction.config.oldBytes, manifest: transaction.manifest.oldBytes };
+  await writeAtomic(teamConfigPath(teamName, cwd), bytes.config);
+  await writeAtomic(teamManifestV2Path(teamName, cwd), bytes.manifest);
+  await rm(journalPath, { force: true });
+}
+
+async function writeCanonicalStatePair(
+  teamName: string,
+  cwd: string,
+  configBytes: string,
+  manifestBytes: string,
+): Promise<void> {
+  const [oldConfigBytes, oldManifestBytes] = await Promise.all([
+    readFile(teamConfigPath(teamName, cwd), 'utf8'),
+    readFile(teamManifestV2Path(teamName, cwd), 'utf8'),
+  ]);
+  const journalPath = canonicalStateTransactionPath(teamName, cwd);
+  const transaction: CanonicalStateTransaction = {
+    phase: 'prepared',
+    config: { oldBytes: oldConfigBytes, newBytes: configBytes },
+    manifest: { oldBytes: oldManifestBytes, newBytes: manifestBytes },
+  };
+  await writeAtomic(journalPath, JSON.stringify(transaction, null, 2));
+  try {
+    await writeAtomic(teamConfigPath(teamName, cwd), configBytes);
+    await writeAtomic(teamManifestV2Path(teamName, cwd), manifestBytes);
+    transaction.phase = 'committed';
+    await writeAtomic(journalPath, JSON.stringify(transaction, null, 2));
+    await rm(journalPath, { force: true });
+  } catch (error) {
+    try {
+      await recoverCanonicalStateTransaction(teamName, cwd);
+    } catch {
+      // The prepared journal remains recovery authority when restoration fails.
+    }
+    throw error;
+  }
+}
+
 // Initialize team state directory + config.json
 // Creates: .omx/state/team/{name}/, workers/{worker-1}..{worker-N}/, tasks/
 // Throws if workerCount > maxWorkers (default 20)
@@ -1163,9 +1233,8 @@ export async function initTeamState(
 async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
   const normalized = normalizeTeamConfig(cfg);
   const p = teamConfigPath(normalized.name, cwd);
-  await writeAtomic(p, JSON.stringify(normalized, null, 2));
 
-  // Keep v2 manifest in sync when present. Don't create it implicitly here to preserve migration behavior.
+  // Read the current companion before publishing either canonical file.
   const existing = await readTeamManifestV2(normalized.name, cwd);
   if (existing) {
     const merged: TeamManifestV2 = {
@@ -1199,7 +1268,14 @@ async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
       requested_name: normalized.requested_name ?? existing.requested_name,
       identity_source: normalized.identity_source ?? existing.identity_source,
     };
-    await writeTeamManifestV2(merged, cwd);
+    await writeCanonicalStatePair(
+      normalized.name,
+      cwd,
+      JSON.stringify(normalized, null, 2),
+      JSON.stringify(merged, null, 2),
+    );
+  } else {
+    await writeAtomic(p, JSON.stringify(normalized, null, 2));
   }
 }
 
@@ -1558,6 +1634,7 @@ async function readTeamConfigFileOutcome(
  * outcome rather than nullable compatibility readers.
  */
 export async function readTeamStateOutcome(teamName: string, cwd: string): Promise<TeamStateReadOutcome> {
+  await recoverCanonicalStateTransaction(teamName, cwd);
   const configOutcome = await readTeamConfigFileOutcome(teamName, cwd);
   const manifestOutcome = await readTeamManifestV2Outcome(
     teamName,
@@ -2647,6 +2724,7 @@ export async function markOwnedTeamsLeaderStopObserved(
 // === Config persistence (public wrapper) ===
 
 export async function saveTeamConfig(config: TeamConfig, cwd: string): Promise<void> {
+  await recoverCanonicalStateTransaction(config.name, cwd);
   await writeConfig(config, cwd);
 }
 
