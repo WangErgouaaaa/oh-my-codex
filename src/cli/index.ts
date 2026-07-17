@@ -1661,10 +1661,16 @@ function buildTmuxPaneIncarnationCondition(paneId: string, panePid: string, sess
 function buildTmuxHudOwnerCondition(expectedOwner: InsideTmuxHudOwner): string | null {
   const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(expectedOwner.leaderPaneId);
   if (typeof expectedOwner.sessionId !== "string" || !canonicalLeaderPaneId || !/^[A-Za-z0-9._-]+$/.test(expectedOwner.sessionId)) return null;
-  const posixPrefix = `exec[[:space:]]+env[[:space:]]+OMX_SESSION_ID='${expectedOwner.sessionId}'[[:space:]]+${OMX_TMUX_HUD_OWNER_ENV}=1[[:space:]]+${OMX_TMUX_HUD_LEADER_PANE_ENV}='${canonicalLeaderPaneId}'([[:space:]]|$)`;
-  const powerShellPrefix = `powershell\\.exe[[:space:]]+-NoLogo[[:space:]]+-NoExit[[:space:]]+-Command[[:space:]]+'\\$env:OMX_SESSION_ID[[:space:]]*=[[:space:]]*'${expectedOwner.sessionId}';[[:space:]]+\\$env:${OMX_TMUX_HUD_OWNER_ENV}[[:space:]]*=[[:space:]]*'1';[[:space:]]+\\$env:${OMX_TMUX_HUD_LEADER_PANE_ENV}[[:space:]]*=[[:space:]]*'${canonicalLeaderPaneId}';[[:space:]]+&([[:space:]]|$)`;
-  return `#{||:#{m/r:^${posixPrefix},#{pane_start_command}},#{m/r:^${powerShellPrefix},#{pane_start_command}}}`;
+  const splitMarker = "(OMX_TMUX_SPLIT_OPERATION_MARKER='[a-f0-9-]+';[[:space:]]+export[[:space:]]+OMX_TMUX_SPLIT_OPERATION_MARKER;[[:space:]]+)?";
+  const posixQuoted = "'([^']|'\"'\"')*'";
+  const posixCommand = `exec[[:space:]]+env[[:space:]]+OMX_SESSION_ID='${expectedOwner.sessionId}'[[:space:]]+${OMX_TMUX_HUD_OWNER_ENV}=1[[:space:]]+${OMX_TMUX_HUD_LEADER_PANE_ENV}='${canonicalLeaderPaneId}'[[:space:]]+(node|${posixQuoted})[[:space:]]+${posixQuoted}[[:space:]]+hud[[:space:]]+--watch([[:space:]]+'--preset=(minimal|focused|full)')?$`;
+  const powerShellQuoted = "'([^']|'')*'";
+  const powerShellAssignments = `\\$env:OMX_SESSION_ID[[:space:]]*=[[:space:]]*'${expectedOwner.sessionId}';[[:space:]]+\\$env:${OMX_TMUX_HUD_OWNER_ENV}[[:space:]]*=[[:space:]]*'1';[[:space:]]+\\$env:${OMX_TMUX_HUD_LEADER_PANE_ENV}[[:space:]]*=[[:space:]]*'${canonicalLeaderPaneId}';[[:space:]]+&[[:space:]]+${powerShellQuoted}[[:space:]]+${powerShellQuoted}[[:space:]]+hud[[:space:]]+--watch([[:space:]]+(minimal|focused|full))?`;
+  const barePowerShellCommand = `${powerShellAssignments}$`;
+  const envelopedPowerShellCommand = `powershell\\.exe[[:space:]]+-NoLogo[[:space:]]+-NoExit[[:space:]]+-Command[[:space:]]+'${powerShellAssignments}'$`;
+  return `#{||:#{m/r:^${splitMarker}${posixCommand},#{pane_start_command}},#{||:#{m/r:^${barePowerShellCommand},#{pane_start_command}},#{m/r:^${envelopedPowerShellCommand},#{pane_start_command}}}}`;
 }
+
 
 export type InsideTmuxHudMutation =
   | { kind: "kill" }
@@ -1704,17 +1710,18 @@ export function mutateInsideTmuxHudPane(
   const mutationCommand = buildInsideTmuxHudMutationCommand(canonicalPaneId, mutation);
   const receipt = randomUUID().replace(/-/g, "");
   if (!sessionIncarnation || !receiptSessionIncarnation || !mutationCommand || !/^[a-f0-9]{32}$/.test(receipt)) return false;
-  const incarnationCondition = buildTmuxPaneIncarnationCondition(canonicalPaneId, panePid!, sessionIncarnation);
+  const hudIncarnationCondition = buildTmuxPaneIncarnationCondition(canonicalPaneId, panePid!, sessionIncarnation);
   const leaderIncarnationCondition = buildTmuxPaneIncarnationCondition(canonicalReceiptPaneId, receiptPanePid!, receiptSessionIncarnation);
   const ownerCondition = buildTmuxHudOwnerCondition(expectedOwner);
   if (!ownerCondition) return false;
-  const authorityCondition = `#{&&:${incarnationCondition},#{&&:${leaderIncarnationCondition},${ownerCondition}}}`;
-  const receiptCondition = `#{&&:${authorityCondition},#{==:#{@omx_hud_mutation_receipt},${receipt}}}`;
+  const hudAuthorityCondition = `#{&&:${hudIncarnationCondition},${ownerCondition}}`;
+  const receiptCondition = `#{&&:${hudAuthorityCondition},#{==:#{@omx_hud_mutation_receipt},${receipt}}}`;
+  const hudMutationTransaction = `if-shell -F -t ${canonicalPaneId} ${hudAuthorityCondition} 'set-option -p -t ${canonicalPaneId} @omx_hud_mutation_receipt ${receipt} ; if-shell -F -t ${canonicalPaneId} ${receiptCondition} '${mutationCommand} ; display-message -p -t ${canonicalPaneId} ${receipt}' ''`;
   try {
     const stdout = execTmuxFileSync([
-      "if-shell", "-F", "-t", canonicalPaneId,
-      authorityCondition,
-      `set-option -p -t ${canonicalPaneId} @omx_hud_mutation_receipt ${receipt} ; if-shell -F ${receiptCondition} '${mutationCommand} ; display-message -p -t ${canonicalReceiptPaneId} ${receipt}' ''`,
+      "if-shell", "-F", "-t", canonicalReceiptPaneId,
+      leaderIncarnationCondition,
+      hudMutationTransaction,
       "",
     ], { encoding: "utf-8" });
     return parseExactTmuxScalar(stdout) === receipt;

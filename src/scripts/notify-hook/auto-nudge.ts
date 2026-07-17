@@ -714,6 +714,23 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
     const signature = await resolveAutoNudgeSignature(stateDir, payload, signatureSourceText);
     const semanticSignature = normalizeAutoNudgeSignatureText(signatureSourceText);
 
+    if (
+      (signature && safeString(nudgeState.ambiguousSignature) === signature)
+      || (semanticSignature && safeString(nudgeState.ambiguousSemanticSignature) === semanticSignature)
+    ) {
+      await logTmuxHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        type: 'auto_nudge_skipped',
+        reason: 'delivery_ambiguous_pending_reconciliation',
+        source,
+        signature,
+        semantic_signature: semanticSignature,
+        delivery_state: 'ambiguous',
+        retryable: false,
+      }).catch(() => {});
+      return;
+    }
+
     if (signature && safeString(nudgeState.lastSignature) === signature) {
       await logTmuxHookEvent(logsDir, {
         timestamp: new Date().toISOString(),
@@ -829,6 +846,28 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
         submitDelayMs: 100,
       });
       if (!sendResult.ok) {
+        if (sendResult.deliveryState === 'ambiguous' && sendResult.retryable === false) {
+          nudgeState.ambiguousAt = nowIso;
+          nudgeState.ambiguousSignature = signature;
+          nudgeState.ambiguousSemanticSignature = semanticSignature;
+          nudgeState.deliveryState = 'ambiguous';
+          nudgeState.retryable = false;
+          nudgeState.ambiguousEffectStage = safeString(sendResult.effectStage);
+          await mkdir(dirname(nudgeStatePath), { recursive: true }).catch(() => {});
+          await writeFile(nudgeStatePath, JSON.stringify(nudgeState, null, 2)).catch(() => {});
+          await logTmuxHookEvent(logsDir, {
+            timestamp: nowIso,
+            type: 'auto_nudge_ambiguous',
+            pane_id: paneId,
+            source,
+            signature,
+            semantic_signature: semanticSignature,
+            delivery_state: 'ambiguous',
+            retryable: false,
+            effect_stage: safeString(sendResult.effectStage) || undefined,
+          }).catch(() => {});
+          return;
+        }
         throw new Error(sendResult.error || sendResult.reason);
       }
 

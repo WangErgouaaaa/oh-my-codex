@@ -496,6 +496,44 @@ function resizeTeamPaneIncarnation(
   return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
 
+/**
+ * Tags a newly created standalone HUD only while both the leader and HUD still
+ * have the exact pane incarnations adopted by this invocation. The nested tmux
+ * transaction closes the gap between the local liveness probes and the option
+ * mutation: neither a recycled leader nor a recycled HUD can receive the tag.
+ */
+function tagStandaloneHudPaneInstance(
+  hudPane: TeamPaneIncarnation,
+  leaderPane: TeamPaneIncarnation,
+  ownerSessionId: string,
+): boolean {
+  const hudPaneId = parseCanonicalTmuxPaneId(hudPane.paneId);
+  const leaderPaneId = parseCanonicalTmuxPaneId(leaderPane.paneId);
+  if (
+    !hudPaneId
+    || hudPaneId !== hudPane.paneId
+    || !leaderPaneId
+    || leaderPaneId !== leaderPane.paneId
+    || !/^[1-9][0-9]*$/.test(hudPane.panePid)
+    || !/^[1-9][0-9]*$/.test(leaderPane.panePid)
+    || !isSafeTmuxFormatOperand(ownerSessionId)
+  ) return false;
+
+  const receipt = createMutationReceipt();
+  const tag = `set-option -p -t ${hudPaneId} ${OMX_PANE_INSTANCE_OPTION} ${ownerSessionId} \\; display-message -p ${receipt}`;
+  const hudTransaction = `if-shell -t ${hudPaneId} -F ${buildTeamPaneIncarnationCondition(hudPaneId, hudPane.panePid)} ${tag} ''`;
+  const result = runTmux([
+    'if-shell',
+    '-t',
+    leaderPaneId,
+    '-F',
+    buildTeamPaneIncarnationCondition(leaderPaneId, leaderPane.panePid),
+    hudTransaction,
+    '',
+  ]);
+  return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;
+}
+
 
 function isPaneStablyLiveInStrictGlobalProbe(
   paneId: string,
@@ -2782,7 +2820,9 @@ export function restoreStandaloneHudPane(
   if (!hasFreshNewHudAuthority() || !isPaneStablyLiveInStrictGlobalProbe(paneId, paneAuthority.panePid) || !isPaneStablyLiveInStrictGlobalProbe(leaderPaneIncarnation.paneId, leaderPaneIncarnation.panePid)) {
     return rollbackAndFail();
   }
-  if (ownerSessionId !== '') tagPaneInstance(paneId, ownerSessionId);
+  if (ownerSessionId !== '' && !tagStandaloneHudPaneInstance(paneAuthority, leaderPaneIncarnation, ownerSessionId)) {
+    return rollbackAndFail();
+  }
   if (!hasFreshNewHudAuthority()) return rollbackAndFail();
   runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
   return paneId;

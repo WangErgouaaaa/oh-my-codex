@@ -226,9 +226,14 @@ if [ "$command" = "if-shell" ]; then
   esac
   log_size=$(wc -c < "$(dirname "$0")/tmux.log")
   set +e
-  mutation_command="\${inner_command%% ; display-message -p *}"
-  eval "set -- $mutation_command"
-  "$fixture" "$@"
+  case "$inner_command" in
+    "if-shell "*) "$fixture" __omx_nested_if_shell__ "$inner_command" "\${5:-}" ;;
+    *)
+      mutation_command="\${inner_command%% ; display-message -p *}"
+      eval "set -- $mutation_command"
+      "$fixture" "$@"
+      ;;
+  esac
   status=$?
   if [ "$status" -eq 0 ]; then
     case "$inner_command" in
@@ -6676,6 +6681,14 @@ case "\${1:-}" in
     echo "%44"
     exit 0
     ;;
+  if-shell|__omx_nested_if_shell__)
+    case "$*" in
+      *"set-option -p -t %44 @omx_pane_instance_id current-session-for-hud"*)
+        printf 'current-session-for-hud\n' > "${ownerProofPath}"
+        ;;
+    esac
+    exit 0
+    ;;
   set-option)
     owner_value=''
     for arg do owner_value="$arg"; done
@@ -7248,6 +7261,99 @@ esac
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
       else delete process.env.OMX_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('tags a new standalone HUD through an exact coupled leader/HUD transaction', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-hud-coupled-tag-'));
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      for (const scenario of [
+        { name: 'accepted', expectedPaneId: '%44', receipt: 'exact' },
+        { name: 'hud-recycled', expectedPaneId: null, receipt: 'none' },
+        { name: 'leader-recycled', expectedPaneId: null, receipt: 'none' },
+        { name: 'malformed-receipt', expectedPaneId: null, receipt: 'malformed' },
+      ] as const) {
+        await withMockTmuxFixture(
+          `omx-standalone-hud-coupled-tag-${scenario.name}-`,
+          (logPath) => `#!/bin/sh
+set -eu
+hud_state="$(dirname "${logPath}")/hud"
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*)
+        printf '%%11 0 1000000011\\n'
+        if [ -f "$hud_state" ]; then printf '%%44 0 1000000044\\n'; fi
+        ;;
+      *"#{pane_dead} #{pane_pid}"*)
+        case "$*" in
+          *"-t %11"*) printf '0 1000000011\\n' ;;
+          *"-t %44"*) printf '0 1000000044\\n' ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      *"pane_current_command"*) printf '%%11\\tzsh\\tzsh\\n' ;;
+      *)
+        printf '%%11\\n'
+        if [ -f "$hud_state" ]; then printf '%%44\\n'; fi
+        ;;
+    esac
+    ;;
+  split-window)
+    : > "$hud_state"
+    printf '%%44\\n'
+    ;;
+  if-shell|__omx_nested_if_shell__)
+    leader_pid=1000000011
+    hud_pid=1000000044
+    case "${scenario.name}" in
+      hud-recycled) hud_pid=1000000999 ;;
+      leader-recycled) leader_pid=1000000999 ;;
+    esac
+    case "$*" in
+      *"set-option -p -t %44 @omx_pane_instance_id current-session"*)
+        case "$*" in
+          *"#{==:#{pane_pid},$leader_pid}"*)
+            case "$*" in
+              *"#{==:#{pane_pid},$hud_pid}"*)
+                case "${scenario.receipt}" in
+                  exact) : ;;
+                  malformed) printf 'unexpected\\n' ;;
+                  none) exit 1 ;;
+                esac
+                ;;
+              *) exit 1 ;;
+            esac
+            ;;
+          *) exit 1 ;;
+        esac
+        ;;
+    esac
+    ;;
+  resize-pane|select-pane|kill-pane) : ;;
+  *) : ;;
+esac
+`,
+          async ({ logPath }) => {
+            Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+            const paneId = restoreStandaloneHudPane('%11', cwd, { sessionId: 'current-session' });
+            assert.equal(paneId, scenario.expectedPaneId, scenario.name);
+
+            const tmuxLog = await readFile(logPath, 'utf-8');
+            const tagTransactions = tmuxLog.match(/if-shell -t %11 -F .*if-shell -t %44 -F .*set-option -p -t %44 @omx_pane_instance_id current-session/g) ?? [];
+            assert.equal(tagTransactions.length, 1, `${scenario.name}: tags only through the coupled transaction`);
+            assert.match(tmuxLog, /#{==:#\{pane_id\},%11}.*#{==:#\{pane_pid\},1000000011}/, `${scenario.name}: leader incarnation is guarded at the write boundary`);
+            assert.match(tmuxLog, /#{==:#\{pane_id\},%44}.*#{==:#\{pane_pid\},1000000044}/, `${scenario.name}: HUD incarnation is guarded at the write boundary`);
+            assert.doesNotMatch(tmuxLog, /^set-option -p -t %44 @omx_pane_instance_id current-session$/m, `${scenario.name}: no probe-then-write tag`);
+          },
+        );
+      }
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
       await rm(cwd, { recursive: true, force: true });
     }
   });

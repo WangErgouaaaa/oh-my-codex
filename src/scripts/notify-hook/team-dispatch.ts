@@ -165,6 +165,10 @@ async function readBridgeDispatchRequests(stateDir, teamName) {
         message_id: safeString(metadata.message_id).trim() || undefined,
         inbox_correlation_key: safeString(metadata.inbox_correlation_key).trim() || undefined,
         transport_preference: safeString(metadata.transport_preference).trim() || 'hook_preferred_with_fallback',
+        delivery_state: safeString(metadata.delivery_state).trim() || undefined,
+        retryable: typeof metadata.retryable === 'boolean' ? metadata.retryable : undefined,
+        effect_stage: safeString(metadata.effect_stage).trim() || undefined,
+        ambiguous_at: safeString(metadata.ambiguous_at).trim() || undefined,
         fallback_allowed: typeof metadata.fallback_allowed === 'boolean' ? metadata.fallback_allowed : true,
         status: safeString(record.status).trim() || 'pending',
         attempt_count: Number.isFinite(metadata.attempt_count) ? Number(metadata.attempt_count) : 0,
@@ -444,6 +448,10 @@ function serializeDispatchRequestRecord(request) {
       transport_preference: safeString(request.transport_preference).trim() || 'hook_preferred_with_fallback',
       fallback_allowed: typeof request.fallback_allowed === 'boolean' ? request.fallback_allowed : true,
       attempt_count: Number.isFinite(request.attempt_count) ? Number(request.attempt_count) : 0,
+      delivery_state: safeString(request.delivery_state).trim() || undefined,
+      retryable: typeof request.retryable === 'boolean' ? request.retryable : undefined,
+      effect_stage: safeString(request.effect_stage).trim() || undefined,
+      ambiguous_at: safeString(request.ambiguous_at).trim() || undefined,
     },
   };
 }
@@ -554,6 +562,10 @@ async function appendLeaderNotificationDeferredEvent({
   };
   await mkdir(eventsDir, { recursive: true }).catch(() => {});
   await appendFile(eventsPath, JSON.stringify(event) + '\n').catch(() => {});
+}
+
+function isAmbiguousDeliveryResult(result) {
+  return result?.deliveryState === 'ambiguous' && result?.retryable === false;
 }
 
 async function finalizeClaimedDispatchRequest({
@@ -709,21 +721,24 @@ async function finalizeClaimedDispatchRequest({
           reason: result.reason,
         });
       }
-    } else {
-      request.status = 'failed';
-      request.failed_at = nowIso;
-      request.last_reason = result.reason;
-      runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir, teamName);
+    } else if (isAmbiguousDeliveryResult(result)) {
+      request.status = 'pending';
+      request.ambiguous_at = nowIso;
+      request.delivery_state = 'ambiguous';
+      request.retryable = false;
+      request.effect_stage = safeString(result.effectStage).trim() || undefined;
+      request.last_reason = safeString(result.reason).trim() || 'delivery_ambiguous';
       summary.processed += 1;
-      summary.failed += 1;
       mutated = true;
       await appendDispatchLog(logsDir, {
-        type: 'dispatch_failed',
+        type: 'dispatch_ambiguous',
         team: teamName,
         request_id: request.request_id,
         worker: request.to_worker,
         message_id: request.message_id || null,
-        reason: result.reason,
+        reason: request.last_reason,
+        delivery_state: request.delivery_state,
+        retryable: request.retryable,
         ...buildDispatchAttemptEvidence(result),
       });
       await appendDeliveryTelemetry(logsDir, {
@@ -733,19 +748,54 @@ async function finalizeClaimedDispatchRequest({
         message_id: request.message_id || null,
         to_worker: request.to_worker,
         transport: 'send-keys',
-        result: 'failed',
-        reason: result.reason,
+        result: 'ambiguous',
+        reason: request.last_reason,
       });
-      await emitOperationalHookEvent(cwd, result.reason === LEADER_PANE_MISSING_DEFERRED_REASON ? 'handoff-needed' : 'failed', {
+      await emitOperationalHookEvent(cwd, 'reconciliation-needed', {
         team: teamName,
         worker: request.to_worker,
         request_id: request.request_id,
         message_id: request.message_id || null,
         command: request.trigger_message,
-        reason: result.reason,
-        ...(result.reason === LEADER_PANE_MISSING_DEFERRED_REASON
-          ? { status: 'handoff-needed' }
-          : { status: 'failed', error_summary: result.reason }),
+        reason: request.last_reason,
+        status: 'reconciliation-needed',
+      });
+    } else {
+      // No pane mutation was confirmed ambiguous. Keep pre-effect failures pending
+      // so a later hook invocation can retry once the transient condition clears.
+      request.status = 'pending';
+      request.last_reason = safeString(result.reason).trim() || 'dispatch_pre_effect_failed';
+      request.retryable = true;
+      summary.skipped += 1;
+      mutated = true;
+      await appendDispatchLog(logsDir, {
+        type: 'dispatch_pre_effect_retry',
+        team: teamName,
+        request_id: request.request_id,
+        worker: request.to_worker,
+        message_id: request.message_id || null,
+        reason: request.last_reason,
+        retryable: true,
+        ...buildDispatchAttemptEvidence(result),
+      });
+      await appendDeliveryTelemetry(logsDir, {
+        event: 'dispatch_result',
+        team: teamName,
+        request_id: request.request_id,
+        message_id: request.message_id || null,
+        to_worker: request.to_worker,
+        transport: 'send-keys',
+        result: 'retry',
+        reason: request.last_reason,
+      });
+      await emitOperationalHookEvent(cwd, 'retry-needed', {
+        team: teamName,
+        worker: request.to_worker,
+        request_id: request.request_id,
+        message_id: request.message_id || null,
+        command: request.trigger_message,
+        reason: request.last_reason,
+        status: 'retry-needed',
       });
     }
 
@@ -935,6 +985,9 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     return {
       ok: false,
       reason: sendResult.error || sendResult.reason,
+      deliveryState: sendResult.deliveryState,
+      retryable: sendResult.retryable,
+      effectStage: sendResult.effectStage,
       pane: resolution.paneTarget,
       pane_source: resolution.source || null,
       readiness_evidence: paneGuard.readinessEvidence || null,
@@ -975,13 +1028,27 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
         if (!(await provePaneSendAuthority())) {
           return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: true };
         }
-        await sendPaneInput({
+        const retrySendResult = await sendPaneInput({
           paneTarget: resolution.paneTarget,
           prompt: request.trigger_message,
           submitKeyPresses,
           typePrompt: false,
           assertPaneAuthority: provePaneSendAuthority,
-        }).catch(() => {});
+        }).catch(() => null);
+        if (isAmbiguousDeliveryResult(retrySendResult)) {
+          return {
+            ok: false,
+            reason: retrySendResult.reason || 'delivery_ambiguous',
+            deliveryState: retrySendResult.deliveryState,
+            retryable: retrySendResult.retryable,
+            effectStage: retrySendResult.effectStage,
+            pane: resolution.paneTarget,
+            pane_source: resolution.source || null,
+            readiness_evidence: paneGuard.readinessEvidence || null,
+            pane_current_command: paneGuard.paneCurrentCommand || null,
+            tmux_injection_attempted: true,
+          };
+        }
         continue;
       }
       // Worker is actively processing (mirrors sync path tmux-session.ts:1292-1294)
@@ -1031,14 +1098,28 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     if (!(await provePaneSendAuthority())) {
       return { ok: false, reason: authorityInvalidReason, pane: resolution.paneTarget, tmux_injection_attempted: true };
     }
-    await sendPaneInput({
+    const retrySendResult = await sendPaneInput({
       paneTarget: resolution.paneTarget,
       prompt: request.trigger_message,
       submitKeyPresses,
       typePrompt: false,
       queueFirstSubmit: leaderTargeted,
       assertPaneAuthority: provePaneSendAuthority,
-    }).catch(() => {});
+    }).catch(() => null);
+    if (isAmbiguousDeliveryResult(retrySendResult)) {
+      return {
+        ok: false,
+        reason: retrySendResult.reason || 'delivery_ambiguous',
+        deliveryState: retrySendResult.deliveryState,
+        retryable: retrySendResult.retryable,
+        effectStage: retrySendResult.effectStage,
+        pane: resolution.paneTarget,
+        pane_source: resolution.source || null,
+        readiness_evidence: paneGuard.readinessEvidence || null,
+        pane_current_command: paneGuard.paneCurrentCommand || null,
+        tmux_injection_attempted: true,
+      };
+    }
   }
 
   // Trigger text is still visible after all retry rounds.
@@ -1054,6 +1135,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
 }
 
 function shouldSkipRequest(request) {
+  if (request.delivery_state === 'ambiguous' && request.retryable === false) return true;
   if (request.status !== 'pending') return true;
   const preference = safeString(request.transport_preference).trim();
   return preference !== '' && preference !== 'hook_preferred_with_fallback';

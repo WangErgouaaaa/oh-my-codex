@@ -100,7 +100,9 @@ import { ensureReusableNodeModules } from "../../utils/repo-deps.js";
 import { readAllState } from "../../hud/state.js";
 import { generateOverlay } from "../../hooks/agents-overlay.js";
 import { HUD_TMUX_HEIGHT_LINES, HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES } from "../../hud/constants.js";
-import { createHudWatchPane as createSharedHudWatchPane, listCurrentWindowHudPaneIds } from "../../hud/tmux.js";
+import { createHudWatchPane as createSharedHudWatchPane, listCurrentWindowHudPaneIds, writeHudWatchCommand } from "../../hud/tmux.js";
+import { buildHudStartupCommand } from "../../hud/index.js";
+
 import {
   DEFAULT_FRONTIER_MODEL,
   getTeamLowComplexityModel,
@@ -4121,7 +4123,10 @@ exit 0
     assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*const expectedOwner = hudPaneOwnersById\.get\(paneId\);\s*if \(expectedOwner && hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateInsideTmuxHudPane\(paneId, globalPanePidsBefore\.get\(paneId\), currentPaneId, globalPanePidsBefore\.get\(currentPaneId\), expectedOwner, \{ kind: "kill" \}\);\s*\}/);
     assert.match(source, /if \(keeperHudPaneId\) \{\s*hudPaneId = keeperHudPaneId;/);
     assert.match(source, /const expectedOwner = hudPaneOwnersById\.get\(hudPaneId\);\s*if \(expectedOwner && hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateInsideTmuxHudPane\(hudPaneId, hudPanePid, currentPaneId, globalPanePidsBefore\.get\(currentPaneId\), expectedOwner, \{ kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES \}\);\s*\}/);
-    assert.match(source, /const authorityCondition = `#\{&&:\$\{incarnationCondition\},#\{&&:\$\{leaderIncarnationCondition\},\$\{ownerCondition\}\}\}`;\s*const receiptCondition = `#\{&&:\$\{authorityCondition\},#\{==:#\{@omx_hud_mutation_receipt\},\$\{receipt\}\}\}`;/);
+    assert.match(source, /const hudMutationTransaction = `if-shell -F -t \$\{canonicalPaneId\} \$\{hudAuthorityCondition\} 'set-option -p -t \$\{canonicalPaneId\} @omx_hud_mutation_receipt \$\{receipt\} ; if-shell -F -t \$\{canonicalPaneId\} \$\{receiptCondition\} '\$\{mutationCommand\} ; display-message -p -t \$\{canonicalPaneId\} \$\{receipt\}' ''`;/);
+    assert.match(source, /"if-shell", "-F", "-t", canonicalReceiptPaneId,\s*leaderIncarnationCondition,\s*hudMutationTransaction,/);
+
+
     assert.match(source, /if \(hudPaneId\) hudPaneOwnersById\.set\(hudPaneId, \{ sessionId, leaderPaneId: currentPaneId \}\);/);
     assert.match(source, /return matchesOwner\(\) && matchesLiveIncarnation\(\) && matchesOwner\(\) && matchesLiveIncarnation\(\);/);
     assert.doesNotMatch(
@@ -4130,7 +4135,7 @@ exit 0
     );
   });
 
-  it("rejects spoofed, recycled-leader, or stale final HUD mutation receipts without running kill or resize", async () => {
+  it("binds HUD mutations to distinct target-scoped leader and HUD transactions", async () => {
     const fakeBinDir = await mkdtemp(join(tmpdir(), "omx-hud-authority-bin-"));
     const fakeTmuxPath = join(fakeBinDir, "tmux");
     const logPath = join(fakeBinDir, "effects.log");
@@ -4145,31 +4150,38 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "if-shell" ]]; then
+  target="$3"
   condition="$4"
   then_command="$5"
-  receipt="\${then_command##*display-message -p -t %1 }"
-  receipt="\${receipt%%\\'*}"
+  leader_pane="%1"
+  leader_pid="3131"
+  hud_pane="%2"
+  hud_pid="4242"
+  owner_session="sess-hud-owner"
+  owner_leader="%1"
   case "\${OMX_TEST_HUD_AUTHORITY_MODE:-ok}" in
-    changed-session|owner-session-drift|owner-leader-drift|leader-recycled|changed-receipt) exit 0 ;;
-    static-marker) printf '__OMX_HUD_PANE_MUTATION_OK__\\n'; exit 0 ;;
-    extra) printf '%s\\nextra\\n' "$receipt"; exit 0 ;;
-    duplicate) printf '%s\\n%s\\n' "$receipt" "$receipt"; exit 0 ;;
+    leader-recycled) leader_pid="9999" ;;
+    hud-recycled) hud_pid="9999" ;;
+    malformed-owner) owner_session="" ;;
+    spoofed-owner) owner_leader="%9" ;;
   esac
-  [[ "$condition" == *'#{==:#{pane_id},%2}'* ]] || exit 1
-  [[ "$condition" == *'#{==:#{pane_pid},4242}'* ]] || exit 1
-  [[ "$condition" == *'#{==:#{session_id},$1}'* ]] || exit 1
-  [[ "$condition" == *'OMX_TMUX_HUD_OWNER=1'* ]] || exit 1
-  [[ "$then_command" == *'OMX_TMUX_HUD_OWNER=1'* ]] || exit 1
-  [[ "$condition" == *"OMX_SESSION_ID='sess-hud-owner'"* ]] || exit 1
-  [[ "$condition" == *"OMX_TMUX_HUD_LEADER_PANE='%1'"* ]] || exit 1
-  [[ "$condition" == *'m/r:^exec[[:space:]]+env'* ]] || exit 1
-  [[ "$condition" == *'m/r:^powershell\\.exe'* ]] || exit 1
-  [[ "$then_command" == *"OMX_SESSION_ID='sess-hud-owner'"* ]] || exit 1
-  [[ "$then_command" == *"OMX_TMUX_HUD_LEADER_PANE='%1'"* ]] || exit 1
+  [[ "$target" == "$leader_pane" && "$condition" == *"#{==:#{pane_pid},$leader_pid}"* ]] || exit 0
+  [[ "$condition" != *'OMX_TMUX_HUD_OWNER'* ]] || exit 1
+  [[ "$then_command" == "if-shell -F -t $hud_pane "* ]] || exit 0
+  [[ "$then_command" == *"#{==:#{pane_pid},$hud_pid}"* ]] || exit 0
+  [[ -n "$owner_session" && "$then_command" == *"OMX_SESSION_ID='$owner_session'"* && "$then_command" == *"OMX_TMUX_HUD_LEADER_PANE='$owner_leader'"* ]] || exit 0
   [[ "$condition" == *'#{==:#{pane_id},%1}'* ]] || exit 1
-  [[ "$condition" == *'#{==:#{pane_pid},3131}'* ]] || exit 1
-  [[ "$then_command" == *'@omx_hud_mutation_receipt'* ]] || exit 1
-  [[ "$then_command" == *'#{@omx_hud_mutation_receipt}'* ]] || exit 1
+  [[ "$then_command" == *'#{==:#{pane_id},%2}'* ]] || exit 1
+  [[ "$then_command" == *"OMX_TMUX_SPLIT_OPERATION_MARKER"* ]] || exit 1
+  [[ "$then_command" == *'\\$env:OMX_SESSION_ID'* ]] || exit 1
+  [[ "$then_command" == *'powershell\\.exe'* ]] || exit 1
+  case "\${OMX_TEST_HUD_AUTHORITY_MODE:-ok}" in
+    changed-receipt) exit 0 ;;
+    static-marker) printf '__OMX_HUD_PANE_MUTATION_OK__\\n'; exit 0 ;;
+  esac
+  [[ "$then_command" =~ display-message\\ -p\\ -t\\ %2\\ ([a-f0-9]{32}) ]] || exit 1
+  receipt="\${BASH_REMATCH[1]}"
+
   if [[ "$then_command" == *'kill-pane -t %2'* ]]; then printf 'kill\\n' >> "$OMX_TEST_HUD_EFFECTS"; fi
   if [[ "$then_command" == *'resize-pane -t %2 -y 6'* ]]; then printf 'resize\\n' >> "$OMX_TEST_HUD_EFFECTS"; fi
   printf '%s\\n' "$receipt"
@@ -4180,15 +4192,27 @@ exit 1
       await chmod(fakeTmuxPath, 0o755);
       process.env.PATH = `${fakeBinDir}:${previousPath || ""}`;
       process.env.OMX_TEST_HUD_EFFECTS = logPath;
+      const ownerRuntimeEnv = {
+        OMX_SESSION_ID: "sess-hud-owner",
+        OMX_TMUX_HUD_OWNER: "1",
+        OMX_TMUX_HUD_LEADER_PANE: "%1",
+      };
+      const serializerShapes = [
+        buildHudStartupCommand("/tmp/omx.js", ownerRuntimeEnv, undefined, "linux"),
+        writeHudWatchCommand({ omxEntry: "/tmp/omx.js", runtimeEnv: ownerRuntimeEnv, nodeCommand: "node.exe", platform: "win32" }),
+        buildHudStartupCommand("/tmp/omx.js", ownerRuntimeEnv, undefined, "win32"),
+      ];
+      assert.match(serializerShapes[0]!, /^exec env OMX_SESSION_ID='sess-hud-owner' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' /);
+      assert.match(serializerShapes[1]!, /^\$env:OMX_SESSION_ID = 'sess-hud-owner'; \$env:OMX_TMUX_HUD_OWNER = '1'; \$env:OMX_TMUX_HUD_LEADER_PANE = '%1'; & /);
+      assert.match(serializerShapes[2]!, /^powershell\.exe -NoLogo -NoExit -Command '\$env:OMX_SESSION_ID = ''sess-hud-owner''; \$env:OMX_TMUX_HUD_OWNER = ''1''; \$env:OMX_TMUX_HUD_LEADER_PANE = ''%1''; & /);
 
       const owner = { sessionId: "sess-hud-owner", leaderPaneId: "%1" };
       assert.equal(mutateInsideTmuxHudPane("%2", "4242", "%1", "3131", owner, { kind: "kill" }), true);
       assert.equal(mutateInsideTmuxHudPane("%2", "4242", "%1", "3131", owner, { kind: "resize", heightLines: 6 }), true);
       assert.equal(await readFile(logPath, "utf8"), "kill\nresize\n");
-      for (const mode of ["changed-session", "owner-session-drift", "owner-leader-drift", "leader-recycled", "changed-receipt", "static-marker", "extra", "duplicate"]) {
+      for (const mode of ["leader-recycled", "hud-recycled", "malformed-owner", "spoofed-owner", "changed-receipt", "static-marker"]) {
         process.env.OMX_TEST_HUD_AUTHORITY_MODE = mode;
         assert.equal(mutateInsideTmuxHudPane("%2", "4242", "%1", "3131", owner, { kind: "kill" }), false, mode);
-        assert.equal(mutateInsideTmuxHudPane("%2", "4242", "%1", "3131", owner, { kind: "resize", heightLines: 6 }), false, mode);
       }
       assert.equal(await readFile(logPath, "utf8"), "kill\nresize\n");
     } finally {

@@ -713,6 +713,61 @@ describe('team message delivery end-to-end smoke tests', () => {
     }
   });
 
+  it('persists ambiguous delivery tombstones across later hook invocations', async () => {
+    const { cwd, cleanup } = await setupTeam('delivery-ambiguity-tombstone', 1);
+    try {
+      const config = await readTeamConfig('delivery-ambiguity-tombstone', cwd);
+      assert.ok(config, 'missing team config');
+      if (!config) throw new Error('missing team config');
+      config.workers[0] = { ...config.workers[0], pane_id: '' };
+      await saveTeamConfig(config, cwd);
+      const ambiguousQueued = await executeTeamApiOperation('send-message', {
+        team_name: 'delivery-ambiguity-tombstone',
+        from_worker: 'leader-fixed',
+        to_worker: 'worker-1',
+        body: 'ambiguous effect must not replay',
+      }, cwd);
+      assert.equal(ambiguousQueued.ok, true);
+      let ambiguousAttempts = 0;
+      await drainPendingTeamDispatch({
+        cwd,
+        injector: async () => {
+          ambiguousAttempts += 1;
+          return {
+            ok: false,
+            reason: 'delivery_ambiguous',
+            deliveryState: 'ambiguous',
+            retryable: false,
+            effectStage: 'submit',
+            pane: '%42',
+            pane_source: 'fixture',
+            readiness_evidence: null,
+            pane_current_command: 'codex',
+            tmux_injection_attempted: true,
+          };
+        },
+      });
+      await drainPendingTeamDispatch({
+        cwd,
+        injector: async () => {
+          ambiguousAttempts += 1;
+          return { ok: true, reason: 'must_not_run' };
+        },
+      });
+      assert.equal(ambiguousAttempts, 1, 'an ambiguous effect must not be automatically replayed');
+      const ambiguousRequest = (await listDispatchRequests('delivery-ambiguity-tombstone', cwd))[0];
+      assert.equal(ambiguousRequest?.status, 'pending');
+      const persistedAmbiguousRequest = JSON.parse(await readFile(
+        join(cwd, '.omx', 'state', 'team', 'delivery-ambiguity-tombstone', 'dispatch', 'requests.json'),
+        'utf-8',
+      ))[0];
+      assert.equal(persistedAmbiguousRequest?.delivery_state, 'ambiguous');
+      assert.equal(persistedAmbiguousRequest?.retryable, false);
+
+    } finally {
+      await cleanup();
+    }
+  });
   it('edge: duplicate same from/to/body send dedupes without adding a second mailbox record', async () => {
     const { cwd, cleanup } = await setupTeam('dedupe-smoke', 1);
     try {
