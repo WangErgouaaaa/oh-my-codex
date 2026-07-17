@@ -411,7 +411,7 @@ describe('team message delivery end-to-end smoke tests', () => {
         assert.equal(result.status, 0, result.stderr || result.stdout);
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /set-buffer -b omx-pane-input-[^ ]+ -- Team worker-leader-fallback:/);
+        assert.match(tmuxLog, /set-buffer -b omx-pane-input-[^ ]+ -- Read \.omx\/state\/team\/worker-leader-fallback\/mailbox\/leader-fixed\.json/);
         assert.match(tmuxLog, /show-buffer -b omx-pane-input-[^ ]+/);
         assert.match(tmuxLog, /'send-keys' '-t' '%95' 'C-u'/);
         assert.match(tmuxLog, /'paste-buffer' '-t' '%95' '-b' 'omx-pane-input-[^']+' '-p' '-d'/);
