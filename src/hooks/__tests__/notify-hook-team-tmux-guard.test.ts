@@ -59,6 +59,34 @@ exit 0
 `;
 }
 
+function buildReceiptLossFakeTmux(tmuxLogPath: string, receiptLossAtEffect: number): string {
+  const bufferPath = `${tmuxLogPath}.buffer`;
+  return `#!/usr/bin/env bash
+set -eu
+if [[ "$1" == "if-shell" ]]; then
+  printf '[%s]' "$@" >> "${tmuxLogPath}"
+  printf '\n' >> "${tmuxLogPath}"
+  effect_count_path="${tmuxLogPath}.effect-count"
+  effect_count=0
+  if [[ -f "$effect_count_path" ]]; then effect_count=$(<"$effect_count_path"); fi
+  effect_count=$((effect_count + 1))
+  printf '%s' "$effect_count" > "$effect_count_path"
+  if [[ "$effect_count" -ne ${receiptLossAtEffect} ]]; then
+    success="\${6:-}"; receipt="\${success##*display-message -p }"; receipt="\${receipt%% *}"
+    if [[ "$receipt" =~ ^[a-f0-9]{32}$ ]]; then printf '%s\n' "$receipt"; fi
+  fi
+  exit 0
+fi
+cmd="$1"
+shift || true
+if [[ "$cmd" == "display-message" ]]; then printf '%%42\t0\t4242\n'; exit 0; fi
+if [[ "$cmd" == "set-buffer" ]]; then printf '%s' "\${@: -1}" > "${bufferPath}"; exit 0; fi
+if [[ "$cmd" == "show-buffer" ]]; then [[ -f "${bufferPath}" ]] && cat "${bufferPath}"; exit 0; fi
+if [[ "$cmd" == "delete-buffer" ]]; then rm -f "${bufferPath}"; fi
+exit 0
+`;
+}
+
 function buildPidRecyclingFakeTmux(tmuxLogPath: string, stableAuthorityChecks: number): string {
   const bufferPath = `${tmuxLogPath}.buffer`;
   const authorityCountPath = `${tmuxLogPath}.authority-count`;
@@ -289,6 +317,51 @@ describe('notify-hook team tmux guard bridge', () => {
     }
   });
 
+  it('marks lost receipts from every effectful stage as non-retryable ambiguous delivery', async () => {
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    const cases = [
+      { receiptLossAtEffect: 1, effectStage: 'clear_composer' },
+      { receiptLossAtEffect: 2, effectStage: 'paste_buffer' },
+      { receiptLossAtEffect: 3, effectStage: 'submit' },
+    ] as const;
+
+    for (const testCase of cases) {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-receipt-loss-'));
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+      try {
+        await mkdir(fakeBinDir, { recursive: true });
+        await writeFile(join(fakeBinDir, 'tmux'), buildReceiptLossFakeTmux(tmuxLogPath, testCase.receiptLossAtEffect));
+        await chmod(join(fakeBinDir, 'tmux'), 0o755);
+
+        const result = runSendPaneInputInChild({
+          fakeBinDir,
+          moduleUrl,
+          paneTarget: '%42',
+          prompt: 'exactly-once receipt-loss probe',
+          submitKeyPresses: 1,
+          typePrompt: true,
+        });
+
+        assert.equal(result.status, 0, result.stderr);
+        const parsed = JSON.parse(result.stdout);
+        assert.equal(parsed.ok, false);
+        assert.equal(parsed.sent, false);
+        assert.equal(parsed.reason, 'delivery_ambiguous');
+        assert.equal(parsed.deliveryState, 'ambiguous');
+        assert.equal(parsed.retryable, false);
+        assert.equal(parsed.effectStage, testCase.effectStage);
+
+        const effectLines = (await readFile(tmuxLogPath, 'utf-8'))
+          .split('\n')
+          .filter((line) => /\[if-shell\].*(?:C-u|paste-buffer|C-m)/.test(line));
+        assert.equal(effectLines.length, testCase.receiptLossAtEffect, `automatic retry followed ${testCase.effectStage}`);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('aborts before paste when buffer setup fails so stale tmux content is not reused', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-'));
     const fakeBinDir = join(cwd, 'fake-bin');
@@ -462,7 +535,9 @@ exit 0
       assert.equal(result.status, 0, result.stderr);
       const parsed = JSON.parse(result.stdout);
       assert.equal(parsed.ok, false);
-      assert.equal(parsed.reason, 'buffer_paste_failed');
+      assert.equal(parsed.reason, 'delivery_ambiguous');
+      assert.equal(parsed.retryable, false);
+      assert.equal(parsed.effectStage, 'paste_buffer');
 
       const lines = (await readFile(tmuxLogPath, 'utf-8')).trim().split('\n').filter(Boolean);
       assert.match(lines[0] ?? '', /\[display-message\].*pane_id/);
@@ -646,7 +721,9 @@ exit 0
           typePrompt: true,
         });
         assert.equal(result.status, 0, result.stderr);
-        assert.equal(JSON.parse(result.stdout).reason, 'pane_authority_invalid');
+        const parsed = JSON.parse(result.stdout);
+        assert.equal(parsed.reason, testCase.stableChecks === 2 || testCase.stableChecks === 4 ? 'delivery_ambiguous' : 'pane_authority_invalid');
+        if (parsed.reason === 'delivery_ambiguous') assert.equal(parsed.retryable, false);
         const log = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
         for (const sink of testCase.expected) assert.match(log, new RegExp(`\\[if-shell\\].*${sink}`));
         const sinkCount = log.split('\n').filter((line) => /\[if-shell\].*(?:C-u|paste-buffer|C-m)/.test(line)).length;
@@ -809,7 +886,8 @@ ${behavior.replaceAll('__BUFFER__', `${tmuxLogPath}.buffer`).replaceAll('__COUNT
         await chmod(join(fakeBinDir, 'tmux'), 0o755);
         const result = runSendPaneInputInChild({ fakeBinDir, moduleUrl, paneTarget: '%42', prompt: 'must not reach downstream input', submitKeyPresses: 1, typePrompt: name !== 'owner takeover after readiness', ...authority });
         assert.equal(result.status, 0, result.stderr);
-        assert.equal(JSON.parse(result.stdout).reason, 'pane_authority_invalid', name);
+        assert.equal(JSON.parse(result.stdout).reason, name === 'malformed receipt' ? 'delivery_ambiguous' : 'pane_authority_invalid', name);
+        if (name === 'malformed receipt') assert.equal(JSON.parse(result.stdout).retryable, false);
         const log = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
         assert.doesNotMatch(log, /\[if-shell\].*(?:paste-buffer|C-m)/, name);
         if (name === 'HUD target') assert.equal(log, '');

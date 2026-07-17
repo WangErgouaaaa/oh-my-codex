@@ -552,7 +552,7 @@ describe('HUD resize hook command builders', () => {
     const hook = args[4] ?? '';
     assert.equal((hook.match(/\btmux if-shell -F -t %1 /g) ?? []).length, 2);
     assert.equal((hook.match(/'\\''if-shell -F -t %9 /g) ?? []).length, 2);
-    assert.match(hook, /'\\''#\{&&:#\{==:#\{pane_id\},%1\},#\{&&:#\{==:#\{pane_dead\},0\},#\{==:#\{pane_pid\},101\}\}\}'\\''/);
+    assert.match(hook, /'\\''#\{&&:#\{==:#\{pane_id\},%1\},#\{&&:#\{==:#\{pane_dead\},0\},#\{&&:#\{==:#\{pane_pid\},101\},1\}\}\}'\\''/);
     assert.match(hook, /#\{pane_dead\}/);
     assert.match(hook, /%1.*101/);
     assert.match(hook, /%9.*909/);
@@ -570,7 +570,7 @@ describe('HUD resize hook command builders', () => {
       })[4] ?? '';
       assert.equal((hook.match(/& ''[^']+'' if-shell -F -t %1 /g) ?? []).length, 2);
       assert.equal((hook.match(/''if-shell -F -t %9 /g) ?? []).length, 2);
-      assert.match(hook, /& ''[^']+'' if-shell -F -t %1 ''#\{&&:#\{==:#\{pane_id\},%1\},#\{&&:#\{==:#\{pane_dead\},0\},#\{==:#\{pane_pid\},101\}\}\}''/);
+      assert.match(hook, /& ''[^']+'' if-shell -F -t %1 ''#\{&&:#\{==:#\{pane_id\},%1\},#\{&&:#\{==:#\{pane_dead\},0\},#\{&&:#\{==:#\{pane_pid\},101\},1\}\}\}''/);
       assert.doesNotMatch(removeTmuxFormatExpressions(hook), /list-panes|awk|env |\/dev\/null|&&|\|\|/);
       assert.match(hook, /set-hook -u -t/);
     } finally {
@@ -4829,6 +4829,13 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  show-option)
+    case "$*" in
+      *" -t %1 "*|*" -t %2 "*) printf 'leader-session-a\n' ;;
+      *" -t %7 "*|*" -t %8 "*) printf 'neighbor-session\n' ;;
+    esac
+    exit 0
+    ;;
   split-window)
     case "$*" in
       *" -h "*)
@@ -4876,7 +4883,7 @@ esac
           assert.equal(session.hudPaneId, '%4');
 
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.match(tmuxLog, /if-shell -t %2 -F #\{&&:#\{==:#\{pane_id\},%2\},#\{&&:#\{==:#\{pane_dead\},0\},#\{==:#\{pane_pid\},102\}\}\} kill-pane -t %2 \\; display-message -p __OMX_PANE_MUTATION_[0-9a-f]+__/);
+          assert.match(tmuxLog, /if-shell -t %2 -F #\{&&:#\{==:#\{pane_id\},%2\},#\{&&:#\{==:#\{pane_dead\},0\},#\{&&:#\{==:#\{pane_pid\},102\},1\}\}\} kill-pane -t %2 \\; display-message -p __OMX_PANE_MUTATION_[0-9a-f]+__/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %8/);
           assert.match(tmuxLog, /split-window -v -f -l 3 -t shared:0 -d -P -F #\{pane_id\}/);
         },
@@ -6674,7 +6681,7 @@ case "\${1:-}" in
     for arg do owner_value="$arg"; done
     printf '%s\n' "$owner_value" > "${ownerProofPath}"
     ;;
-  show-options)
+  show-option|show-options)
     if [ -f "${ownerProofPath}" ]; then cat "${ownerProofPath}"; fi
     ;;
   select-pane)
@@ -6692,8 +6699,8 @@ esac
 `;
         },
         async ({ logPath }) => {
-          const firstPaneId = restoreStandaloneHudPane('%11', cwd);
-          const secondPaneId = restoreStandaloneHudPane('%11', cwd);
+          const firstPaneId = restoreStandaloneHudPane('%11', cwd, { sessionId: 'current-session-for-hud' });
+          const secondPaneId = restoreStandaloneHudPane('%11', cwd, { sessionId: 'current-session-for-hud' });
 
           assert.equal(firstPaneId, '%44');
           assert.equal(secondPaneId, '%44');
@@ -6703,6 +6710,47 @@ esac
           assert.equal(splitCount, 1);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %44/);
           assert.match(tmuxLog, /list-panes -t %11 -F #\{pane_id\}\t#\{pane_current_command\}\t#\{pane_start_command\}/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a recycled leader pane with a HUD owned by a stale OMX session', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-stale-owner-hud-'));
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-stale-owner-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *"#{pane_id} #{pane_dead} #{pane_pid}"*) printf '%%11 0 1000000011\\n%%44 0 1000000044\\n' ;;
+      *"#{pane_dead} #{pane_pid}"*)
+        case "$*" in
+          *"-t %11"*) printf '0 1000000011\\n' ;;
+          *"-t %44"*) printf '0 1000000044\\n' ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      *"#{pane_current_command}"*"#{pane_start_command}"*) printf '%%11\\tzsh\\tzsh\\n%%44\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='"'"'%%11'"'"' node /omx.js hud --watch\\n' ;;
+      *) printf '%%11\\n%%44\\n' ;;
+    esac
+    ;;
+  show-option) printf 'stale-session\\n' ;;
+  *) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(restoreStandaloneHudPane('%11', cwd, { sessionId: 'current-session-for-hud' }), null);
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /show-option -qv -p -t %11 @omx_pane_instance_id/);
+          assert.doesNotMatch(tmuxLog, /split-window|resize-pane|select-pane|run-shell/);
         },
       );
     } finally {

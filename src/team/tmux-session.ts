@@ -101,7 +101,7 @@ export interface CreateTeamSessionOptions {
 }
 
 export interface RestoreStandaloneHudPaneOptions {
-  /** Session id that prompt-submit HUD reconciliation should use to dedupe the restored HUD. */
+  /** Current OMX session id required to adopt an existing HUD; also forwarded to a newly created HUD. */
   sessionId?: string | null;
   /** Explicit HUD cwd override. When omitted, the live leader pane cwd is preferred over team launch cwd. */
   cwd?: string | null;
@@ -443,8 +443,9 @@ export function isTeamPaneIncarnationLive(
     && isPaneLiveInStrictGlobalProbe(paneId, normalizedPid);
 }
 
-function buildTeamPaneIncarnationCondition(paneId: string, panePid: string): string {
-  return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
+function buildTeamPaneIncarnationCondition(paneId: string, panePid: string, ownerSessionId?: string): string {
+  const ownerCondition = ownerSessionId ? `#{==:#{@omx_pane_instance_id},${ownerSessionId}}` : '1';
+  return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${panePid}},${ownerCondition}}}}`;
 }
 
 function createMutationReceipt(): string {
@@ -470,16 +471,28 @@ function removeTeamPaneIncarnation(pane: TeamPaneIncarnation): boolean {
 }
 
 /** Resizes only the exact live pane incarnation and requires a tmux-server receipt. */
-function resizeTeamPaneIncarnation(pane: TeamPaneIncarnation, heightLines: number): boolean {
+function resizeTeamPaneIncarnation(
+  pane: TeamPaneIncarnation,
+  heightLines: number,
+  ownerSessionId?: string,
+  coupledPane?: TeamPaneIncarnation,
+): boolean {
   const paneId = parseCanonicalTmuxPaneId(pane.paneId);
-  if (!paneId || paneId !== pane.paneId || !/^[1-9][0-9]*$/.test(pane.panePid)) return false;
+  const coupledPaneId = coupledPane && parseCanonicalTmuxPaneId(coupledPane.paneId);
+  if (
+    !paneId
+    || paneId !== pane.paneId
+    || !/^[1-9][0-9]*$/.test(pane.panePid)
+    || (coupledPane && (!coupledPaneId || coupledPaneId !== coupledPane.paneId || !/^[1-9][0-9]*$/.test(coupledPane.panePid)))
+  ) return false;
   const height = Number.isFinite(heightLines) && heightLines > 0 ? Math.floor(heightLines) : HUD_TMUX_TEAM_HEIGHT_LINES;
   const receipt = createMutationReceipt();
-  const result = runTmux([
-    'if-shell', '-t', paneId, '-F', buildTeamPaneIncarnationCondition(paneId, pane.panePid),
-    `resize-pane -t ${paneId} -y ${height} \\; display-message -p ${receipt}`,
-    '',
-  ]);
+  const resize = `resize-pane -t ${paneId} -y ${height} \\; display-message -p ${receipt}`;
+  const paneCondition = buildTeamPaneIncarnationCondition(paneId, pane.panePid, ownerSessionId);
+  const success = coupledPane ? `if-shell -F -t ${paneId} ${paneCondition} ${resize} ''` : resize;
+  const result = runTmux(coupledPane
+    ? ['if-shell', '-t', coupledPaneId!, '-F', buildTeamPaneIncarnationCondition(coupledPaneId!, coupledPane.panePid, ownerSessionId), success, '']
+    : ['if-shell', '-t', paneId, '-F', paneCondition, success, '']);
   return result.ok && parseExactTmuxAuthorityScalar(result.stdout) === receipt;
 }
 
@@ -1159,6 +1172,7 @@ export interface HudResizeHookPaneIncarnations {
   leaderPanePid: string;
   hudPaneId: string;
   hudPanePid: string;
+  ownerSessionId?: string;
 }
 
 function buildHudResizeCommand(hudPaneId: string, heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES): string {
@@ -1188,6 +1202,7 @@ function validateHudResizeHookPaneIncarnations(incarnations: HudResizeHookPaneIn
   const hudPaneId = parseCanonicalTmuxPaneId(incarnations.hudPaneId);
   const leaderPanePid = String(incarnations.leaderPanePid);
   const hudPanePid = String(incarnations.hudPanePid);
+  const ownerSessionId = incarnations.ownerSessionId;
   if (
     !leaderPaneId
     || !hudPaneId
@@ -1195,8 +1210,9 @@ function validateHudResizeHookPaneIncarnations(incarnations: HudResizeHookPaneIn
     || hudPaneId !== incarnations.hudPaneId
     || !/^[1-9][0-9]*$/.test(leaderPanePid)
     || !/^[1-9][0-9]*$/.test(hudPanePid)
+    || (ownerSessionId !== undefined && (!isSafeTmuxFormatOperand(ownerSessionId) || ownerSessionId.trim() !== ownerSessionId))
   ) throw new Error('invalid_tmux_hook_pane_incarnations');
-  return { leaderPaneId, leaderPanePid, hudPaneId, hudPanePid };
+  return { leaderPaneId, leaderPanePid, hudPaneId, hudPanePid, ...(ownerSessionId ? { ownerSessionId } : {}) };
 }
 
 function quoteHookShellArgument(value: string): string {
@@ -1205,8 +1221,9 @@ function quoteHookShellArgument(value: string): string {
     : shellQuoteSingle(value);
 }
 
-function buildHudResizeIncarnationCondition(incarnation: TeamPaneIncarnation): string {
-  return `#{&&:#{==:#{pane_id},${incarnation.paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${incarnation.panePid}}}}`;
+function buildHudResizeIncarnationCondition(incarnation: TeamPaneIncarnation, ownerSessionId?: string): string {
+  const ownerCondition = ownerSessionId ? `#{==:#{@omx_pane_instance_id},${ownerSessionId}}` : '1';
+  return `#{&&:#{==:#{pane_id},${incarnation.paneId}},#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_pid},${incarnation.panePid}},${ownerCondition}}}}`;
 }
 
 function buildAtomicHudResizeMutation(
@@ -1225,13 +1242,13 @@ function buildAtomicHudResizeMutation(
     : '';
   const inner = [
     'if-shell', '-F', '-t', hud.paneId,
-    quoteHookShellArgument(buildHudResizeIncarnationCondition(hud)),
+    quoteHookShellArgument(buildHudResizeIncarnationCondition(hud, expected.ownerSessionId)),
     quoteHookShellArgument(buildHudResizeCommand(hudPaneId, heightLines)),
     quoteHookShellArgument(unregister),
   ].join(' ');
   const conditional = [
     'if-shell', '-F', '-t', leader.paneId,
-    quoteHookShellArgument(buildHudResizeIncarnationCondition(leader)),
+    quoteHookShellArgument(buildHudResizeIncarnationCondition(leader, expected.ownerSessionId)),
     quoteHookShellArgument(inner),
     quoteHookShellArgument(unregister),
   ].join(' ');
@@ -2644,6 +2661,7 @@ export function restoreStandaloneHudPane(
   ) return null;
   const leaderPaneIncarnation = readTeamPaneIncarnation(normalizedLeaderPaneId);
   if (!leaderPaneIncarnation || !isTeamPaneIncarnationLive(leaderPaneIncarnation.paneId, leaderPaneIncarnation.panePid)) return null;
+  const ownerSessionId = (options.sessionId ?? '').trim();
 
   const ownedHudPaneCandidates = findHudWatchPaneIds(
     preSplitPanes,
@@ -2670,27 +2688,28 @@ export function restoreStandaloneHudPane(
 
   if (existingHudPaneId && existingHudPaneIncarnation) {
     const hasFreshExistingHudAuthority = (): boolean => (
-      isTeamPaneIncarnationLive(leaderPaneIncarnation.paneId, leaderPaneIncarnation.panePid)
+      ownerSessionId !== ''
+      && isSafeTmuxFormatOperand(ownerSessionId)
+      && paneHasOmxInstanceTag(leaderPaneIncarnation.paneId, ownerSessionId)
+      && paneHasOmxInstanceTag(existingHudPaneIncarnation.paneId, ownerSessionId)
+      && isTeamPaneIncarnationLive(leaderPaneIncarnation.paneId, leaderPaneIncarnation.panePid)
       && isTeamPaneIncarnationLive(existingHudPaneIncarnation.paneId, existingHudPaneIncarnation.panePid)
     );
     if (!hasFreshExistingHudAuthority()) return null;
     if (nativeWindows) {
-      if (!resizeTeamPaneIncarnation(existingHudPaneIncarnation, HUD_TMUX_TEAM_HEIGHT_LINES)) return null;
+      if (!resizeTeamPaneIncarnation(existingHudPaneIncarnation, HUD_TMUX_TEAM_HEIGHT_LINES, ownerSessionId, leaderPaneIncarnation)) return null;
     } else {
       if (!hasFreshExistingHudAuthority()) return null;
-      runTmux(buildScheduleDelayedHudResizeArgs(existingHudPaneId, {
+      const incarnations = {
         leaderPaneId: leaderPaneIncarnation.paneId,
         leaderPanePid: leaderPaneIncarnation.panePid,
         hudPaneId: existingHudPaneIncarnation.paneId,
         hudPanePid: existingHudPaneIncarnation.panePid,
-      }));
+        ownerSessionId,
+      };
+      runTmux(buildScheduleDelayedHudResizeArgs(existingHudPaneId, incarnations));
       if (!hasFreshExistingHudAuthority()) return null;
-      runTmux(buildReconcileHudResizeArgs(existingHudPaneId, {
-        leaderPaneId: leaderPaneIncarnation.paneId,
-        leaderPanePid: leaderPaneIncarnation.panePid,
-        hudPaneId: existingHudPaneIncarnation.paneId,
-        hudPanePid: existingHudPaneIncarnation.panePid,
-      }));
+      runTmux(buildReconcileHudResizeArgs(existingHudPaneId, incarnations));
     }
     if (!hasFreshExistingHudAuthority()) return null;
     runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
@@ -2763,6 +2782,7 @@ export function restoreStandaloneHudPane(
   if (!hasFreshNewHudAuthority() || !isPaneStablyLiveInStrictGlobalProbe(paneId, paneAuthority.panePid) || !isPaneStablyLiveInStrictGlobalProbe(leaderPaneIncarnation.paneId, leaderPaneIncarnation.panePid)) {
     return rollbackAndFail();
   }
+  if (ownerSessionId !== '') tagPaneInstance(paneId, ownerSessionId);
   if (!hasFreshNewHudAuthority()) return rollbackAndFail();
   runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
   return paneId;

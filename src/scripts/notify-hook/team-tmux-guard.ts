@@ -227,15 +227,31 @@ function paneAuthorityFormat(paneId: string, panePid: string, expectedPaneOwnerI
     : incarnation;
 }
 
-async function runPaneMutationAtomically(paneId: string, panePid: string, command: string[], expectedPaneOwnerId = ''): Promise<boolean> {
+type PaneMutationOutcome = 'confirmed' | 'ambiguous';
+
+async function runPaneMutationAtomically(paneId: string, panePid: string, command: string[], expectedPaneOwnerId = ''): Promise<PaneMutationOutcome> {
   const receipt = randomUUID().replace(/-/g, '');
-  if (!/^[a-f0-9]{32}$/.test(receipt)) return false;
+  if (!/^[a-f0-9]{32}$/.test(receipt)) return 'ambiguous';
   const quoted = `${command.map((arg) => `'${arg.replace(/'/g, "\\'")}'`).join(' ')} ; display-message -p ${receipt}`;
 
   const result = await runProcess('tmux', [
     'if-shell', '-t', paneId, '-F', paneAuthorityFormat(paneId, panePid, expectedPaneOwnerId), quoted, '',
   ], 3000);
-  return parseExactTmuxAuthorityScalar(result.stdout) === receipt;
+  return parseExactTmuxAuthorityScalar(result.stdout) === receipt ? 'confirmed' : 'ambiguous';
+}
+
+function ambiguousDeliveryFailure(paneTarget: string, argv: Record<string, unknown>, effectStage: string, error?: unknown): Record<string, unknown> {
+  return {
+    ok: false,
+    sent: false,
+    retryable: false,
+    deliveryState: 'ambiguous',
+    reason: 'delivery_ambiguous',
+    effectStage,
+    paneTarget,
+    argv,
+    ...(error === undefined ? {} : { error: error instanceof Error ? error.message : safeString(error) }),
+  };
 }
 
 async function confirmPaneAuthorityAtomically(paneId: string, panePid: string, expectedPaneOwnerId = ''): Promise<boolean> {
@@ -364,35 +380,48 @@ export async function sendPaneInput({
       }
       if (!(await requirePaneAuthority())) return authorityFailure();
       try {
-        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.clearComposerArgv, expectedPaneOwnerId))) return authorityFailure();
-
-        if (!(await requirePaneAuthority())) return authorityFailure();
-        if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.pasteBufferArgv, expectedPaneOwnerId))) return authorityFailure();
-
-
+        if ((await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.clearComposerArgv, expectedPaneOwnerId)) !== 'confirmed') {
+          return ambiguousDeliveryFailure(authoritativeTarget, argv, 'clear_composer');
+        }
       } catch (error) {
-        return { ok: false, sent: false, reason: 'buffer_paste_failed', paneTarget: target, argv, error: error instanceof Error ? error.message : safeString(error) };
+        return ambiguousDeliveryFailure(authoritativeTarget, argv, 'clear_composer', error);
+      }
+      if (!(await requirePaneAuthority())) return authorityFailure();
+      try {
+        if ((await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, pasteArgv.pasteBufferArgv, expectedPaneOwnerId)) !== 'confirmed') {
+          return ambiguousDeliveryFailure(authoritativeTarget, argv, 'paste_buffer');
+        }
+      } catch (error) {
+        return ambiguousDeliveryFailure(authoritativeTarget, argv, 'paste_buffer', error);
       }
     }
     if (queueFirstSubmit && argv.submitArgv.length > 0) {
       if (!(await requirePaneAuthority())) return authorityFailure();
-      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, ['send-keys', '-t', authoritativeTarget, 'Tab'], expectedPaneOwnerId))) return authorityFailure();
-
-
+      try {
+        if ((await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, ['send-keys', '-t', authoritativeTarget, 'Tab'], expectedPaneOwnerId)) !== 'confirmed') {
+          return ambiguousDeliveryFailure(authoritativeTarget, argv, 'queue_submit');
+        }
+      } catch (error) {
+        return ambiguousDeliveryFailure(authoritativeTarget, argv, 'queue_submit', error);
+      }
       if (submitDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
     }
     for (const submit of argv.submitArgv) {
       if (submitDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
       if (!(await requirePaneAuthority())) return authorityFailure();
-      if (!(await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, submit, expectedPaneOwnerId))) return authorityFailure();
-
-
+      try {
+        if ((await runPaneMutationAtomically(authoritativeTarget, capturedAuthority.panePid, submit, expectedPaneOwnerId)) !== 'confirmed') {
+          return ambiguousDeliveryFailure(authoritativeTarget, argv, 'submit');
+        }
+      } catch (error) {
+        return ambiguousDeliveryFailure(authoritativeTarget, argv, 'submit', error);
+      }
     }
-    if (!(await confirmPaneAuthorityAtomically(authoritativeTarget, capturedAuthority.panePid, expectedPaneOwnerId))) return authorityFailure();
+    if (!(await confirmPaneAuthorityAtomically(authoritativeTarget, capturedAuthority.panePid, expectedPaneOwnerId))) return ambiguousDeliveryFailure(authoritativeTarget, argv, 'post_submit_confirmation');
 
     return { ok: true, sent: true, reason: 'sent', paneTarget: authoritativeTarget, argv };
   } catch (error) {
-    return { ok: false, sent: false, reason: 'send_failed', paneTarget: authoritativeTarget, argv, error: error instanceof Error ? error.message : safeString(error) };
+    return ambiguousDeliveryFailure(authoritativeTarget, argv, 'unknown', error);
   } finally {
     if (bufferSet) await runProcess('tmux', pasteArgv.deleteBufferArgv, 3000).catch(() => {});
   }
@@ -427,33 +456,26 @@ export async function queuePaneInput({
     ['send-keys', '-t', target, 'Tab'],
     ['send-keys', '-t', target, 'C-m'],
   ];
+  const queueArgv = { typeArgv: sendResult.argv?.typeArgv || null, submitArgv };
   try {
-    if (!(await paneAuthority()) || !(await capturedAuthority.assertPaneAuthority())) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
-    if (!(await runPaneMutationAtomically(target, capturedAuthority.panePid, submitArgv[0]))) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
-
+    if (!(await paneAuthority()) || !(await capturedAuthority.assertPaneAuthority())) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: queueArgv };
+    if ((await runPaneMutationAtomically(target, capturedAuthority.panePid, submitArgv[0])) !== 'confirmed') return ambiguousDeliveryFailure(target, queueArgv, 'queue_submit');
 
     if (submitDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
     }
-    if (!(await paneAuthority()) || !(await capturedAuthority.assertPaneAuthority())) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
-    if (!(await runPaneMutationAtomically(target, capturedAuthority.panePid, submitArgv[1]))) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
-    if (!(await confirmPaneAuthorityAtomically(target, capturedAuthority.panePid))) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv } };
+    if (!(await paneAuthority()) || !(await capturedAuthority.assertPaneAuthority())) return { ok: false, sent: false, reason: 'pane_authority_invalid', paneTarget: target, argv: queueArgv };
+    if ((await runPaneMutationAtomically(target, capturedAuthority.panePid, submitArgv[1])) !== 'confirmed') return ambiguousDeliveryFailure(target, queueArgv, 'submit');
+    if (!(await confirmPaneAuthorityAtomically(target, capturedAuthority.panePid))) return ambiguousDeliveryFailure(target, queueArgv, 'post_submit_confirmation');
     return {
       ok: true,
       sent: true,
       reason: 'queued',
       paneTarget: target,
-      argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv },
+      argv: queueArgv,
     };
   } catch (error) {
-    return {
-      ok: false,
-      sent: false,
-      reason: 'queue_failed',
-      paneTarget: target,
-      argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv },
-      error: error instanceof Error ? error.message : safeString(error),
-    };
+    return ambiguousDeliveryFailure(target, queueArgv, 'unknown', error);
   }
 }
 
