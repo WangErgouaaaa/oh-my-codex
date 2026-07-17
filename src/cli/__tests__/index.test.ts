@@ -4123,11 +4123,14 @@ exit 0
     assert.match(source, /for \(const paneId of duplicateHudPaneIds\) \{\s*const expectedOwner = hudPaneOwnersById\.get\(paneId\);\s*if \(expectedOwner && hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(paneId, currentPaneId, sessionId, globalPanePidsBefore\.get\(paneId\)\)\) mutateInsideTmuxHudPane\(paneId, globalPanePidsBefore\.get\(paneId\), currentPaneId, globalPanePidsBefore\.get\(currentPaneId\), expectedOwner, \{ kind: "kill" \}\);\s*\}/);
     assert.match(source, /if \(keeperHudPaneId\) \{\s*hudPaneId = keeperHudPaneId;/);
     assert.match(source, /const expectedOwner = hudPaneOwnersById\.get\(hudPaneId\);\s*if \(expectedOwner && hasFreshTmuxPaneIncarnation\(currentPaneId, globalPanePidsBefore\.get\(currentPaneId\)\) && hasFreshInsideTmuxHudPaneAuthority\(hudPaneId, currentPaneId, sessionId, hudPanePid\)\) \{\s*mutateInsideTmuxHudPane\(hudPaneId, hudPanePid, currentPaneId, globalPanePidsBefore\.get\(currentPaneId\), expectedOwner, \{ kind: "resize", heightLines: HUD_TMUX_HEIGHT_LINES \}\);\s*\}/);
-    assert.match(source, /const hudMutationTransaction = `if-shell -F -t \$\{canonicalPaneId\} \$\{hudAuthorityCondition\} 'set-option -p -t \$\{canonicalPaneId\} @omx_hud_mutation_receipt \$\{receipt\} ; if-shell -F -t \$\{canonicalPaneId\} \$\{receiptCondition\} '\$\{mutationCommand\} ; display-message -p -t \$\{canonicalPaneId\} \$\{receipt\}' ''`;/);
+    assert.match(source, /const mutationAndReceipt = `\$\{mutationCommand\} \\\\; display-message -p -t \$\{canonicalPaneId\} \$\{receipt\}`;\s*const receiptTransaction = `if-shell -F -t \$\{canonicalPaneId\} \$\{receiptCondition\} \$\{quoteShellArg\(mutationAndReceipt\)\} ''`;\s*const hudMutationTransaction = `if-shell -F -t \$\{canonicalPaneId\} \$\{hudAuthorityCondition\} \$\{quoteShellArg\(`set-option -p -t \$\{canonicalPaneId\} @omx_hud_mutation_receipt \$\{receipt\} \\\\; \$\{receiptTransaction\}`\)\} ''`;/);
     assert.match(source, /"if-shell", "-F", "-t", canonicalReceiptPaneId,\s*leaderIncarnationCondition,\s*hudMutationTransaction,/);
 
 
     assert.match(source, /if \(hudPaneId\) hudPaneOwnersById\.set\(hudPaneId, \{ sessionId, leaderPaneId: currentPaneId \}\);/);
+    assert.match(source, /setDetachedTmuxSessionHistoryLimit\(\s*sessionIncarnation: string,[\s\S]*?buildTmuxPaneIncarnationCondition\(canonicalLeaderPaneId, exactLeaderPanePid, sessionIncarnation\)[\s\S]*?set-option -q -t \$\{sessionIncarnation\} history-limit/);
+    assert.match(source, /clearDetachedTmuxSessionHistoryIfUnattached\(\s*sessionIncarnation: string,[\s\S]*?if-shell -F -t \$\{sessionIncarnation\}/);
+    assert.doesNotMatch(source, /set-option -q -t \$\{sessionName\} history-limit/);
     assert.match(source, /return matchesOwner\(\) && matchesLiveIncarnation\(\) && matchesOwner\(\) && matchesLiveIncarnation\(\);/);
     assert.doesNotMatch(
       source,
@@ -4184,7 +4187,10 @@ if [[ "$cmd" == "if-shell" ]]; then
 
   if [[ "$then_command" == *'kill-pane -t %2'* ]]; then printf 'kill\\n' >> "$OMX_TEST_HUD_EFFECTS"; fi
   if [[ "$then_command" == *'resize-pane -t %2 -y 6'* ]]; then printf 'resize\\n' >> "$OMX_TEST_HUD_EFFECTS"; fi
-  printf '%s\\n' "$receipt"
+  case "\${OMX_TEST_HUD_AUTHORITY_MODE:-ok}" in
+    malformed-receipt) printf '%s\\n\\n' "\$receipt"; exit 0 ;;
+  esac
+  printf '%s\\n' "\$receipt"
   exit 0
 fi
 exit 1
@@ -4196,25 +4202,26 @@ exit 1
         OMX_SESSION_ID: "sess-hud-owner",
         OMX_TMUX_HUD_OWNER: "1",
         OMX_TMUX_HUD_LEADER_PANE: "%1",
+        OMX_ROOT: "/tmp/omx runtime's root",
       };
       const serializerShapes = [
         buildHudStartupCommand("/tmp/omx.js", ownerRuntimeEnv, undefined, "linux"),
         writeHudWatchCommand({ omxEntry: "/tmp/omx.js", runtimeEnv: ownerRuntimeEnv, nodeCommand: "node.exe", platform: "win32" }),
         buildHudStartupCommand("/tmp/omx.js", ownerRuntimeEnv, undefined, "win32"),
       ];
-      assert.match(serializerShapes[0]!, /^exec env OMX_SESSION_ID='sess-hud-owner' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' /);
-      assert.match(serializerShapes[1]!, /^\$env:OMX_SESSION_ID = 'sess-hud-owner'; \$env:OMX_TMUX_HUD_OWNER = '1'; \$env:OMX_TMUX_HUD_LEADER_PANE = '%1'; & /);
-      assert.match(serializerShapes[2]!, /^powershell\.exe -NoLogo -NoExit -Command '\$env:OMX_SESSION_ID = ''sess-hud-owner''; \$env:OMX_TMUX_HUD_OWNER = ''1''; \$env:OMX_TMUX_HUD_LEADER_PANE = ''%1''; & /);
+      assert.match(serializerShapes[0]!, /^exec env OMX_SESSION_ID='sess-hud-owner' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' OMX_ROOT='\/tmp\/omx runtime'\\''s root' /);
+      assert.match(serializerShapes[1]!, /^\$env:OMX_SESSION_ID = 'sess-hud-owner'; \$env:OMX_TMUX_HUD_OWNER = '1'; \$env:OMX_TMUX_HUD_LEADER_PANE = '%1'; \$env:OMX_ROOT = '\/tmp\/omx runtime''s root'; & /);
+      assert.match(serializerShapes[2]!, /^powershell\.exe -NoLogo -NoExit -Command '\$env:OMX_SESSION_ID = ''sess-hud-owner''; \$env:OMX_TMUX_HUD_OWNER = ''1''; \$env:OMX_TMUX_HUD_LEADER_PANE = ''%1''; \$env:OMX_ROOT = ''\/tmp\/omx runtime''''s root''; & /);
 
       const owner = { sessionId: "sess-hud-owner", leaderPaneId: "%1" };
       assert.equal(mutateInsideTmuxHudPane("%2", "4242", "%1", "3131", owner, { kind: "kill" }), true);
       assert.equal(mutateInsideTmuxHudPane("%2", "4242", "%1", "3131", owner, { kind: "resize", heightLines: 6 }), true);
       assert.equal(await readFile(logPath, "utf8"), "kill\nresize\n");
-      for (const mode of ["leader-recycled", "hud-recycled", "malformed-owner", "spoofed-owner", "changed-receipt", "static-marker"]) {
+      for (const mode of ["leader-recycled", "hud-recycled", "malformed-owner", "spoofed-owner", "changed-receipt", "static-marker", "malformed-receipt"]) {
         process.env.OMX_TEST_HUD_AUTHORITY_MODE = mode;
         assert.equal(mutateInsideTmuxHudPane("%2", "4242", "%1", "3131", owner, { kind: "kill" }), false, mode);
       }
-      assert.equal(await readFile(logPath, "utf8"), "kill\nresize\n");
+      assert.equal(await readFile(logPath, "utf8"), "kill\nresize\nkill\n", "a malformed receipt fails closed at the caller after the server-side mutation transaction has already run");
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;

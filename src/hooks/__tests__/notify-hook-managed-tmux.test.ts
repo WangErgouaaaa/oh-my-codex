@@ -282,7 +282,7 @@ exit 1
     }
   });
 
-  it('accepts native payload session ids when session state stores a separate native_session_id', async () => {
+  it('rejects a native payload session id when it has no tmux incarnation authority', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-native-session-'));
     try {
       const stateDir = join(cwd, '.omx', 'state');
@@ -299,17 +299,18 @@ exit 1
       process.env.OMX_TEAM_WORKER = '';
 
       const result = await resolveManagedSessionContext(cwd, { session_id: 'codex-native-session' }, { allowTeamWorker: false });
-      assert.equal(result.managed, true);
+      assert.equal(result.managed, false);
+      assert.equal(result.reason, 'missing_tmux_instance_authority');
       assert.equal(result.invocationSessionId, 'codex-native-session');
       assert.equal(result.canonicalSessionId, 'omx-canonical-session');
       assert.equal(result.nativeSessionId, 'codex-native-session');
-      assert.match(result.expectedTmuxSessionName, /omx-canonical-session|canonical-session/);
+
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('uses authoritative tmux session metadata before recomputing branch-based names', async () => {
+  it('accepts authoritative current-session recovery only with an exact instance tag', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-authoritative-'));
     try {
       const sessionId = 'omx-authoritative-session';
@@ -321,6 +322,10 @@ if [[ "$1" == "display-message" ]]; then
   echo "${tmuxSessionName}"
   exit 0
 fi
+if [[ "$1" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
 exit 1
 `, async () => {
         process.env.TMUX = '1';
@@ -329,7 +334,7 @@ exit 1
 
         const result = await resolveManagedSessionContext(cwd, { session_id: sessionId }, { allowTeamWorker: false });
         assert.equal(result.managed, true);
-        assert.equal(result.reason, 'tmux_session_match');
+        assert.equal(result.reason, 'tmux_instance_match');
         assert.equal(result.expectedTmuxSessionName, tmuxSessionName);
         assert.equal(result.currentTmuxSessionName, tmuxSessionName);
       });
@@ -338,15 +343,19 @@ exit 1
     }
   });
 
-  it('fails closed when authoritative tmux metadata disagrees with the active tmux session', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-authoritative-mismatch-'));
+  it('rejects malformed tmux instance-tag framing', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-malformed-tag-'));
     try {
-      const sessionId = 'omx-authoritative-session';
-      await writeSessionStart(cwd, sessionId, { tmuxSessionName: 'omx-expected-session' });
-
+      const sessionId = 'omx-malformed-tag-session';
+      const tmuxSessionName = 'omx-malformed-tag-session-name';
+      await writeSessionStart(cwd, sessionId, { tmuxSessionName });
       await withFakeTmux(cwd, `#!/usr/bin/env bash
 if [[ "$1" == "display-message" ]]; then
-  echo "omx-other-session"
+  echo "${tmuxSessionName}"
+  exit 0
+fi
+if [[ "$1" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  printf '%s\\n%s\\n' "${sessionId}" "forged-owner"
   exit 0
 fi
 exit 1
@@ -357,16 +366,42 @@ exit 1
 
         const result = await resolveManagedSessionContext(cwd, { session_id: sessionId }, { allowTeamWorker: false });
         assert.equal(result.managed, false);
-        assert.equal(result.reason, 'tmux_session_mismatch');
-        assert.equal(result.expectedTmuxSessionName, 'omx-expected-session');
-        assert.equal(result.currentTmuxSessionName, 'omx-other-session');
+        assert.equal(result.reason, 'missing_tmux_instance_authority');
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('accepts symlinked cwd aliases for the same managed session', async () => {
+  it('rejects a same-name tmux session without an exact instance tag', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-authoritative-mismatch-'));
+    try {
+      const sessionId = 'omx-authoritative-session';
+      await writeSessionStart(cwd, sessionId, { tmuxSessionName: 'omx-expected-session' });
+
+      await withFakeTmux(cwd, `#!/usr/bin/env bash
+if [[ "$1" == "display-message" ]]; then
+  echo "omx-expected-session"
+  exit 0
+fi
+exit 1
+`, async () => {
+        process.env.TMUX = '1';
+        delete process.env.TMUX_PANE;
+        process.env.OMX_TEAM_WORKER = '';
+
+        const result = await resolveManagedSessionContext(cwd, { session_id: sessionId }, { allowTeamWorker: false });
+        assert.equal(result.managed, false);
+        assert.equal(result.reason, 'missing_tmux_instance_authority');
+        assert.equal(result.expectedTmuxSessionName, 'omx-expected-session');
+        assert.equal(result.currentTmuxSessionName, 'omx-expected-session');
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects PID ancestry alone for a symlinked cwd alias', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-cwd-alias-'));
     const aliasCwd = `${cwd}-alias`;
     try {
@@ -378,8 +413,8 @@ exit 1
       process.env.OMX_TEAM_WORKER = '';
 
       const result = await resolveManagedSessionContext(aliasCwd, { session_id: 'omx-alias-session' }, { allowTeamWorker: false });
-      assert.equal(result.managed, true);
-      assert.match(result.reason, /ancestry_match$/);
+      assert.equal(result.managed, false);
+      assert.equal(result.reason, 'missing_tmux_instance_authority');
       assert.equal(result.canonicalSessionId, 'omx-alias-session');
       assert.equal(result.expectedTmuxSessionName, buildTmuxSessionName(cwd, 'omx-alias-session'));
     } finally {
@@ -423,6 +458,13 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "${managedSessionName}"
     exit 0
   fi
+fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
 fi
 echo "unsupported tmux call: $cmd $*" >&2
 exit 1
@@ -572,6 +614,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -667,6 +718,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -746,6 +806,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -841,6 +910,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -936,6 +1014,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -1031,6 +1118,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -1126,6 +1222,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -1232,6 +1337,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -1327,6 +1441,15 @@ if [[ "$cmd" == "display-message" ]]; then
   echo "unsupported display target: $target / $format" >&2
   exit 1
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
+fi
+
 if [[ "$cmd" == "list-panes" ]]; then
   target=""
   while (($#)); do
@@ -1417,6 +1540,13 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   echo "unsupported display target: $target / $format" >&2
   exit 1
+fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_instance_id" ]]; then
+  echo "${sessionId}"
+  exit 0
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   target=""

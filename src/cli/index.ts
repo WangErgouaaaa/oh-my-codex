@@ -1661,14 +1661,17 @@ function buildTmuxPaneIncarnationCondition(paneId: string, panePid: string, sess
 function buildTmuxHudOwnerCondition(expectedOwner: InsideTmuxHudOwner): string | null {
   const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(expectedOwner.leaderPaneId);
   if (typeof expectedOwner.sessionId !== "string" || !canonicalLeaderPaneId || !/^[A-Za-z0-9._-]+$/.test(expectedOwner.sessionId)) return null;
-  const splitMarker = "(OMX_TMUX_SPLIT_OPERATION_MARKER='[a-f0-9-]+';[[:space:]]+export[[:space:]]+OMX_TMUX_SPLIT_OPERATION_MARKER;[[:space:]]+)?";
-  const posixQuoted = "'([^']|'\"'\"')*'";
-  const posixCommand = `exec[[:space:]]+env[[:space:]]+OMX_SESSION_ID='${expectedOwner.sessionId}'[[:space:]]+${OMX_TMUX_HUD_OWNER_ENV}=1[[:space:]]+${OMX_TMUX_HUD_LEADER_PANE_ENV}='${canonicalLeaderPaneId}'[[:space:]]+(node|${posixQuoted})[[:space:]]+${posixQuoted}[[:space:]]+hud[[:space:]]+--watch([[:space:]]+'--preset=(minimal|focused|full)')?$`;
+  const posixSplitMarker = "(OMX_TMUX_SPLIT_OPERATION_MARKER='[a-f0-9-]+';[[:space:]]+export[[:space:]]+OMX_TMUX_SPLIT_OPERATION_MARKER;[[:space:]]+)?";
+  const powerShellSplitMarker = "(\\$env:OMX_TMUX_SPLIT_OPERATION_MARKER[[:space:]]*=[[:space:]]*'[a-f0-9-]+';[[:space:]]+)?";
+  const posixQuoted = "'([^']|'\"'\"'|'\\\\'')*'";
   const powerShellQuoted = "'([^']|'')*'";
-  const powerShellAssignments = `\\$env:OMX_SESSION_ID[[:space:]]*=[[:space:]]*'${expectedOwner.sessionId}';[[:space:]]+\\$env:${OMX_TMUX_HUD_OWNER_ENV}[[:space:]]*=[[:space:]]*'1';[[:space:]]+\\$env:${OMX_TMUX_HUD_LEADER_PANE_ENV}[[:space:]]*=[[:space:]]*'${canonicalLeaderPaneId}';[[:space:]]+&[[:space:]]+${powerShellQuoted}[[:space:]]+${powerShellQuoted}[[:space:]]+hud[[:space:]]+--watch([[:space:]]+(minimal|focused|full))?`;
-  const barePowerShellCommand = `${powerShellAssignments}$`;
-  const envelopedPowerShellCommand = `powershell\\.exe[[:space:]]+-NoLogo[[:space:]]+-NoExit[[:space:]]+-Command[[:space:]]+'${powerShellAssignments}'$`;
-  return `#{||:#{m/r:^${splitMarker}${posixCommand},#{pane_start_command}},#{||:#{m/r:^${barePowerShellCommand},#{pane_start_command}},#{m/r:^${envelopedPowerShellCommand},#{pane_start_command}}}}`;
+  const posixRootAssignment = `(OMX_(TEAM_STATE_ROOT|STATE_ROOT|ROOT)=${posixQuoted}[[:space:]]+)?`;
+  const powerShellRootAssignment = `(\\$env:OMX_(TEAM_STATE_ROOT|STATE_ROOT|ROOT)[[:space:]]*=[[:space:]]*${powerShellQuoted};[[:space:]]+)?`;
+  const envelopedPowerShellRootAssignment = `(\\$env:OMX_(TEAM_STATE_ROOT|STATE_ROOT|ROOT)[[:space:]]*=[[:space:]]*''([^']|'')*'';[[:space:]]+)?`;
+  const posixCommand = `exec[[:space:]]+env[[:space:]]+OMX_SESSION_ID='${expectedOwner.sessionId}'[[:space:]]+${OMX_TMUX_HUD_OWNER_ENV}=1[[:space:]]+${OMX_TMUX_HUD_LEADER_PANE_ENV}='${canonicalLeaderPaneId}'[[:space:]]+${posixRootAssignment}(node|${posixQuoted})[[:space:]]+${posixQuoted}[[:space:]]+hud[[:space:]]+--watch([[:space:]]+'--preset=(minimal|focused|full)')?$`;
+  const powerShellCommand = `\\$env:OMX_SESSION_ID[[:space:]]*=[[:space:]]*'${expectedOwner.sessionId}';[[:space:]]+\\$env:${OMX_TMUX_HUD_OWNER_ENV}[[:space:]]*=[[:space:]]*'1';[[:space:]]+\\$env:${OMX_TMUX_HUD_LEADER_PANE_ENV}[[:space:]]*=[[:space:]]*'${canonicalLeaderPaneId}';[[:space:]]+${powerShellRootAssignment}&[[:space:]]+${powerShellQuoted}[[:space:]]+${powerShellQuoted}[[:space:]]+hud[[:space:]]+--watch([[:space:]]+(minimal|focused|full))?$`;
+  const envelopedPowerShellCommand = `powershell\\.exe[[:space:]]+-NoLogo[[:space:]]+-NoExit[[:space:]]+-Command[[:space:]]+'\\$env:OMX_SESSION_ID[[:space:]]*=[[:space:]]*''${expectedOwner.sessionId}'';[[:space:]]+\\$env:${OMX_TMUX_HUD_OWNER_ENV}[[:space:]]*=[[:space:]]*''1'';[[:space:]]+\\$env:${OMX_TMUX_HUD_LEADER_PANE_ENV}[[:space:]]*=[[:space:]]*''${canonicalLeaderPaneId}'';[[:space:]]+${envelopedPowerShellRootAssignment}&[[:space:]]+''([^']|'')*''[[:space:]]+''([^']|'')*''[[:space:]]+hud[[:space:]]+--watch([[:space:]]+(minimal|focused|full))?$`;
+  return `#{||:#{m/r:^${posixSplitMarker}${posixCommand},#{pane_start_command}},#{||:#{m/r:^${powerShellSplitMarker}${powerShellCommand},#{pane_start_command}},#{m/r:^${envelopedPowerShellCommand},#{pane_start_command}}}}`;
 }
 
 
@@ -1716,7 +1719,9 @@ export function mutateInsideTmuxHudPane(
   if (!ownerCondition) return false;
   const hudAuthorityCondition = `#{&&:${hudIncarnationCondition},${ownerCondition}}`;
   const receiptCondition = `#{&&:${hudAuthorityCondition},#{==:#{@omx_hud_mutation_receipt},${receipt}}}`;
-  const hudMutationTransaction = `if-shell -F -t ${canonicalPaneId} ${hudAuthorityCondition} 'set-option -p -t ${canonicalPaneId} @omx_hud_mutation_receipt ${receipt} ; if-shell -F -t ${canonicalPaneId} ${receiptCondition} '${mutationCommand} ; display-message -p -t ${canonicalPaneId} ${receipt}' ''`;
+  const mutationAndReceipt = `${mutationCommand} \\; display-message -p -t ${canonicalPaneId} ${receipt}`;
+  const receiptTransaction = `if-shell -F -t ${canonicalPaneId} ${receiptCondition} ${quoteShellArg(mutationAndReceipt)} ''`;
+  const hudMutationTransaction = `if-shell -F -t ${canonicalPaneId} ${hudAuthorityCondition} ${quoteShellArg(`set-option -p -t ${canonicalPaneId} @omx_hud_mutation_receipt ${receipt} \\; ${receiptTransaction}`)} ''`;
   try {
     const stdout = execTmuxFileSync([
       "if-shell", "-F", "-t", canonicalReceiptPaneId,
@@ -1747,56 +1752,44 @@ function buildAtomicTmuxPaneMutationArgs(
 }
 
 function setDetachedTmuxSessionHistoryLimit(
-  sessionName: string,
+  sessionIncarnation: string,
   leaderPaneId: string | null | undefined,
   leaderPanePid: string | undefined,
 ): void {
   const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
-  if (!canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(leaderPanePid ?? '')) return;
+  if (!canonicalLeaderPaneId || !isSafeTmuxFormatScalar(sessionIncarnation) || !/^[1-9][0-9]*$/.test(leaderPanePid ?? '')) return;
   const exactLeaderPanePid = leaderPanePid!;
-
-  const mutationArgs = buildAtomicTmuxPaneMutationArgs(
-    canonicalLeaderPaneId,
-    exactLeaderPanePid,
-    `set-option -q -t ${sessionName} history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`,
-  );
+  const sessionCondition = buildTmuxPaneIncarnationCondition(canonicalLeaderPaneId, exactLeaderPanePid, sessionIncarnation);
+  const mutationArgs = [
+    "if-shell", "-F", "-t", canonicalLeaderPaneId, sessionCondition,
+    `set-option -q -t ${sessionIncarnation} history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`,
+    "",
+  ];
   const paneMutationArgs = buildAtomicTmuxPaneMutationArgs(
     canonicalLeaderPaneId,
     exactLeaderPanePid,
     `set-option -pq -t ${canonicalLeaderPaneId} history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`,
   );
-
   try {
     execTmuxFileSync(mutationArgs, { stdio: "ignore" });
     execTmuxFileSync(paneMutationArgs, { stdio: "ignore" });
-
   } catch (err) {
     logCliOperationFailure(err);
   }
 }
 
 function clearDetachedTmuxSessionHistoryIfUnattached(
-  sessionName: string,
+  sessionIncarnation: string,
   leaderPaneId: string,
   leaderPanePid: string | undefined,
 ): void {
   const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
-  if (!canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(leaderPanePid ?? '')) return;
+  if (!canonicalLeaderPaneId || !isSafeTmuxFormatScalar(sessionIncarnation) || !/^[1-9][0-9]*$/.test(leaderPanePid ?? '')) return;
   const exactLeaderPanePid = leaderPanePid!;
-
   try {
-    const condition = buildTmuxPaneIncarnationCondition(canonicalLeaderPaneId, exactLeaderPanePid);
-    const mutation = `if-shell -F -t ${sessionName} '#{==:#{session_attached},0}' 'clear-history -t ${canonicalLeaderPaneId}' ''`;
-    execTmuxFileSync([
-      "if-shell",
-      "-F",
-      "-t",
-      canonicalLeaderPaneId,
-      condition,
-      mutation,
-      "",
-    ], { stdio: "ignore" });
-
+    const condition = buildTmuxPaneIncarnationCondition(canonicalLeaderPaneId, exactLeaderPanePid, sessionIncarnation);
+    const mutation = `if-shell -F -t ${sessionIncarnation} '#{==:#{session_attached},0}' 'clear-history -t ${canonicalLeaderPaneId}' ''`;
+    execTmuxFileSync(["if-shell", "-F", "-t", canonicalLeaderPaneId, condition, mutation, ""], { stdio: "ignore" });
   } catch (err) {
     logCliOperationFailure(err);
   }
@@ -4777,7 +4770,7 @@ export function buildDetachedSessionBootstrapSteps(
     "-d",
     "-P",
     "-F",
-    "#{pane_id}",
+    "#{session_id}\t#{pane_id}\t#{pane_pid}",
     "-s",
     sessionName,
     "-c",
@@ -4969,30 +4962,47 @@ type DetachedSessionAuthority = {
   launchProof: string;
 };
 
-function captureDetachedSessionAuthority(
-  leaderPaneId: string,
+function provisionalDetachedSessionAuthorityFromCreateReceipt(
+  output: string,
   launchProof: string,
 ): DetachedSessionAuthority | null {
-  const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
-  if (!canonicalLeaderPaneId || !/^[a-f0-9]{32}$/.test(launchProof)) return null;
+  if (!/^[a-f0-9]{32}$/.test(launchProof)) return null;
+  const receipt = parseExactTmuxScalar(output);
+  const [sessionId, paneId, panePid] = receipt?.split("\t") ?? [];
+  const leaderPaneId = parseCanonicalTmuxPaneId(paneId);
+  if (
+    !sessionId
+    || !isSafeTmuxFormatScalar(sessionId)
+    || !leaderPaneId
+    || !/^[1-9][0-9]*$/.test(panePid ?? "")
+  ) return null;
+  return { sessionId, leaderPaneId, leaderPanePid: panePid!, launchProof };
+}
+
+function captureDetachedSessionAuthority(
+  provisionalAuthority: DetachedSessionAuthority,
+): DetachedSessionAuthority | null {
+  const { sessionId, leaderPaneId: canonicalLeaderPaneId, leaderPanePid: panePid, launchProof } = provisionalAuthority;
+  if (
+    !parseCanonicalTmuxPaneId(canonicalLeaderPaneId)
+    || !/^[a-f0-9]{32}$/.test(launchProof)
+    || !isSafeTmuxFormatScalar(sessionId)
+    || !/^[1-9][0-9]*$/.test(panePid)
+  ) return null;
   try {
     const snapshot = parseExactTmuxScalar(execTmuxFileSync(
       ["display-message", "-p", "-t", canonicalLeaderPaneId, "#{session_id}\t#{pane_id}\t#{pane_pid}"],
       { encoding: "utf-8" },
     ));
-    const [sessionId, paneId, panePid] = snapshot?.split("\t") ?? [];
-    const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
-    if (!sessionId || !isSafeTmuxFormatScalar(sessionId) || canonicalPaneId !== canonicalLeaderPaneId || !/^[1-9][0-9]*$/.test(panePid ?? "")) return null;
-    const condition = buildTmuxPaneIncarnationCondition(canonicalPaneId, panePid!, sessionId);
+    if (snapshot !== `${sessionId}\t${canonicalLeaderPaneId}\t${panePid}`) return null;
+    const condition = buildTmuxPaneIncarnationCondition(canonicalLeaderPaneId, panePid, sessionId);
     const receiptCondition = `#{&&:${condition},#{==:#{${DETACHED_LAUNCH_PROOF_OPTION}},${launchProof}}}`;
     const output = execTmuxFileSync([
-      "if-shell", "-F", "-t", canonicalPaneId, condition,
-      `set-option -p -t ${canonicalPaneId} ${DETACHED_LAUNCH_PROOF_OPTION} ${launchProof} ; if-shell -F ${receiptCondition} ${quoteShellArg(`display-message -p -t ${canonicalPaneId} ${launchProof}`)} ''`,
+      "if-shell", "-F", "-t", canonicalLeaderPaneId, condition,
+      `set-option -p -t ${canonicalLeaderPaneId} ${DETACHED_LAUNCH_PROOF_OPTION} ${launchProof} ; if-shell -F ${receiptCondition} ${quoteShellArg(`display-message -p -t ${canonicalLeaderPaneId} ${launchProof}`)} ''`,
       "",
     ], { encoding: "utf-8" });
-    return parseExactTmuxScalar(output) === launchProof
-      ? { sessionId, leaderPaneId: canonicalPaneId, leaderPanePid: panePid!, launchProof }
-      : null;
+    return parseExactTmuxScalar(output) === launchProof ? provisionalAuthority : null;
   } catch {
     return null;
   }
@@ -5952,7 +5962,7 @@ function runCodex(
           throw new MadmaxDetachedReuseError("madmax detached leader authority changed before history mutation");
         }
         setDetachedTmuxSessionHistoryLimit(
-          activeRecord.tmux_session_name,
+          activeRecord.session_id!,
           activeRecord.tmux_pane_id!,
           activeRecord.tmux_pane_pid,
         );
@@ -5961,7 +5971,7 @@ function runCodex(
             throw new MadmaxDetachedReuseError("madmax detached leader authority changed before history cleanup");
           }
           clearDetachedTmuxSessionHistoryIfUnattached(
-            activeRecord.tmux_session_name,
+            activeRecord.session_id!,
             activeRecord.tmux_pane_id!,
             activeRecord.tmux_pane_pid,
           );
@@ -6056,30 +6066,36 @@ function runCodex(
           });
           if (step.name === "new-session") {
             createdDetachedSession = true;
-            const leaderPaneId = parsePaneIdFromTmuxOutput(output || "");
-            if (leaderPaneId) {
-              const authority = captureDetachedSessionAuthority(leaderPaneId, detachedLaunchProof);
-              if (!authority) throw new Error("detached leader session authority unavailable");
-              detachedSessionAuthority = authority;
-              detachedLeaderPaneId = authority.leaderPaneId;
-              setDetachedTmuxSessionHistoryLimit(sessionName, authority.leaderPaneId, authority.leaderPanePid);
-              if (activeRecordPath && contextKey) {
-                writeMadmaxDetachedActiveRecord(activeRecordPath, {
-                  version: 1,
-                  context_key: contextKey,
-                  created_at: new Date().toISOString(),
-                  source_cwd: runtimeContext?.sourceCwd ?? process.env.OMX_SOURCE_CWD ?? cwd,
-                  ...(runtimeContext?.worktreeCwd ? { worktree_cwd: runtimeContext.worktreeCwd } : {}),
-                  argv: args,
-                  run_dir: runtimeContext?.omxRoot ?? process.env.OMX_ROOT ?? cwd,
-                  tmux_session_name: sessionName,
-                  session_id: sessionId,
-                  tmux_pane_id: authority.leaderPaneId,
-                  tmux_pane_pid: authority.leaderPanePid,
-                });
-              }
-              writeDetachedSessionBinding(leaderPaneId);
+            const provisionalAuthority = provisionalDetachedSessionAuthorityFromCreateReceipt(
+              output || "",
+              detachedLaunchProof,
+            );
+            if (!provisionalAuthority) {
+              throw new Error("detached leader session creation receipt unavailable");
             }
+            detachedSessionAuthority = provisionalAuthority;
+            detachedLeaderPaneId = provisionalAuthority.leaderPaneId;
+            const authority = captureDetachedSessionAuthority(provisionalAuthority);
+            if (!authority) throw new Error("detached leader session authority unavailable");
+            detachedSessionAuthority = authority;
+            detachedLeaderPaneId = authority.leaderPaneId;
+            setDetachedTmuxSessionHistoryLimit(authority.sessionId, authority.leaderPaneId, authority.leaderPanePid);
+            if (activeRecordPath && contextKey) {
+              writeMadmaxDetachedActiveRecord(activeRecordPath, {
+                version: 1,
+                context_key: contextKey,
+                created_at: new Date().toISOString(),
+                source_cwd: runtimeContext?.sourceCwd ?? process.env.OMX_SOURCE_CWD ?? cwd,
+                ...(runtimeContext?.worktreeCwd ? { worktree_cwd: runtimeContext.worktreeCwd } : {}),
+                argv: args,
+                run_dir: runtimeContext?.omxRoot ?? process.env.OMX_ROOT ?? cwd,
+                tmux_session_name: sessionName,
+                session_id: sessionId,
+                tmux_pane_id: authority.leaderPaneId,
+                tmux_pane_pid: authority.leaderPanePid,
+              });
+            }
+            writeDetachedSessionBinding(authority.leaderPaneId);
           }
           if (step.name === "split-and-capture-hud-pane") {
             const hudPaneId = parsePaneIdFromTmuxOutput(output || "");

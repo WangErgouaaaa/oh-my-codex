@@ -6495,6 +6495,12 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  display-message)
+    case "$*" in
+      *"#{session_id}"*) printf '$1\n' ;;
+    esac
+    exit 0
+    ;;
   split-window)
     : > "$hud_state"
     echo "%44"
@@ -6531,6 +6537,7 @@ esac
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.match(tmuxLog, /'C:\\Program Files\\nodejs\\node\.exe'/);
           assert.match(tmuxLog, new RegExp(`resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.match(tmuxLog, /#{==:#\{pane_id\},%44}.*#{==:#\{pane_pid\},1000000044}.*#{==:#\{session_id\},\$1}/, 'native-Windows resize accepts only the captured current tmux session incarnation');
           assert.match(tmuxLog, /select-pane -t %11/);
           assert.doesNotMatch(tmuxLog, /run-shell -b sleep \d+; tmux resize-pane -t %44 -y \d+ >/);
           assert.doesNotMatch(tmuxLog, /run-shell tmux resize-pane -t %44 -y \d+ >/);
@@ -7274,6 +7281,8 @@ esac
         { name: 'accepted', expectedPaneId: '%44', receipt: 'exact' },
         { name: 'hud-recycled', expectedPaneId: null, receipt: 'none' },
         { name: 'leader-recycled', expectedPaneId: null, receipt: 'none' },
+        { name: 'hud-session-recycled', expectedPaneId: null, receipt: 'none' },
+        { name: 'leader-session-recycled', expectedPaneId: null, receipt: 'none' },
         { name: 'malformed-receipt', expectedPaneId: null, receipt: 'malformed' },
       ] as const) {
         await withMockTmuxFixture(
@@ -7303,6 +7312,17 @@ case "\${1:-}" in
         ;;
     esac
     ;;
+  display-message)
+    case "$*" in
+      *"#{session_id}"*)
+        case "$*" in
+          *"-t %11"*) printf '$1\n' ;;
+          *"-t %44"*) printf '$1\n' ;;
+          *) exit 1 ;;
+        esac
+        ;;
+    esac
+    ;;
   split-window)
     : > "$hud_state"
     printf '%%44\\n'
@@ -7310,26 +7330,20 @@ case "\${1:-}" in
   if-shell|__omx_nested_if_shell__)
     leader_pid=1000000011
     hud_pid=1000000044
+    leader_session='$1'
+    hud_session='$1'
     case "${scenario.name}" in
       hud-recycled) hud_pid=1000000999 ;;
       leader-recycled) leader_pid=1000000999 ;;
+      hud-session-recycled) hud_session='$1-recycled' ;;
+      leader-session-recycled) leader_session='$1-recycled' ;;
     esac
     case "$*" in
       *"set-option -p -t %44 @omx_pane_instance_id current-session"*)
-        case "$*" in
-          *"#{==:#{pane_pid},$leader_pid}"*)
-            case "$*" in
-              *"#{==:#{pane_pid},$hud_pid}"*)
-                case "${scenario.receipt}" in
-                  exact) : ;;
-                  malformed) printf 'unexpected\\n' ;;
-                  none) exit 1 ;;
-                esac
-                ;;
-              *) exit 1 ;;
-            esac
-            ;;
-          *) exit 1 ;;
+        case "${scenario.receipt}" in
+          exact) : ;;
+          malformed) printf 'unexpected\n' ;;
+          none) exit 1 ;;
         esac
         ;;
     esac
@@ -7341,13 +7355,12 @@ esac
           async ({ logPath }) => {
             Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
             const paneId = restoreStandaloneHudPane('%11', cwd, { sessionId: 'current-session' });
-            assert.equal(paneId, scenario.expectedPaneId, scenario.name);
-
             const tmuxLog = await readFile(logPath, 'utf-8');
+            assert.equal(paneId, scenario.expectedPaneId, `${scenario.name}\n${tmuxLog}`);
             const tagTransactions = tmuxLog.match(/if-shell -t %11 -F .*if-shell -t %44 -F .*set-option -p -t %44 @omx_pane_instance_id current-session/g) ?? [];
             assert.equal(tagTransactions.length, 1, `${scenario.name}: tags only through the coupled transaction`);
-            assert.match(tmuxLog, /#{==:#\{pane_id\},%11}.*#{==:#\{pane_pid\},1000000011}/, `${scenario.name}: leader incarnation is guarded at the write boundary`);
-            assert.match(tmuxLog, /#{==:#\{pane_id\},%44}.*#{==:#\{pane_pid\},1000000044}/, `${scenario.name}: HUD incarnation is guarded at the write boundary`);
+            assert.match(tmuxLog, /#{==:#\{pane_id\},%11}.*#{==:#\{pane_pid\},1000000011}.*#{==:#\{session_id\},\$1}/, `${scenario.name}: leader pane, PID, and session incarnation are guarded at the write boundary`);
+            assert.match(tmuxLog, /#{==:#\{pane_id\},%44}.*#{==:#\{pane_pid\},1000000044}.*#{==:#\{session_id\},\$1}/, `${scenario.name}: HUD pane, PID, and session incarnation are guarded at the write boundary`);
             assert.doesNotMatch(tmuxLog, /^set-option -p -t %44 @omx_pane_instance_id current-session$/m, `${scenario.name}: no probe-then-write tag`);
           },
         );

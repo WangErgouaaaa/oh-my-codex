@@ -563,7 +563,7 @@ case "$1" in
     exit 1
     ;;
   new-session)
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   list-panes)
@@ -658,7 +658,7 @@ case "$1" in
       if [ "$prev" = '-s' ]; then printf '%s\n' "$arg" > "${activeMarker}"; fi
       prev="$arg"
     done
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   list-panes)
@@ -772,7 +772,7 @@ case "$1" in
     exit 1
     ;;
   new-session)
-    printf '%%77\n'
+    printf '$77\t%%77\t101\n'
     exit 0
     ;;
   list-panes)
@@ -892,7 +892,7 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   split-window)
@@ -970,7 +970,7 @@ printf 'tmux:%s\n' "$*" >> "${logPath}"
 case "$1" in
   -V) printf 'tmux 3.4\n'; exit 0 ;;
   has-session) exit 1 ;;
-  new-session) printf '%%12\n'; exit 0 ;;
+  new-session) printf '$12\t%%12\t101\n'; exit 0 ;;
   list-panes) printf '%s\n' '%12 0 101' '%13 0 202'; exit 0 ;;
   split-window) printf '%%13\n'; exit 0 ;;
   display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then printf '%s\t%s\t%s\n' '$12' '%12' '101'; else printf '0\n'; fi; exit 0 ;;
@@ -1034,7 +1034,7 @@ printf 'tmux:%s\n' "$*" >> "${logPath}"
 case "$1" in
   -V) printf 'tmux 3.4\n'; exit 0 ;;
   has-session) exit 1 ;;
-  new-session) printf '%%12\n'; exit 0 ;;
+  new-session) printf '$12\t%%12\t101\n'; exit 0 ;;
   list-panes) printf '%s\n' '%12 0 101' '%13 0 202'; exit 0 ;;
   split-window) printf '%%13\n'; exit 0 ;;
   display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then printf '%s\t%s\t%s\n' '$12' '%12' '101'; else printf '0\n'; fi; exit 0 ;;
@@ -1093,7 +1093,7 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   list-panes)
@@ -1226,7 +1226,7 @@ case "$1" in
       TERMINFO_DIRS=/tmp/server-terminfo-dirs \
       TERMCAP=server-termcap \
       sh -c "$last" >/dev/null 2>&1 || true
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   split-window)
@@ -1556,7 +1556,7 @@ case "$1" in
     exit 1
     ;;
   new-session)
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   split-window)
@@ -1716,7 +1716,7 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf '%%1\n'
+    printf '$1\t%%1\t101\n'
     exit 0
     ;;
   list-panes)
@@ -1803,7 +1803,7 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf '%%1\n'
+    printf '$1\t%%1\t101\n'
     exit 0
     ;;
   list-panes)
@@ -1875,6 +1875,47 @@ exit 0
     }
   });
 
+  it('rolls back the exact newly created session when capture receipts are absent or malformed', async () => {
+    for (const receipt of ['', 'not-the-launch-proof']) {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-capture-fail-'));
+      try {
+        const { env, tmuxLogPath } = await createLaunchFixture(
+          wd,
+          (tmuxLogPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V|list-sessions) exit 0 ;;
+  new-session) printf '$12\t%%12\t101\n'; exit 0 ;;
+  display-message)
+    if [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '$12\t%%12\t101\n'
+    fi
+    exit 0
+    ;;
+  if-shell)
+    printf '%s\n' '${receipt}'
+    exit 0
+    ;;
+esac
+exit 0
+`,
+        );
+        const result = runOmx(wd, ['--madmax', '--tmux'], { ...env, TMUX: '', TMUX_PANE: '' });
+        if (shouldSkipForSpawnPermissions(result.error)) return;
+
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+        assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
+        assert.match(
+          tmuxLog,
+          /tmux:if-shell -F -t %12 .*#\{==:#\{session_name\},[^} ]+\}.*#\{==:#\{pane_id\},%12\}.*#\{==:#\{pane_pid\},101\}.*#\{==:#\{@omx_detached_launch_proof\},[a-f0-9]{32}\}.*kill-session -t /,
+        );
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('preserves the requested cwd through detached tmux launch when an unsupported SHELL value falls back away from rc-driven cwd drift', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-cwd-'));
     try {
@@ -1918,7 +1959,7 @@ case "$cmd" in
     if [ -n "\${last:-}" ]; then
       /bin/sh -c "$last"
     fi
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   split-window)
@@ -2026,7 +2067,7 @@ case "$cmd" in
     if [ -n "\${last:-}" ]; then
       /bin/sh -c "$last"
     fi
-    printf '%%12\n'
+    printf '$12\t%%12\t101\n'
     exit 0
     ;;
   split-window)
