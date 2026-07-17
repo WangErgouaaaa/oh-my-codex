@@ -372,6 +372,10 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "list-panes" ]]; then
+  printf '%%79\t0\t79\tdevsess:21\tteam:shell-idle-team\n'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -382,6 +386,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{pane_id}"$'\t'"#{pane_dead}"$'\t'"#{pane_pid}" && "$target" == "%79" ]]; then
+    printf '%%79\t0\t79\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%79" ]]; then
     echo "zsh"
   fi

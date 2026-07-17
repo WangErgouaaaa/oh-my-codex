@@ -481,6 +481,10 @@ cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
   format="\${@: -1}"
+  if [[ "$format" == "#{pane_id}"$'\t'"#{pane_dead}"$'\t'"#{pane_pid}" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" ]]; then
     echo "codex"
     exit 0
@@ -535,6 +539,10 @@ cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
   format="\${@: -1}"
+  if [[ "$format" == "#{pane_id}"$'\t'"#{pane_dead}"$'\t'"#{pane_pid}" ]]; then
+    printf '%%42\t0\t4242\n'
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" ]]; then
     echo "codex"
     exit 0
@@ -708,6 +716,7 @@ if [[ "$1" == "if-shell" ]]; then success="\${6:-}"; receipt="\${success##*displ
 set -eu
 if [[ "$1" == "display-message" ]]; then
   case "${'${@: -1}'}" in '#{pane_current_command}') printf 'codex\\n' ;; '#{pane_in_mode}') printf '0\\n' ;; esac
+  if [[ "${'${@: -1}'}" == "#{pane_id}"$'\t'"#{pane_dead}"$'\t'"#{pane_pid}" ]]; then printf '%%42\t0\t4242\n'; exit 0; fi
   exit 0
 fi
 if [[ "$1" == "capture-pane" ]]; then printf '%s' ${JSON.stringify(captureOutput)}; fi

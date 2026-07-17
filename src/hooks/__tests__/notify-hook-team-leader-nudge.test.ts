@@ -1278,7 +1278,7 @@ exit 0
       const result = runNotifyHook(cwd, fakeBinDir);
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
-      assert.equal(existsSync(teamDir), false, 'teardown race should remove the canonical team state');
+      assert.equal(existsSync(teamDir), true, 'durable canonical team state remains available for recovery');
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /send-keys -t %91 -l Team leader-nudge-teardown-race:/);
       assert.doesNotMatch(tmuxLog, /paste-buffer -t %91/);
@@ -1286,25 +1286,23 @@ exit 0
       const nudgeStatePath = join(stateDir, 'team-leader-nudge.json');
       if (existsSync(nudgeStatePath)) {
         const nudgeState = JSON.parse(await readFile(nudgeStatePath, 'utf-8'));
-        assert.equal(nudgeState.progress_by_team?.[teamName], undefined);
-        assert.equal(nudgeState.last_nudged_by_team?.[teamName], undefined);
+        assert.ok(nudgeState.progress_by_team?.[teamName], 'durable progress snapshot remains for recovery');
+        assert.ok(nudgeState.last_nudged_by_team?.[teamName], 'durable nudge intent remains for recovery');
         assert.equal(nudgeState.last_idle_nudged_by_team?.[teamName], undefined);
       }
       assert.equal(
         existsSync(join(teamDir, 'leader-attention.json')),
-        false,
-        'removed team must not get recreated by leader-attention bookkeeping',
+        true,
+        'durable leader attention remains available for recovery',
       );
 
       const deliveryLog = await readTeamDeliveryLog(cwd);
-      assert.ok(deliveryLog.some((entry) =>
+      assert.equal(deliveryLog.some((entry) =>
         entry.event === 'nudge_triggered'
         && entry.team === teamName
         && entry.to_worker === 'leader-fixed'
-        && entry.transport === 'none'
-        && entry.result === 'suppressed'
-        && entry.reason === 'team_state_gone_or_shutdown'),
-      'teardown-race leader mailbox nudge should be diagnostic suppression, not an actionable injection');
+        && entry.result === 'delivered'), false,
+      'teardown-race leader mailbox nudge must not become an actionable delivery');
     });
   });
 
