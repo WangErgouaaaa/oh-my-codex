@@ -29,7 +29,15 @@ describe('Windows popup loop contracts', () => {
     assert.match(updateSource, /spawnNpmSync\(\s*\[\s*'install',\s*'-g',[\s\S]*?windowsHide:\s*true/);
     assert.match(notifierSource, /execFileAsync\(cmd,\s*args,\s*\{\s*windowsHide:\s*true\s*\}\)/);
     assert.match(replyListenerSource, /spawn\('node',\s*\['-e',\s*daemonScript\],\s*\{[\s\S]*?windowsHide:\s*true/);
-    assert.match(fallbackWatcherSource, /spawnPlatformCommandSync\('tmux', \['send-keys', '-t', paneId/);
+    assert.match(fallbackWatcherSource, /checkPaneReadyForTeamSendKeys\(paneId\)/);
+    assert.match(fallbackWatcherSource, /display-message', '-p', '-t', canonicalPaneId, '#\{pane_id\}\\t#\{pane_dead\}\\t#\{pane_pid\}'/);
+    assert.match(fallbackWatcherSource, /set-buffer', '-b', bufferName, '--', markedText/);
+    assert.match(fallbackWatcherSource, /show-buffer', '-b', bufferName/);
+    assert.match(fallbackWatcherSource, /if-shell', '-t', canonicalPaneId, '-F', authority, mutation, ''/);
+    assert.match(fallbackWatcherSource, /paste-buffer -t \$\{canonicalPaneId\} -b \$\{bufferName\} -p -d/);
+    assert.match(fallbackWatcherSource, /tmux atomic input authority receipt mismatch/);
+    assert.match(fallbackWatcherSource, /spawn\(process\.execPath, \[notifyScript, JSON\.stringify\(payload\)\], \{[\s\S]*?stdio: 'ignore',[\s\S]*?windowsHide: true/);
+    assert.doesNotMatch(fallbackWatcherSource, /spawnPlatformCommandSync\('tmux', \['send-keys'/);
     assert.doesNotMatch(fallbackWatcherSource, /spawnSync\('tmux'/);
   });
 });

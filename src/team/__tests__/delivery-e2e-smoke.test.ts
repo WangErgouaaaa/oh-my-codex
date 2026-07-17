@@ -411,12 +411,19 @@ describe('team message delivery end-to-end smoke tests', () => {
         assert.equal(result.status, 0, result.stderr || result.stdout);
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /set-buffer -b omx-pane-input-[^ ]+ -- Read \.omx\/state\/team\/worker-leader-fallback\/mailbox\/leader-fixed\.json/);
-        assert.match(tmuxLog, /show-buffer -b omx-pane-input-[^ ]+/);
-        assert.match(tmuxLog, /'send-keys' '-t' '%95' 'C-u'/);
-        assert.match(tmuxLog, /'paste-buffer' '-t' '%95' '-b' 'omx-pane-input-[^']+' '-p' '-d'/);
-        assert.match(tmuxLog, /'paste-buffer' '-t' '%95'/);
-        assert.match(tmuxLog, /msg\(s\) pending|msg\(s\) for leader/);
+        const prompt = 'Read .omx/state/team/worker-leader-fallback/mailbox/leader-fixed.json; worker-1 sent a new message. Review it and decide the next concrete step.';
+        const bufferMatch = tmuxLog.match(new RegExp(`set-buffer -b (omx-pane-input-[^ ]+) -- ${prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+        assert.ok(bufferMatch, 'fallback watcher should stage the exact leader mailbox prompt');
+        const bufferName = bufferMatch[1];
+        assert.match(tmuxLog, new RegExp(`show-buffer -b ${bufferName}`));
+        const authority = '#{&&:#{==:#{pane_id},%95},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},10095}}}';
+        const atomicMutation = (command: string) => new RegExp(
+          `if-shell -t %95 -F ${authority.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} ${command} ; display-message -p [a-f0-9]{32}`,
+        );
+        assert.match(tmuxLog, atomicMutation("'send-keys' '-t' '%95' 'C-u'"));
+        assert.match(tmuxLog, atomicMutation(`'paste-buffer' '-t' '%95' '-b' '${bufferName}' '-p' '-d'`));
+        assert.match(tmuxLog, atomicMutation("'send-keys' '-t' '%95' 'Tab'"));
+        assert.match(tmuxLog, atomicMutation("'send-keys' '-t' '%95' 'C-m'"));
       });
     } finally {
       await cleanup();

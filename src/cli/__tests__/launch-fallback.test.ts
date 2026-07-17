@@ -577,9 +577,22 @@ case "$1" in
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
       printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     else
       printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -659,6 +672,8 @@ case "$1" in
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
       printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     elif [ "$2" = '-p' ] && [ "$5" = '#{session_name}' ]; then
       cat "${activeMarker}"
     elif [ "$2" = '-p' ] && [ "$5" = '#{session_attached}' ]; then
@@ -666,6 +681,17 @@ case "$1" in
     else
       printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -760,6 +786,8 @@ case "$1" in
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
       printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$77' '%77' '101'
     elif [ "$2" = '-p' ] && [ "$5" = '#{session_name}' ]; then
       printf 'detached-session\n'
     elif [ "$2" = '-p' ] && [ "$5" = '#{session_attached}' ]; then
@@ -767,6 +795,17 @@ case "$1" in
     else
       printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -863,11 +902,24 @@ case "$1" in
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
       printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     elif [ "$2" = '-p' ] && [ "$5" = '#{session_name}' ]; then
       printf 'user-owned-session\n'
     else
       printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -921,7 +973,8 @@ case "$1" in
   new-session) printf '%%12\n'; exit 0 ;;
   list-panes) printf '%s\n' '%12 0 101' '%13 0 202'; exit 0 ;;
   split-window) printf '%%13\n'; exit 0 ;;
-  display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; else printf '0\n'; fi; exit 0 ;;
+  display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then printf '%s\t%s\t%s\n' '$12' '%12' '101'; else printf '0\n'; fi; exit 0 ;;
+  if-shell) case "$*" in *'@omx_detached_launch_proof'*) receipt="\${6##*display-message -p -t }"; receipt="\${receipt#* }"; receipt="\${receipt%%\\'*}"; printf '%s\n' "$receipt";; esac; exit 0 ;;
   show-options) printf 'off\n'; exit 0 ;;
   set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
 esac
@@ -984,7 +1037,8 @@ case "$1" in
   new-session) printf '%%12\n'; exit 0 ;;
   list-panes) printf '%s\n' '%12 0 101' '%13 0 202'; exit 0 ;;
   split-window) printf '%%13\n'; exit 0 ;;
-  display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; else printf '0\n'; fi; exit 0 ;;
+  display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then printf '%s\t%s\t%s\n' '$12' '%12' '101'; else printf '0\n'; fi; exit 0 ;;
+  if-shell) case "$*" in *'@omx_detached_launch_proof'*) receipt="\${6##*display-message -p -t }"; receipt="\${receipt#* }"; receipt="\${receipt%%\\'*}"; printf '%s\n' "$receipt";; esac; exit 0 ;;
   show-options) printf 'off\n'; exit 0 ;;
   set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
 esac
@@ -1052,10 +1106,23 @@ case "$1" in
     ;;
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\\n'
+      printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     else
-      printf '0\\n'
+      printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -1159,7 +1226,7 @@ case "$1" in
       TERMINFO_DIRS=/tmp/server-terminfo-dirs \
       TERMCAP=server-termcap \
       sh -c "$last" >/dev/null 2>&1 || true
-    printf 'leader-pane\\n'
+    printf '%%12\n'
     exit 0
     ;;
   split-window)
@@ -1168,10 +1235,23 @@ case "$1" in
     ;;
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\\n'
+      printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     else
-      printf '0\\n'
+      printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -1476,7 +1556,7 @@ case "$1" in
     exit 1
     ;;
   new-session)
-    printf 'leader-pane\n'
+    printf '%%12\n'
     exit 0
     ;;
   split-window)
@@ -1486,9 +1566,22 @@ case "$1" in
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
       printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     else
       printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -1637,9 +1730,22 @@ case "$1" in
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
       printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$1' '%1' '101'
     else
       printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -1679,7 +1785,7 @@ exit 0
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
       assert.match(tmuxLog, /tmux:attach-session -t /);
-      assert.match(tmuxLog, /tmux:kill-session -t /);
+      assert.match(tmuxLog, /tmux:if-shell .*@omx_detached_launch_proof.*kill-session -t /);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1711,9 +1817,22 @@ case "$1" in
   display-message)
     if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
       printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$1' '%1' '101'
     else
       printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${6##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -1750,7 +1869,7 @@ exit 0
       assert.match(result.stderr, /Falling back to direct Codex launch/i);
       assert.match(tmuxLog, /tmux:attach-session -t /);
       assert.match(tmuxLog, /tmux:display-message -p -t .* #\{session_attached\}/);
-      assert.match(tmuxLog, /tmux:kill-session -t /);
+      assert.match(tmuxLog, /tmux:if-shell .*@omx_detached_launch_proof.*kill-session -t /);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1799,7 +1918,7 @@ case "$cmd" in
     if [ -n "\${last:-}" ]; then
       /bin/sh -c "$last"
     fi
-    printf 'leader-pane\\n'
+    printf '%%12\n'
     exit 0
     ;;
   split-window)
@@ -1808,10 +1927,23 @@ case "$cmd" in
     ;;
   display-message)
     if [ "$1" = '-p' ] && [ "$2" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\\n'
+      printf '/tmp/tmux-test.sock\n'
+    elif [ "$1" = '-p' ] && [ "$4" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     else
-      printf '0\\n'
+      printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${5##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
@@ -1894,7 +2026,7 @@ case "$cmd" in
     if [ -n "\${last:-}" ]; then
       /bin/sh -c "$last"
     fi
-    printf 'leader-pane\\n'
+    printf '%%12\n'
     exit 0
     ;;
   split-window)
@@ -1903,10 +2035,23 @@ case "$cmd" in
     ;;
   display-message)
     if [ "$1" = '-p' ] && [ "$2" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\\n'
+      printf '/tmp/tmux-test.sock\n'
+    elif [ "$1" = '-p' ] && [ "$4" = '#{session_id}\t#{pane_id}\t#{pane_pid}' ]; then
+      printf '%s\t%s\t%s\n' '$12' '%12' '101'
     else
-      printf '0\\n'
+      printf '0\n'
     fi
+    exit 0
+    ;;
+  if-shell)
+    case "$*" in
+      *'@omx_detached_launch_proof'*)
+        receipt="\${5##*display-message -p -t }"
+        receipt="\${receipt#* }"
+        receipt="\${receipt%%\\'*}"
+        printf '%s\n' "$receipt"
+        ;;
+    esac
     exit 0
     ;;
   show-options)
