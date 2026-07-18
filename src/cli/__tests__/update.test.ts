@@ -1145,6 +1145,12 @@ describe('runImmediateUpdate', () => {
       assert.deepEqual(revisionPrefixes, [prefix]);
       assert.match(output, /Selected update channel: fork-dev/);
       assert.match(output, /Updated fork-dev channel/);
+      assert.equal(
+        logs.includes(
+          `[omx] Running: clone dev branch, run prepack, then npm install -g --prefix ${prefix} the packed tarball`,
+        ),
+        true,
+      );
       assert.equal(logs.some((line) => /retry manually.*npm install -g/i.test(line)), false);
 
       const stamp = JSON.parse(await readFile(stampPath, 'utf-8')) as {
@@ -1355,6 +1361,48 @@ describe('runImmediateUpdate', () => {
       assert.equal(result.status, 'failed');
       assert.equal(refreshCalls, 1);
       assert.match(logs.join('\n'), /Update installed, but the setup refresh failed/);
+      await assert.rejects(readFile(stampPath, 'utf-8'));
+    } finally {
+      console.log = originalLog;
+      if (typeof originalCodexHome === 'string') {
+        process.env.CODEX_HOME = originalCodexHome;
+      } else {
+        delete process.env.CODEX_HOME;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps fork-dev setup-refresh failure recovery on the prefix-safe update route', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-now-fork-dev-setup-failure-'));
+    const stampPath = join(cwd, '.codex', '.omx', 'install-state.json');
+    const originalCodexHome = process.env.CODEX_HOME;
+    const originalLog = console.log;
+    const logs: string[] = [];
+    const setupPrefixes: Array<string | undefined> = [];
+    const prefix = join(homedir(), '.local');
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(' '));
+    };
+    process.env.CODEX_HOME = join(cwd, '.codex');
+
+    try {
+      const result = await runImmediateUpdate(cwd, {
+        getCurrentVersion: async () => '0.20.3',
+        fetchLatestVersion: async () => '0.20.3',
+        runGlobalUpdate: () => ({ ok: true, stderr: '', revision: 'abcdef123456' }),
+        runSetupRefresh: async (_refreshCwd, installPrefix) => {
+          setupPrefixes.push(installPrefix);
+          return { ok: false, stderr: 'updated setup exited 17' };
+        },
+      }, { channel: 'fork-dev' });
+      const output = logs.join('\n');
+
+      assert.equal(result.status, 'failed');
+      assert.deepEqual(setupPrefixes, [prefix]);
+      assert.match(output, /omx update --fork-dev/);
+      assert.doesNotMatch(output, /Run `omx setup`/);
       await assert.rejects(readFile(stampPath, 'utf-8'));
     } finally {
       console.log = originalLog;

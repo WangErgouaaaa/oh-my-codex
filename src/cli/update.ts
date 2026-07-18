@@ -976,7 +976,10 @@ async function executeUpdate(
   console.log(`[omx] Selected update channel: ${channelConfig.channel}`);
   console.log(`[omx] Install source: ${channelConfig.installSource}`);
   if (developmentChannel) {
-    console.log('[omx] Running: clone dev branch, run prepack, then npm install -g the packed tarball');
+    const installPrefixSuffix = channelConfig.installPrefix
+      ? ` --prefix ${channelConfig.installPrefix}`
+      : '';
+    console.log(`[omx] Running: clone dev branch, run prepack, then npm install -g${installPrefixSuffix} the packed tarball`);
   } else {
     console.log(`[omx] Running: npm install -g ${channelConfig.installSource}`);
   }
@@ -989,8 +992,11 @@ async function executeUpdate(
 
   const setupRefreshResult = await dependencies.runSetupRefresh(cwd, channelConfig.installPrefix);
   if (!setupRefreshResult.ok) {
+    const setupRecovery = channelConfig.channel === 'fork-dev'
+      ? 'Retry with `omx update --fork-dev` to keep the fork update and setup prefix-safe.'
+      : 'Run `omx setup` with the new install.';
     console.log(
-      `[omx] Update installed, but the setup refresh failed. Run \`omx setup\` with the new install. (${setupRefreshResult.stderr})`,
+      `[omx] Update installed, but the setup refresh failed. ${setupRecovery} (${setupRefreshResult.stderr})`,
     );
     return { status: 'failed', currentVersion: current, latestVersion: latest };
   }
