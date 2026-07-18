@@ -348,12 +348,13 @@ function runDevGlobalUpdate(
       return { ok: false, stderr: 'npm pack did not produce an installable tarball.' };
     }
 
-    const globalInstallArgs = ['install', '-g'];
-    if (installPrefix) globalInstallArgs.push('--prefix', installPrefix);
-    globalInstallArgs.push(tarballPath);
-
     const globalInstallResult = spawnNpmSync(
-      globalInstallArgs,
+      [
+        'install',
+        '-g',
+        ...(installPrefix ? ['--prefix', installPrefix] : []),
+        tarballPath,
+      ],
       {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
