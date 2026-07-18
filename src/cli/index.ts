@@ -246,6 +246,8 @@ Usage:
                 Install/rollback to npm stable (oh-my-codex@latest), then refresh setup
   omx update --dev
                 Install the upstream dev branch, then refresh setup
+  omx update --fork-dev
+                Install WangErgouaaaa/oh-my-codex#dev under ~/.local, then refresh setup
   omx uninstall Remove OMX configuration and clean up installed artifacts
   omx doctor    Check installation health
   omx list      List packaged OMX skills and native agent prompts (--json)
@@ -742,6 +744,7 @@ export function resolveUpdateChannelArg(args: string[]): UpdateChannel {
   let channel: UpdateChannel = 'stable';
   let sawStable = false;
   let sawDev = false;
+  let sawForkDev = false;
 
   for (const arg of args) {
     if (arg === '--stable') {
@@ -754,13 +757,18 @@ export function resolveUpdateChannelArg(args: string[]): UpdateChannel {
       channel = 'dev';
       continue;
     }
+    if (arg === '--fork-dev') {
+      sawForkDev = true;
+      channel = 'fork-dev';
+      continue;
+    }
     throw new Error(
-      `Unknown omx update option: ${arg}. Expected no flags, --stable, or --dev.`,
+      `Unknown omx update option: ${arg}. Expected no flags, --stable, --dev, or --fork-dev.`,
     );
   }
 
-  if (sawStable && sawDev) {
-    throw new Error('omx update --dev and --stable are mutually exclusive.');
+  if (Number(sawStable) + Number(sawDev) + Number(sawForkDev) > 1) {
+    throw new Error('omx update --stable, --dev, and --fork-dev are mutually exclusive.');
   }
 
   return channel;
