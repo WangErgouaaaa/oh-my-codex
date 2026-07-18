@@ -580,12 +580,15 @@ function summarizeUpdateFailure(
   logPath?: string,
 ): string {
   const details = stderr.trim().split(/\r?\n/).filter(Boolean).slice(0, 3).join(' | ');
-  if (installSource === DEV_INSTALL_SOURCE) {
+  if (installSource === DEV_INSTALL_SOURCE || installSource === FORK_DEV_INSTALL_SOURCE) {
+    const forkDev = installSource === FORK_DEV_INSTALL_SOURCE;
+    const repositoryUrl = forkDev ? FORK_DEV_REPOSITORY_URL : DEV_REPOSITORY_URL;
+    const retryFlag = forkDev ? '--fork-dev' : '--dev';
     return [
-      `[omx] Update failed while building and installing the dev channel from ${DEV_REPOSITORY_URL}#${DEV_REPOSITORY_BRANCH}.`,
+      `[omx] Update failed while building and installing the dev channel from ${repositoryUrl}#${DEV_REPOSITORY_BRANCH}.`,
       details ? `[omx] update stderr: ${details}` : undefined,
       logPath ? `[omx] Full log: ${logPath}` : undefined,
-      '[omx] You can retry manually with: omx update --dev',
+      `[omx] You can retry manually with: omx update ${retryFlag}`,
     ].filter((line): line is string => typeof line === 'string').join('\n');
   }
   return [
@@ -616,7 +619,7 @@ interface UpdateDependencies {
   readUserInstallStamp: typeof readUserInstallStamp;
   runGlobalUpdate: (installSource: string) => RunGlobalUpdateResult;
   runDeferredGlobalUpdate: typeof runDeferredGlobalUpdate;
-  runSetupRefresh: (cwd: string) => Promise<RunSetupRefreshResult>;
+  runSetupRefresh: (cwd: string, installPrefix?: string) => Promise<RunSetupRefreshResult>;
   writeUpdateState: typeof writeUpdateState;
 }
 
@@ -672,7 +675,9 @@ export async function readUserInstallStamp(
       ...(typeof parsed.setup_completed_version === 'string'
         ? { setup_completed_version: parsed.setup_completed_version }
         : {}),
-      ...(parsed.install_channel === 'stable' || parsed.install_channel === 'dev'
+      ...(parsed.install_channel === 'stable'
+        || parsed.install_channel === 'dev'
+        || parsed.install_channel === 'fork-dev'
         ? { install_channel: parsed.install_channel }
         : {}),
       ...(typeof parsed.install_source === 'string'
@@ -728,7 +733,7 @@ function resolveUpdateCheckBaseline(
   // latest alone. A dev baseline is install metadata, so only a matching dev
   // stamp written by a successful dev update can raise the comparison baseline.
   if (
-    stamp?.install_channel === 'dev' &&
+    isDevelopmentChannel(stamp?.install_channel ?? 'stable') &&
     stampVersion === current &&
     devBaseVersion &&
     isNewerVersion(current, devBaseVersion)
@@ -742,9 +747,12 @@ function resolveUpdateCheckBaseline(
 export function resolveGlobalInstallRoot(
   spawnProcess: SpawnSyncLike = spawnSync,
   platform: NodeJS.Platform = process.platform,
+  installPrefix?: string,
 ): string | null {
+  const args = ['root', '-g'];
+  if (installPrefix) args.push('--prefix', installPrefix);
   const result = spawnNpmSync(
-    ['root', '-g'],
+    args,
     {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -763,8 +771,8 @@ export function resolveGlobalInstallRoot(
   return root === '' ? null : root;
 }
 
-async function getInstalledVersionAfterUpdate(): Promise<string | null> {
-  const globalInstallRoot = resolveGlobalInstallRoot();
+async function getInstalledVersionAfterUpdate(installPrefix?: string): Promise<string | null> {
+  const globalInstallRoot = resolveGlobalInstallRoot(spawnSync, process.platform, installPrefix);
   if (!globalInstallRoot) return null;
 
   try {
@@ -779,8 +787,8 @@ async function getInstalledVersionAfterUpdate(): Promise<string | null> {
   }
 }
 
-async function getInstalledRevisionAfterUpdate(): Promise<string | null> {
-  const globalInstallRoot = resolveGlobalInstallRoot();
+async function getInstalledRevisionAfterUpdate(installPrefix?: string): Promise<string | null> {
+  const globalInstallRoot = resolveGlobalInstallRoot(spawnSync, process.platform, installPrefix);
   if (!globalInstallRoot) return null;
 
   try {
@@ -846,8 +854,8 @@ export function spawnInstalledSetupRefresh(
   return { ok: true, stderr: '' };
 }
 
-async function runSetupRefresh(cwd: string): Promise<RunSetupRefreshResult> {
-  const globalInstallRoot = resolveGlobalInstallRoot();
+async function runSetupRefresh(cwd: string, installPrefix?: string): Promise<RunSetupRefreshResult> {
+  const globalInstallRoot = resolveGlobalInstallRoot(spawnSync, process.platform, installPrefix);
   if (!globalInstallRoot) {
     return {
       ok: false,
@@ -887,9 +895,12 @@ async function executeUpdate(
     nowMs = Date.now(),
   } = options;
   const channelConfig = resolveUpdateChannelConfig(channel);
+  const developmentChannel = isDevelopmentChannel(channel);
   const [current, latest] = await Promise.all([
     dependencies.getCurrentVersion(),
-    channel === 'stable' || !forceInstall || channel === 'dev' ? dependencies.fetchLatestVersion() : Promise.resolve(null),
+    channel === 'stable' || !forceInstall || developmentChannel
+      ? dependencies.fetchLatestVersion()
+      : Promise.resolve(null),
   ]);
   const installStamp = await dependencies.readUserInstallStamp();
   const updateCheckBaseline = !forceInstall
@@ -962,14 +973,9 @@ async function executeUpdate(
     return { status: 'scheduled', currentVersion: current, latestVersion: latest };
   }
 
-  if (channelConfig.channel === 'fork-dev') {
-    console.log('[omx] The fork-dev update route is unavailable until prefix-safe installation is active.');
-    return { status: 'failed', currentVersion: current, latestVersion: latest };
-  }
-
   console.log(`[omx] Selected update channel: ${channelConfig.channel}`);
   console.log(`[omx] Install source: ${channelConfig.installSource}`);
-  if (channelConfig.channel === 'dev') {
+  if (developmentChannel) {
     console.log('[omx] Running: clone dev branch, run prepack, then npm install -g the packed tarball');
   } else {
     console.log(`[omx] Running: npm install -g ${channelConfig.installSource}`);
@@ -981,7 +987,7 @@ async function executeUpdate(
     return { status: 'failed', currentVersion: current, latestVersion: latest };
   }
 
-  const setupRefreshResult = await dependencies.runSetupRefresh(cwd);
+  const setupRefreshResult = await dependencies.runSetupRefresh(cwd, channelConfig.installPrefix);
   if (!setupRefreshResult.ok) {
     console.log(
       `[omx] Update installed, but the setup refresh failed. Run \`omx setup\` with the new install. (${setupRefreshResult.stderr})`,
@@ -989,11 +995,11 @@ async function executeUpdate(
     return { status: 'failed', currentVersion: current, latestVersion: latest };
   }
 
-  const installedVersion = await dependencies.getInstalledVersionAfterUpdate();
-  const installedRevision = channelConfig.channel === 'dev'
-    ? ((await dependencies.getInstalledRevisionAfterUpdate()) ?? result.revision ?? null)
+  const installedVersion = await dependencies.getInstalledVersionAfterUpdate(channelConfig.installPrefix);
+  const installedRevision = developmentChannel
+    ? ((await dependencies.getInstalledRevisionAfterUpdate(channelConfig.installPrefix)) ?? result.revision ?? null)
     : null;
-  const devBaseVersion = channelConfig.channel === 'dev'
+  const devBaseVersion = developmentChannel
     ? (latest && installedVersion
         ? (isNewerVersion(latest, installedVersion) ? installedVersion : latest)
         : latest)
@@ -1005,10 +1011,10 @@ async function executeUpdate(
     await writeSuccessfulInstallStamp(stampVersion, {
       channel: channelConfig.channel,
       source: channelConfig.installSource,
-      revision: channelConfig.channel === 'dev' ? installedRevision : null,
+      revision: developmentChannel ? installedRevision : null,
       devBaseVersion,
     });
-  } else if (channelConfig.channel === 'dev') {
+  } else if (developmentChannel) {
     console.log(
       '[omx] Dev update completed, but the installed package version could not be determined for the setup stamp.',
     );
@@ -1019,7 +1025,7 @@ async function executeUpdate(
   console.log(
     `[omx] Updated ${channelConfig.channel} channel${versionSummary}. Restart to use new code.`,
   );
-  if (channelConfig.channel === 'dev') {
+  if (developmentChannel) {
     console.log('[omx] Dev display version may differ from the package/plugin manifest version; start a new Codex session if /skills still shows stale OMX plugin skill metadata.');
   }
   return { status: 'updated', currentVersion: current, latestVersion: latest };

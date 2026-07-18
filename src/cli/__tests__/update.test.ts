@@ -450,40 +450,45 @@ describe('maybeCheckAndPromptUpdate', () => {
     }
   });
 
-  it('treats a current dev install dev_base_version as the launch update baseline', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-dev-baseline-'));
-    let promptCalls = 0;
-    let updateAttempts = 0;
+  it('treats current development installs dev_base_version as the launch update baseline', async () => {
+    for (const [channel, source] of [
+      ['dev', 'github:Yeachan-Heo/oh-my-codex#dev'],
+      ['fork-dev', 'github:WangErgouaaaa/oh-my-codex#dev'],
+    ] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-update-${channel}-baseline-`));
+      let promptCalls = 0;
+      let updateAttempts = 0;
 
-    try {
-      await withInteractiveTty(async () => {
-        await maybeCheckAndPromptUpdate(cwd, {
-          getCurrentVersion: async () => '0.18.10',
-          fetchLatestVersion: async () => '0.18.11',
-          readUserInstallStamp: async () => ({
-            installed_version: '0.18.10',
-            setup_completed_version: '0.18.10',
-            install_channel: 'dev',
-            install_source: 'github:Yeachan-Heo/oh-my-codex#dev',
-            install_revision: '8214377e3c1d',
-            dev_base_version: '0.18.11',
-            updated_at: '2026-06-09T20:21:24.070Z',
-          }),
-          askYesNo: async () => {
-            promptCalls += 1;
-            return true;
-          },
-          runDeferredGlobalUpdate: () => {
-            updateAttempts += 1;
-            return { ok: true, stderr: '', logPath: join(cwd, '.omx', 'logs', 'update-test.log') };
-          },
+      try {
+        await withInteractiveTty(async () => {
+          await maybeCheckAndPromptUpdate(cwd, {
+            getCurrentVersion: async () => '0.18.10',
+            fetchLatestVersion: async () => '0.18.11',
+            readUserInstallStamp: async () => ({
+              installed_version: '0.18.10',
+              setup_completed_version: '0.18.10',
+              install_channel: channel,
+              install_source: source,
+              install_revision: '8214377e3c1d',
+              dev_base_version: '0.18.11',
+              updated_at: '2026-06-09T20:21:24.070Z',
+            }),
+            askYesNo: async () => {
+              promptCalls += 1;
+              return true;
+            },
+            runDeferredGlobalUpdate: () => {
+              updateAttempts += 1;
+              return { ok: true, stderr: '', logPath: join(cwd, '.omx', 'logs', 'update-test.log') };
+            },
+          });
         });
-      });
 
-      assert.equal(promptCalls, 0);
-      assert.equal(updateAttempts, 0);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
+        assert.equal(promptCalls, 0, channel);
+        assert.equal(updateAttempts, 0, channel);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
     }
   });
 
@@ -861,6 +866,25 @@ describe('direct npm spawn fallback', () => {
     assert.deepEqual(calls[0].args, ['root', '-g']);
     assert.deepEqual(calls[1].args, ['root', '-g']);
   });
+
+  it('uses the requested prefix when resolving the global install root', () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const prefix = join(homedir(), '.local');
+    const expectedRoot = join(prefix, 'lib', 'node_modules');
+
+    const root = resolveGlobalInstallRoot(
+      ((command: string, args: readonly string[]) => {
+        calls.push({ command, args: args as string[] });
+        return okResult(`${expectedRoot}\n`);
+      }) as unknown as typeof import('node:child_process').spawnSync,
+      'linux',
+      prefix,
+    );
+
+    assert.equal(root, expectedRoot);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].args, ['root', '-g', '--prefix', prefix]);
+  });
 });
 
 describe('runImmediateUpdate', () => {
@@ -1073,13 +1097,17 @@ describe('runImmediateUpdate', () => {
     }
   });
 
-  it('fails fork-dev before logging or invoking update execution', async () => {
+  it('keeps the full fork-dev lifecycle under the user-local prefix', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-update-now-fork-dev-'));
+    const stampPath = join(cwd, '.codex', '.omx', 'install-state.json');
     const originalCodexHome = process.env.CODEX_HOME;
     const originalLog = console.log;
     const logs: string[] = [];
-    let updateCalls = 0;
-    let refreshCalls = 0;
+    const installSources: string[] = [];
+    const setupPrefixes: Array<string | undefined> = [];
+    const versionPrefixes: Array<string | undefined> = [];
+    const revisionPrefixes: Array<string | undefined> = [];
+    const prefix = join(homedir(), '.local');
 
     console.log = (...args: unknown[]) => {
       logs.push(args.map((arg) => String(arg)).join(' '));
@@ -1088,24 +1116,52 @@ describe('runImmediateUpdate', () => {
 
     try {
       const result = await runImmediateUpdate(cwd, {
-        getCurrentVersion: async () => '0.14.0',
-        runGlobalUpdate: () => {
-          updateCalls += 1;
+        getCurrentVersion: async () => '0.20.3',
+        fetchLatestVersion: async () => '0.20.3',
+        runGlobalUpdate: (installSource) => {
+          installSources.push(installSource);
+          return { ok: true, stderr: '', revision: 'abcdef123456' };
+        },
+        runSetupRefresh: async (refreshCwd, installPrefix) => {
+          assert.equal(refreshCwd, cwd);
+          setupPrefixes.push(installPrefix);
           return { ok: true, stderr: '' };
         },
-        runSetupRefresh: async () => {
-          refreshCalls += 1;
-          return { ok: true, stderr: '' };
+        getInstalledVersionAfterUpdate: async (installPrefix) => {
+          versionPrefixes.push(installPrefix);
+          return '0.20.3';
+        },
+        getInstalledRevisionAfterUpdate: async (installPrefix) => {
+          revisionPrefixes.push(installPrefix);
+          return null;
         },
       }, { channel: 'fork-dev' });
       const output = logs.join('\n');
 
-      assert.equal(updateCalls, 0);
-      assert.equal(refreshCalls, 0);
-      assert.equal(result.status, 'failed');
-      assert.match(output, /fork-dev.*unavailable/i);
-      assert.doesNotMatch(output, /Running:/);
-      assert.doesNotMatch(output, /npm install -g github:WangErgouaaaa\/oh-my-codex#dev/);
+      assert.equal(result.status, 'updated');
+      assert.deepEqual(installSources, ['github:WangErgouaaaa/oh-my-codex#dev']);
+      assert.deepEqual(setupPrefixes, [prefix]);
+      assert.deepEqual(versionPrefixes, [prefix]);
+      assert.deepEqual(revisionPrefixes, [prefix]);
+      assert.match(output, /Selected update channel: fork-dev/);
+      assert.match(output, /Updated fork-dev channel/);
+      assert.equal(logs.some((line) => /retry manually.*npm install -g/i.test(line)), false);
+
+      const stamp = JSON.parse(await readFile(stampPath, 'utf-8')) as {
+        installed_version: string;
+        setup_completed_version: string;
+        install_channel: string;
+        install_source: string;
+        install_revision: string;
+        dev_base_version: string;
+      };
+      assert.equal(stamp.installed_version, '0.20.3');
+      assert.equal(stamp.setup_completed_version, '0.20.3');
+      assert.equal(stamp.install_channel, 'fork-dev');
+      assert.equal(stamp.install_source, 'github:WangErgouaaaa/oh-my-codex#dev');
+      assert.equal(stamp.install_revision, 'abcdef123456');
+      assert.equal(stamp.dev_base_version, '0.20.3');
+      assert.equal((await readUserInstallStamp(stampPath))?.install_channel, 'fork-dev');
     } finally {
       console.log = originalLog;
       if (typeof originalCodexHome === 'string') {
@@ -1339,6 +1395,39 @@ describe('runImmediateUpdate failure diagnostics', () => {
       assert.match(logs.join('\n'), /Update failed while running npm install -g oh-my-codex@latest/);
       assert.match(logs.join('\n'), /npm stderr: EPERM: file is locked/);
       assert.match(logs.join('\n'), /npm install -g oh-my-codex@latest && omx setup/);
+    } finally {
+      console.log = originalLog;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps fork-dev failure guidance on the fork repository and retry flag', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-now-fork-dev-failure-'));
+    const originalLog = console.log;
+    const logs: string[] = [];
+    let refreshCalls = 0;
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(' '));
+    };
+
+    try {
+      const result = await runImmediateUpdate(cwd, {
+        getCurrentVersion: async () => '0.20.3',
+        fetchLatestVersion: async () => '0.20.3',
+        runGlobalUpdate: () => ({ ok: false, stderr: 'git clone exited 128' }),
+        runSetupRefresh: async () => {
+          refreshCalls += 1;
+          return { ok: true, stderr: '' };
+        },
+      }, { channel: 'fork-dev' });
+      const output = logs.join('\n');
+
+      assert.equal(result.status, 'failed');
+      assert.equal(refreshCalls, 0);
+      assert.match(output, /WangErgouaaaa\/oh-my-codex\.git#dev/);
+      assert.match(output, /omx update --fork-dev/);
+      assert.equal(logs.some((line) => line.endsWith('omx update --dev')), false);
     } finally {
       console.log = originalLog;
       await rm(cwd, { recursive: true, force: true });
