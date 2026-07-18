@@ -163,6 +163,7 @@ describe('package bin contract', () => {
     assert.match(compiledCliSource, /omx update\s+Install the stable channel now, then refresh setup/);
     assert.match(compiledCliSource, /omx update --stable\s+Install\/rollback to npm stable \(oh-my-codex@latest\), then refresh setup/);
     assert.match(compiledCliSource, /omx update --dev\s+Install the upstream dev branch, then refresh setup/);
+    assert.match(compiledCliSource, /omx update --fork-dev\s+Install WangErgouaaaa\/oh-my-codex#dev under ~\/\.local, then refresh setup/);
     assert.match(compiledCliSource, /case "update"/);
 
     rmSync(packagedSparkShellPath, { force: true });

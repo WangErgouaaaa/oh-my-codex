@@ -9,7 +9,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
 import { dirname, join } from 'path';
-import { tmpdir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { spawn, spawnSync } from 'child_process';
 import { createInterface } from 'readline/promises';
 import { getPackageRoot } from '../utils/package.js';
@@ -49,11 +49,12 @@ export interface UpdateExecutionResult {
   latestVersion: string | null;
 }
 
-export type UpdateChannel = 'stable' | 'dev';
+export type UpdateChannel = 'stable' | 'dev' | 'fork-dev';
 
 export interface UpdateChannelConfig {
   channel: UpdateChannel;
   installSource: string;
+  installPrefix?: string;
 }
 
 type RunGlobalUpdateResult = { ok: boolean; stderr: string; revision?: string | null };
@@ -69,11 +70,25 @@ const CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12h
 const STABLE_INSTALL_SOURCE = `${PACKAGE_NAME}@latest`;
 const DEV_INSTALL_SOURCE = 'github:Yeachan-Heo/oh-my-codex#dev';
 const DEV_REPOSITORY_URL = 'https://github.com/Yeachan-Heo/oh-my-codex.git';
+const FORK_DEV_INSTALL_SOURCE = 'github:WangErgouaaaa/oh-my-codex#dev';
+const FORK_DEV_REPOSITORY_URL = 'https://github.com/WangErgouaaaa/oh-my-codex.git';
+const FORK_DEV_INSTALL_PREFIX = join(homedir(), '.local');
 const DEV_REPOSITORY_BRANCH = 'dev';
 const DEV_UPDATE_TIMEOUT_MS = 300000;
 const SKIP_NATIVE_AGENT_REFRESH_ENV = 'OMX_SKIP_NATIVE_AGENT_REFRESH';
 
+function isDevelopmentChannel(channel: UpdateChannel): boolean {
+  return channel === 'dev' || channel === 'fork-dev';
+}
+
 export function resolveUpdateChannelConfig(channel: UpdateChannel = 'stable'): UpdateChannelConfig {
+  if (channel === 'fork-dev') {
+    return {
+      channel: 'fork-dev',
+      installSource: FORK_DEV_INSTALL_SOURCE,
+      installPrefix: FORK_DEV_INSTALL_PREFIX,
+    };
+  }
   if (channel === 'dev') {
     return { channel: 'dev', installSource: DEV_INSTALL_SOURCE };
   }

@@ -1924,8 +1924,17 @@ describe("resolveCliInvocation", () => {
     assert.equal(resolveUpdateChannelArg([]), "stable");
     assert.equal(resolveUpdateChannelArg(["--stable"]), "stable");
     assert.equal(resolveUpdateChannelArg(["--dev"]), "dev");
+    assert.equal(resolveUpdateChannelArg(["--fork-dev"]), "fork-dev");
     assert.throws(
       () => resolveUpdateChannelArg(["--dev", "--stable"]),
+      /mutually exclusive/,
+    );
+    assert.throws(
+      () => resolveUpdateChannelArg(["--fork-dev", "--stable"]),
+      /mutually exclusive/,
+    );
+    assert.throws(
+      () => resolveUpdateChannelArg(["--fork-dev", "--dev"]),
       /mutually exclusive/,
     );
     assert.throws(
@@ -1987,6 +1996,7 @@ describe("resolveCliInvocation", () => {
     assert.match(HELP, /omx update\s+Install the stable channel now, then refresh setup/);
     assert.match(HELP, /omx update --stable\s+Install\/rollback to npm stable \(oh-my-codex@latest\), then refresh setup/);
     assert.match(HELP, /omx update --dev\s+Install the upstream dev branch, then refresh setup/);
+    assert.match(HELP, /omx update --fork-dev\s+Install WangErgouaaaa\/oh-my-codex#dev under ~\/\.local, then refresh setup/);
   });
 
   it("advertises concise launch policy controls in top-level help", () => {

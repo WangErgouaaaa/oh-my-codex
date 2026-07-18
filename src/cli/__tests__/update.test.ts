@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import {
   isInstallVersionBump,
   isNewerVersion,
@@ -12,6 +12,7 @@ import {
   resolveAutoUpdateMode,
   resolveGlobalInstallRoot,
   resolveInstalledCliEntry,
+  resolveUpdateChannelConfig,
   formatDeferredSetupCommand,
   resolveSetupRefreshArgs,
   runDeferredGlobalUpdate,
@@ -23,6 +24,16 @@ import {
 } from '../update.js';
 
 const PACKAGE_NAME = 'oh-my-codex';
+
+describe('resolveUpdateChannelConfig', () => {
+  it('pins fork-dev to the custom dev source under the user-local prefix', () => {
+    assert.deepEqual(resolveUpdateChannelConfig('fork-dev' as never), {
+      channel: 'fork-dev',
+      installSource: 'github:WangErgouaaaa/oh-my-codex#dev',
+      installPrefix: join(homedir(), '.local'),
+    });
+  });
+});
 
 describe('isNewerVersion', () => {
   it('returns true when latest has higher major', () => {
