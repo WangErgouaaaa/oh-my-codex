@@ -725,6 +725,22 @@ describe('direct npm spawn fallback', () => {
     assert.deepEqual(calls, ['npm']);
   });
 
+  it('fails closed before fork-dev update routing is available', () => {
+    const calls: string[] = [];
+
+    const result = runGlobalUpdate(
+      'github:WangErgouaaaa/oh-my-codex#dev',
+      ((command: string) => {
+        calls.push(command);
+        return okResult();
+      }) as unknown as typeof import('node:child_process').spawnSync,
+      'linux',
+    );
+
+    assert.deepEqual(calls, []);
+    assert.equal(result.ok, false);
+    assert.match(result.stderr, /Fork dev update routing is unavailable/);
+  });
 
   it('packs the dev branch from a local checkout instead of globally installing the git dependency spec', () => {
     const originalNpmLocation = process.env.npm_config_location;

@@ -395,6 +395,9 @@ export function runGlobalUpdate(
       ? spawnProcessOrPlatform
       : platform;
 
+  if (installSource === FORK_DEV_INSTALL_SOURCE) {
+    return { ok: false, stderr: 'Fork dev update routing is unavailable.' };
+  }
   if (installSource === DEV_INSTALL_SOURCE) {
     return runDevGlobalUpdate(spawnProcess, resolvedPlatform);
   }
