@@ -951,6 +951,11 @@ async function executeUpdate(
     return { status: 'scheduled', currentVersion: current, latestVersion: latest };
   }
 
+  if (channelConfig.channel === 'fork-dev') {
+    console.log('[omx] The fork-dev update route is unavailable until prefix-safe installation is active.');
+    return { status: 'failed', currentVersion: current, latestVersion: latest };
+  }
+
   console.log(`[omx] Selected update channel: ${channelConfig.channel}`);
   console.log(`[omx] Install source: ${channelConfig.installSource}`);
   if (channelConfig.channel === 'dev') {

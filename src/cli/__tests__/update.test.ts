@@ -27,7 +27,7 @@ const PACKAGE_NAME = 'oh-my-codex';
 
 describe('resolveUpdateChannelConfig', () => {
   it('pins fork-dev to the custom dev source under the user-local prefix', () => {
-    assert.deepEqual(resolveUpdateChannelConfig('fork-dev' as never), {
+    assert.deepEqual(resolveUpdateChannelConfig('fork-dev'), {
       channel: 'fork-dev',
       installSource: 'github:WangErgouaaaa/oh-my-codex#dev',
       installPrefix: join(homedir(), '.local'),
@@ -1032,6 +1032,50 @@ describe('runImmediateUpdate', () => {
       };
       assert.equal(stamp.installed_version, '0.14.0');
       assert.equal(stamp.setup_completed_version, '0.14.0');
+    } finally {
+      console.log = originalLog;
+      if (typeof originalCodexHome === 'string') {
+        process.env.CODEX_HOME = originalCodexHome;
+      } else {
+        delete process.env.CODEX_HOME;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails fork-dev before logging or invoking update execution', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-now-fork-dev-'));
+    const originalCodexHome = process.env.CODEX_HOME;
+    const originalLog = console.log;
+    const logs: string[] = [];
+    let updateCalls = 0;
+    let refreshCalls = 0;
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(' '));
+    };
+    process.env.CODEX_HOME = join(cwd, '.codex');
+
+    try {
+      const result = await runImmediateUpdate(cwd, {
+        getCurrentVersion: async () => '0.14.0',
+        runGlobalUpdate: () => {
+          updateCalls += 1;
+          return { ok: true, stderr: '' };
+        },
+        runSetupRefresh: async () => {
+          refreshCalls += 1;
+          return { ok: true, stderr: '' };
+        },
+      }, { channel: 'fork-dev' });
+      const output = logs.join('\n');
+
+      assert.equal(updateCalls, 0);
+      assert.equal(refreshCalls, 0);
+      assert.equal(result.status, 'failed');
+      assert.match(output, /fork-dev.*unavailable/i);
+      assert.doesNotMatch(output, /Running:/);
+      assert.doesNotMatch(output, /npm install -g github:WangErgouaaaa\/oh-my-codex#dev/);
     } finally {
       console.log = originalLog;
       if (typeof originalCodexHome === 'string') {
