@@ -725,21 +725,51 @@ describe('direct npm spawn fallback', () => {
     assert.deepEqual(calls, ['npm']);
   });
 
-  it('fails closed before fork-dev update routing is available', () => {
-    const calls: string[] = [];
+  it('builds fork-dev from the custom repository and installs only the tarball under the user prefix', () => {
+    const calls: Array<{ command: string; args: string[]; cwd?: string }> = [];
 
     const result = runGlobalUpdate(
       'github:WangErgouaaaa/oh-my-codex#dev',
-      ((command: string) => {
-        calls.push(command);
+      ((command: string, args: readonly string[], options?: { cwd?: string }) => {
+        calls.push({ command, args: args as string[], cwd: options?.cwd });
+        if (command === 'git' && args[0] === 'clone') {
+          mkdirSync(String(args[args.length - 1]), { recursive: true });
+        }
+        if (command === 'git' && args[0] === 'rev-parse') {
+          return okResult('abcdef1234567890\n');
+        }
+        if (command === 'npm' && args[0] === 'pack') {
+          writeFileSync(join(options?.cwd ?? process.cwd(), 'oh-my-codex-0.20.3.tgz'), 'packed');
+          return okResult(JSON.stringify([{ filename: 'oh-my-codex-0.20.3.tgz' }]));
+        }
         return okResult();
       }) as unknown as typeof import('node:child_process').spawnSync,
       'linux',
     );
 
-    assert.deepEqual(calls, []);
-    assert.equal(result.ok, false);
-    assert.match(result.stderr, /Fork dev update routing is unavailable/);
+    assert.equal(result.ok, true);
+    const cloneCall = calls.find((call) => call.command === 'git' && call.args[0] === 'clone');
+    assert.deepEqual(cloneCall?.args.slice(0, 6), [
+      'clone',
+      '--depth',
+      '1',
+      '--branch',
+      'dev',
+      'https://github.com/WangErgouaaaa/oh-my-codex.git',
+    ]);
+    const finalCall = calls[calls.length - 1];
+    assert.equal(finalCall.command, 'npm');
+    assert.deepEqual(finalCall.args.slice(0, 4), [
+      'install',
+      '-g',
+      '--prefix',
+      join(homedir(), '.local'),
+    ]);
+    assert.match(finalCall.args[finalCall.args.length - 1], /oh-my-codex-0\.20\.3\.tgz$/);
+    assert.equal(
+      calls.some((call) => call.args.includes('https://github.com/Yeachan-Heo/oh-my-codex.git')),
+      false,
+    );
   });
 
   it('packs the dev branch from a local checkout instead of globally installing the git dependency spec', () => {

@@ -232,8 +232,10 @@ function commandFailure(stderr: unknown, status: number | null, label: string): 
 }
 
 function runDevGlobalUpdate(
-  spawnProcess: SpawnSyncLike = spawnSync,
-  platform: NodeJS.Platform = process.platform,
+  repositoryUrl: string,
+  installPrefix: string | undefined,
+  spawnProcess: SpawnSyncLike,
+  platform: NodeJS.Platform,
 ): RunGlobalUpdateResult {
   const tempRoot = mkdtempSync(join(tmpdir(), 'omx-dev-update-'));
   const checkoutDir = join(tempRoot, 'checkout');
@@ -241,7 +243,7 @@ function runDevGlobalUpdate(
   try {
     const cloneResult = spawnProcess(
       'git',
-      ['clone', '--depth', '1', '--branch', DEV_REPOSITORY_BRANCH, DEV_REPOSITORY_URL, checkoutDir],
+      ['clone', '--depth', '1', '--branch', DEV_REPOSITORY_BRANCH, repositoryUrl, checkoutDir],
       {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -346,8 +348,12 @@ function runDevGlobalUpdate(
       return { ok: false, stderr: 'npm pack did not produce an installable tarball.' };
     }
 
+    const globalInstallArgs = ['install', '-g'];
+    if (installPrefix) globalInstallArgs.push('--prefix', installPrefix);
+    globalInstallArgs.push(tarballPath);
+
     const globalInstallResult = spawnNpmSync(
-      ['install', '-g', tarballPath],
+      globalInstallArgs,
       {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -395,11 +401,16 @@ export function runGlobalUpdate(
       ? spawnProcessOrPlatform
       : platform;
 
-  if (installSource === FORK_DEV_INSTALL_SOURCE) {
-    return { ok: false, stderr: 'Fork dev update routing is unavailable.' };
-  }
   if (installSource === DEV_INSTALL_SOURCE) {
-    return runDevGlobalUpdate(spawnProcess, resolvedPlatform);
+    return runDevGlobalUpdate(DEV_REPOSITORY_URL, undefined, spawnProcess, resolvedPlatform);
+  }
+  if (installSource === FORK_DEV_INSTALL_SOURCE) {
+    return runDevGlobalUpdate(
+      FORK_DEV_REPOSITORY_URL,
+      FORK_DEV_INSTALL_PREFIX,
+      spawnProcess,
+      resolvedPlatform,
+    );
   }
 
   const result = spawnGlobalNpmInstallSync(
