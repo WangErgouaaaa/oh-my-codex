@@ -722,12 +722,6 @@ function isStartCompatible(existing: SessionState, requestedSessionId: string): 
     || currentOwnerAlias(existing) === requestedSessionId;
 }
 
-function getOmxLaunchSessionId(state: SessionState): string | undefined {
-  if (state.session_id.startsWith('omx-')) return state.session_id;
-  const owner = currentOwnerAlias(state);
-  return owner?.startsWith('omx-') ? owner : undefined;
-}
-
 interface SessionPointerLockOwnerV1 {
   version: 1;
   token: string;
@@ -1410,15 +1404,10 @@ export async function writeSessionStart(
   return result.value;
 }
 
-interface NativeReconcileTransition {
-  state: SessionState;
-  replacementLog?: Record<string, unknown>;
-}
-
 function reconcileNativeTransition(
   nativeSessionId: string,
   options: SessionStartOptions,
-): (pointer: SessionPointerReadResult, context: SessionPointerContext) => NativeReconcileTransition {
+): (pointer: SessionPointerReadResult, context: SessionPointerContext) => SessionState {
   return (pointer, context) => {
     if (pointer.status !== 'absent' && pointer.status !== 'stale-dead' && pointer.status !== 'usable') {
       throw unusablePointerAbort(context, nativeSessionId, pointer);
@@ -1433,38 +1422,15 @@ function reconcileNativeTransition(
     if (!existing) {
       const ownerCandidate = verifiedOwnerCandidate(context, options);
       const ownerOmxSessionId = ownerCandidate;
-      return {
-        state: createSessionState(context.cwd, nativeSessionId, pid, platform, linuxIdentity, {
-          nativeSessionId,
-          ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
-        }),
-      };
+      return createSessionState(context.cwd, nativeSessionId, pid, platform, linuxIdentity, {
+        nativeSessionId,
+        ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
+      });
     }
 
     const existingNativeSessionId = normalizeSessionId(existing.native_session_id);
     if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
-      const ownerOmxSessionId = getOmxLaunchSessionId(existing);
-      return {
-        state: createSessionState(context.cwd, nativeSessionId, pid, platform, linuxIdentity, {
-          nativeSessionId,
-          ...(ownerOmxSessionId ? {
-            previousNativeSessionId: existingNativeSessionId,
-            nativeSessionSwitchedAt: nowIso,
-            ownerOmxSessionId,
-          } : {}),
-        }),
-        ...(ownerOmxSessionId ? {
-          replacementLog: {
-            event: 'native_session_replaced',
-            session_id: ownerOmxSessionId,
-            ...(existing.session_id !== ownerOmxSessionId ? { active_session_id: existing.session_id } : {}),
-            previous_native_session_id: existingNativeSessionId,
-            replaced_by_native_session_id: nativeSessionId,
-            pid,
-            timestamp: nowIso,
-          },
-        } : {}),
-      };
+      throw ownerConflictAbort(context, nativeSessionId, existing);
     }
 
     const ownerCandidate = verifiedOwnerCandidate(context, options);
@@ -1479,18 +1445,16 @@ function reconcileNativeTransition(
       throw ownerConflictAbort(context, nativeSessionId, existing, error);
     }
 
-    return {
-      state: createSessionState(context.cwd, existing.session_id, pid, platform, linuxIdentity, {
-        nowIso,
-        nativeSessionId,
-        previousNativeSessionId: existing.previous_native_session_id,
-        nativeSessionSwitchedAt: existing.native_session_switched_at,
-        ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
-        startedAt: existing.started_at,
-        tmuxSessionName: existing.tmux_session_name,
-        tmuxPaneId: existing.tmux_pane_id,
-      }),
-    };
+    return createSessionState(context.cwd, existing.session_id, pid, platform, linuxIdentity, {
+      nowIso,
+      nativeSessionId,
+      previousNativeSessionId: existing.previous_native_session_id,
+      nativeSessionSwitchedAt: existing.native_session_switched_at,
+      ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
+      startedAt: existing.started_at,
+      tmuxSessionName: existing.tmux_session_name,
+      tmuxPaneId: existing.tmux_pane_id,
+    });
   };
 }
 
@@ -1511,19 +1475,16 @@ export async function reconcileNativeSessionStart(
     options,
     NATIVE_POINTER_TIMEOUT_MS,
     reconcileNativeTransition(normalizedNativeSessionId ?? nativeSessionId, options),
-    (transition) => transition.state,
+    (state) => state,
   );
-  if (result.value.replacementLog) {
-    await appendToLogAtContext(result.context, result.value.replacementLog).catch(() => {});
-  }
   await appendToLogAtContext(result.context, {
-    event: result.value.replacementLog ? 'session_start' : 'session_start_reconciled',
-    session_id: result.value.state.session_id,
+    event: 'session_start_reconciled',
+    session_id: result.value.session_id,
     native_session_id: normalizedNativeSessionId ?? nativeSessionId,
-    pid: result.value.state.pid,
-    timestamp: result.value.state.native_session_switched_at ?? new Date().toISOString(),
+    pid: result.value.pid,
+    timestamp: new Date().toISOString(),
   }).catch(() => {});
-  return result.value.state;
+  return result.value;
 }
 
 function historyDirectory(context: SessionPointerContext): string {

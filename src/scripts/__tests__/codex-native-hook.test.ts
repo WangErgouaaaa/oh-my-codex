@@ -4554,16 +4554,19 @@ PY`,
       });
       process.env.OMX_SESSION_ID = replacementCandidate;
       await setOwnerEvidence(replacementCandidate);
-      await dispatchCodexNativeHook(
+      const replacementStart = await dispatchCodexNativeHook(
         { hook_event_name: "SessionStart", cwd: replacementCwd, session_id: "native-after-new-3138" },
         { cwd: replacementCwd, sessionOwnerPid: process.pid },
       );
+      assert.equal(replacementStart.outputJson, null);
       const replacementPointer = JSON.parse(await readFile(join(replacementStateDir, "session.json"), "utf-8")) as {
         session_id?: string;
+        native_session_id?: string;
         owner_omx_session_id?: string;
       };
-      assert.equal(replacementPointer.session_id, "native-after-new-3138");
-      assert.equal(replacementPointer.owner_omx_session_id, replacementOwner);
+      assert.equal(replacementPointer.session_id, replacementOwner);
+      assert.equal(replacementPointer.native_session_id, "native-before-new-3138");
+      assert.equal(replacementPointer.owner_omx_session_id, undefined);
       assert.notEqual(replacementPointer.owner_omx_session_id, replacementCandidate);
 
       const nativeOnlyCwd = join(root, "native-only");
@@ -5391,7 +5394,7 @@ PY`,
     }
   });
 
-  it("prefers the OMX owner session id when a native new session revives HUD", async () => {
+  it("preserves the OMX owner HUD session when an unrelated native SessionStart is rejected", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-hud-owner-session-revive-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -5421,17 +5424,17 @@ PY`,
         previous_native_session_id?: string;
         owner_omx_session_id?: string;
       };
-      assert.equal(sessionState.session_id, nativeSessionId);
-      assert.equal(sessionState.native_session_id, nativeSessionId);
-      assert.equal(sessionState.previous_native_session_id, oldNativeSessionId);
-      assert.equal(sessionState.owner_omx_session_id, ownerSessionId);
+      assert.equal(sessionState.session_id, ownerSessionId);
+      assert.equal(sessionState.native_session_id, oldNativeSessionId);
+      assert.equal(sessionState.previous_native_session_id, undefined);
+      assert.equal(sessionState.owner_omx_session_id, undefined);
 
       let reconcileCall: { cwd: string; sessionId?: string; sessionIds?: string[] } | null = null;
       const promptResult = await dispatchCodexNativeHook(
         {
           hook_event_name: "UserPromptSubmit",
           cwd,
-          session_id: nativeSessionId,
+          session_id: ownerSessionId,
           thread_id: "thread-hud-owner",
           turn_id: "turn-hud-owner",
           prompt: "$ralplan fix native new hud owner handoff",
@@ -5449,7 +5452,7 @@ PY`,
       assert.deepEqual(reconcileCall, {
         cwd,
         sessionId: ownerSessionId,
-        sessionIds: [ownerSessionId, nativeSessionId],
+        sessionIds: [ownerSessionId, oldNativeSessionId],
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -5775,6 +5778,7 @@ PY`,
       await mkdir(join(stateDir, "sessions", priorSessionId), { recursive: true });
       await writeSessionStart(cwd, priorSessionId, {
         nativeSessionId: "codex-native-old",
+        pid: 999_999_999,
       });
       await writeJson(join(stateDir, "sessions", priorSessionId, "ralph-state.json"), {
         active: true,
