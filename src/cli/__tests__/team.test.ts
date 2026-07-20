@@ -2402,10 +2402,12 @@ describe('teamCommand status', () => {
   it('prints pane ids and raw inspect hints when tmux panes are recorded', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-status-panes-'));
     const previousCwd = process.cwd();
+    const previousPath = process.env.PATH;
     const logs: string[] = [];
     const originalLog = console.log;
     try {
       process.chdir(wd);
+      process.env.PATH = wd;
       const config = await withoutTeamTestWorkerEnv(() => initTeamState('pane-team', 'inspect worker panes', 'executor', 2, wd));
       await withoutTeamTestWorkerEnv(() => createTask('pane-team', {
         subject: 'Recover worker-1 progress',
@@ -2549,6 +2551,8 @@ describe('teamCommand status', () => {
       assert.match(modelInspectOutput, /inspect_summary: [\s\S]*command=omx sparkshell --tmux-pane %21 --tail-lines 400/);
     } finally {
       console.log = originalLog;
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
       process.chdir(previousCwd);
       await rm(wd, { recursive: true, force: true });
     }

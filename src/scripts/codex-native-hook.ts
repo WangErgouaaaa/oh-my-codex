@@ -4830,6 +4830,91 @@ const CONDUCTOR_ORCHESTRATION_TOOL_NAMES = new Set([
   "multi_agent_v1.close_agent",
 ]);
 
+const GITHUB_CLI_REMOTE_MUTATION_SUBCOMMANDS = new Map<string, ReadonlySet<string>>([
+  ["issue", new Set(["close", "comment", "create", "delete", "develop", "edit", "lock", "pin", "reopen", "transfer", "unlock", "unpin"])],
+  ["label", new Set(["clone", "create", "delete", "edit"])],
+  ["pr", new Set(["close", "comment", "create", "draft", "edit", "lock", "merge", "ready", "reopen", "review", "unlock"])],
+  ["project", new Set(["close", "copy", "create", "delete", "edit", "field-create", "field-delete", "item-add", "item-archive", "item-create", "item-delete", "item-edit", "mark-template", "unlink"])],
+  ["release", new Set(["create", "delete", "delete-asset", "edit", "upload"])],
+  ["repo", new Set(["archive", "create", "delete", "edit", "fork", "rename", "sync", "unarchive"])],
+  ["run", new Set(["cancel", "delete", "rerun"])],
+  ["workflow", new Set(["disable", "enable", "run"])],
+]);
+const GITHUB_CLI_MUTATING_API_METHODS = new Set(["delete", "patch", "post", "put"]);
+const GITHUB_CLI_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+  "-R", "--repo", "--hostname", "--config-dir",
+]);
+
+function findNextGithubCliOperandIndex(words: string[], startIndex: number): number | null {
+  for (let index = startIndex; index < words.length; index += 1) {
+    const word = shellWordLiteral(words[index] ?? "");
+    if (!word || isShellCommandTerminatorOrGroupClose(word)) return null;
+    if (word === "--") continue;
+    if (GITHUB_CLI_GLOBAL_OPTIONS_WITH_VALUE.has(word)) {
+      index += 1;
+      continue;
+    }
+    if ([...GITHUB_CLI_GLOBAL_OPTIONS_WITH_VALUE].some((option) => word.startsWith(`${option}=`))) continue;
+    if (word.startsWith("-")) continue;
+    return index;
+  }
+  return null;
+}
+
+function githubCliApiInvocationHasRemoteMutationIntent(words: string[], startIndex: number): boolean {
+  for (let index = startIndex; index < words.length; index += 1) {
+    const word = shellWordLiteral(words[index] ?? "");
+    if (!word || isShellCommandTerminatorOrGroupClose(word)) return false;
+    let method = "";
+    if (word === "-X" || word === "--method") {
+      method = shellWordLiteral(words[index + 1] ?? "");
+    } else if (word.startsWith("-X") && word.length > 2) {
+      method = word.slice(2);
+    } else if (word.startsWith("--method=")) {
+      method = word.slice("--method=".length);
+    }
+    if (!method) continue;
+    if (/[$`]/.test(method)) return true;
+    return GITHUB_CLI_MUTATING_API_METHODS.has(method.replace(/^=/, "").toLowerCase());
+  }
+  return false;
+}
+
+function githubCliInvocationHasRemoteMutationIntent(words: string[], ghIndex: number): boolean {
+  const commandIndex = findNextGithubCliOperandIndex(words, ghIndex + 1);
+  if (commandIndex === null) return false;
+  const commandName = commandNameFromShellWord(words[commandIndex] ?? "");
+  if (commandName === "api") return githubCliApiInvocationHasRemoteMutationIntent(words, commandIndex + 1);
+  const subcommandIndex = findNextGithubCliOperandIndex(words, commandIndex + 1);
+  if (subcommandIndex === null) return false;
+  const mutatingSubcommands = GITHUB_CLI_REMOTE_MUTATION_SUBCOMMANDS.get(commandName);
+  return Boolean(mutatingSubcommands?.has(commandNameFromShellWord(words[subcommandIndex] ?? "")));
+}
+
+function unwrapConductorRemoteCommandIndex(words: string[]): number | null {
+  let commandIndex = skipShellCommandPositionPrefixWords(words, 0);
+  for (let unwrapCount = 0; unwrapCount < 8; unwrapCount += 1) {
+    const commandName = commandNameFromShellWord(words[commandIndex] ?? "");
+    if (!commandName) return null;
+    const operandIndex = findConductorWrapperOperandIndex(commandName, words, commandIndex + 1);
+    if (operandIndex === undefined) return commandIndex;
+    if (operandIndex === null) return null;
+    commandIndex = skipShellCommandPositionPrefixWords(words, operandIndex);
+  }
+  return null;
+}
+
+function commandHasRemoteServiceMutationIntent(command: string): boolean {
+  const normalizedCommand = stripHeredocBodiesForCommandScan(normalizeShellLineContinuations(command));
+  for (const segment of splitShellCommandSegments(normalizedCommand)) {
+    const words = tokenizeShellWords(segment);
+    const commandIndex = unwrapConductorRemoteCommandIndex(words);
+    if (commandIndex === null) continue;
+    if (commandNameFromShellWord(words[commandIndex] ?? "") === "gh" && githubCliInvocationHasRemoteMutationIntent(words, commandIndex)) return true;
+  }
+  return false;
+}
+
 function classifyPreToolUseMutationTransport(
   payload: CodexHookPayload,
   toolName: string,
@@ -4837,7 +4922,7 @@ function classifyPreToolUseMutationTransport(
 ): PreToolUseMutationTransport {
   if (toolName === "Bash") {
     const command = readPreToolUseCommand(payload);
-    return commandHasDeepInterviewWriteIntent(command, 0, cwd) || collectOmxStateCommandOperations(command, "write").length > 0 || commandHasNestedCliMutationIntent(command) || classifyConductorExecutableRuntime(command, 0, cwd) !== null
+    return commandHasDeepInterviewWriteIntent(command, 0, cwd) || collectOmxStateCommandOperations(command, "write").length > 0 || commandHasNestedCliMutationIntent(command) || commandHasRemoteServiceMutationIntent(command) || classifyConductorExecutableRuntime(command, 0, cwd) !== null
       ? "bash"
       : "read-only";
   }
@@ -10007,7 +10092,7 @@ function conductorShellStateNameIsSensitive(name: string): boolean {
     || /^NODE_[A-Z0-9_]+$/.test(name)
     || /^LD_[A-Z0-9_]+$/.test(name)
     || /^DYLD_[A-Z0-9_]+$/.test(name)
-    || /^PYTHON[A-Z0-9_]*$/.test(name)
+    || /^PYTHON[A-Z0-9_]*$/.test(name) && name !== "PYTHONUNBUFFERED"
     || /^PERL[A-Z0-9_]*$/.test(name)
     || /^GIT_[A-Z0-9_]+$/.test(name)
     || /^RSYNC_[A-Z0-9_]+$/.test(name)
@@ -14193,6 +14278,7 @@ const CONDUCTOR_KNOWN_OMX_RUNTIME_ENVIRONMENT_NAMES = new Set([
 // They are inputs to the CLI surface, not roots, output destinations, or helper commands.
 const CONDUCTOR_BENIGN_ORCHESTRATION_RUNTIME_ENVIRONMENT_NAMES = new Set([
   "GJC_SESSION_CWD", "GJC_SESSION_FILE", "GJC_SESSION_ID",
+  "OMX_EXPLORE_CODEX_BIN",
   "OMX_OPENCLAW", "OMX_OPENCLAW_COMMAND", "OMX_OPENCLAW_DEBUG", "OMX_TEST_RELAX_TMUX_TIMEOUT",
 ]);
 
@@ -15357,10 +15443,9 @@ function conductorValidatedWorkspaceNpmBinDirectory(rootCwd: string): string | n
     const workspaceRoot = realpathSync(resolve(rootCwd));
     const binDirectory = realpathSync(join(workspaceRoot, "node_modules", ".bin"));
     const omxCandidate = join(binDirectory, "omx");
-    const knownOmxCli = conductorKnownPackageCliPath("omx");
-    if (!lstatSync(omxCandidate).isSymbolicLink() || knownOmxCli === null) return null;
+    if (!lstatSync(omxCandidate).isSymbolicLink()) return null;
     accessSync(omxCandidate, fsConstants.X_OK);
-    return realpathSync(omxCandidate) === knownOmxCli ? binDirectory : null;
+    return conductorPackageCliCandidateMatchesDeclaredBin("omx", omxCandidate) ? binDirectory : null;
   } catch {
     return null;
   }
@@ -15577,7 +15662,10 @@ function conductorPathMayResolveRepositoryExecutable(
     if (canonical === root || canonical.startsWith(`${root}/`)) return true;
     return !conductorExecutableHasTrustedIdentity(commandName, candidate, rootCwd, state);
   }
-  // PATH exhaustion may invoke command_not_found_handle; no executable identity was proved.
+  // zsh is optional in minimal CI images; a missing zsh binary is not a repository
+  // executable risk. Earlier candidates, including workspace shadows, still fail closed.
+  if (commandName === "zsh") return false;
+  // Other PATH exhaustion may invoke command_not_found_handle; no executable identity was proved.
   return true;
 }
 
@@ -15614,6 +15702,22 @@ function conductorKnownPackageCliPath(commandName: string): string | null {
   }
 }
 
+function conductorPackageCliCandidateMatchesDeclaredBin(commandName: string, candidate: string): boolean {
+  try {
+    const canonicalCandidate = realpathSync(candidate);
+    for (let directory = dirname(canonicalCandidate); ; directory = dirname(directory)) {
+      if (existsSync(join(directory, "package.json"))) {
+        const declared = conductorDeclaredPackageCliPath(directory, commandName);
+        return declared !== null && realpathSync(declared) === canonicalCandidate;
+      }
+      const parent = dirname(directory);
+      if (parent === directory) return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
 function conductorWorkspacePackageCliCandidateIsTrusted(
   commandName: string,
   candidate: string,
@@ -15625,8 +15729,7 @@ function conductorWorkspacePackageCliCandidateIsTrusted(
     const workspaceRoot = realpathSync(resolve(rootCwd));
     if (realpathSync(binDirectory) !== realpathSync(join(workspaceRoot, "node_modules", ".bin"))) return false;
     if (!lstatSync(candidate).isSymbolicLink()) return false;
-    const knownCli = conductorKnownPackageCliPath(commandName);
-    return knownCli !== null && realpathSync(candidate) === knownCli;
+    return conductorPackageCliCandidateMatchesDeclaredBin(commandName, candidate);
   } catch {
     return false;
   }
@@ -15676,7 +15779,6 @@ function conductorResolvedPackageCliCandidateIsTrusted(
 ): boolean {
   if (commandName !== "omx" && commandName !== "gjc") return false;
   if (state.filesystemAliasMayExist) return false;
-  const expectedCandidate = conductorKnownPackageCliPath(commandName);
   const path = getConductorShellBinding(state, "PATH").value;
   if (!path || path === CONDUCTOR_UNKNOWN_SHELL_BINDING) return false;
   for (const entry of path.split(":")) {
@@ -15705,7 +15807,7 @@ function conductorResolvedPackageCliCandidateIsTrusted(
     }
     try {
       accessSync(candidate, fsConstants.X_OK);
-      const trustedCli = expectedCandidate !== null && realpathSync(candidate) === expectedCandidate;
+      const trustedCli = conductorPackageCliCandidateMatchesDeclaredBin(commandName, candidate);
       return trustedCli && conductorPackageCliHasTrustedNodeInterpreter(candidate, state, rootCwd);
     } catch {
       return false;
@@ -16660,6 +16762,7 @@ function scanConductorShellSegment(
     const trustedOmxGjcPackageCliPath = isOmxGjcCommand
       && commandIsBare
       && conductorCommandResolvesTrustedPackageCli(words, commandStartIndex, commandIndex, activeState, rootCwd);
+    const pythonRuntimeIsStaticallyModeled = isPythonInterpreterCommandWord(commandName);
     const bareCommandPathIsSafe = commandIsBare && !commandPathMayResolveRepositoryExecutable;
     if (isOmxGjcCommand && (!commandIsBare || !trustedOmxGjcPackageCliPath)) {
       mutations.push({ command: "PATH", targets: [] });
@@ -16703,14 +16806,14 @@ function scanConductorShellSegment(
       continue;
     }
     if (cliMutationIntent) {
-      mutations.push(commandPathMayResolveRepositoryExecutable
+      mutations.push(commandPathMayResolveRepositoryExecutable && !trustedOmxGjcPackageCliPath
         ? { command: "PATH", targets: [] }
         : { command: commandName, targets: [] });
       continue;
     }
     if (
       (!commandIsBare && !conductorSlashCommandIsTrusted(commandWord, activeState, rootCwd))
-      || commandPathMayResolveRepositoryExecutable
+      || (commandPathMayResolveRepositoryExecutable && !trustedOmxGjcPackageCliPath && !pythonRuntimeIsStaticallyModeled)
     ) {
       mutations.push({ command: "PATH", targets: [] });
       continue;
@@ -18136,6 +18239,10 @@ export async function buildConductorPreToolUseWriteGuardOutput(
     nativeChildMutationAttempt = (mutationTransport === "bash" || shellMutations.length > 0)
       && !safeExportedFunctionRead;
     if (blocked) blockedDetail = bashEvaluation.blockedDetail ?? buildConductorBashBlockedDetail(cwd, command);
+    if (!readPayloadAgentId(payload) && !readPayloadThreadId(payload) && commandHasRemoteServiceMutationIntent(command)) {
+      blocked = true;
+      blockedDetail = "Bash identityless remote service mutation requires explicit Main-root provenance";
+    }
   } else if (mutationTransport === "state") {
     nativeChildMutationAttempt = true;
     const directStateInput = safeObject(payload.tool_input);

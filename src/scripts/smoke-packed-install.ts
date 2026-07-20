@@ -263,8 +263,7 @@ const CODEX_EVENT_LABELS: Readonly<Record<string, string>> = {
   stop: 'Stop',
 };
 
-const PINNED_CODEX_VERSION = '0.142.5';
-const PINNED_CODEX_VERSION_OUTPUT = `codex-cli ${PINNED_CODEX_VERSION}`;
+const MIN_CODEX_VERSION = '0.142.5';
 
 /** Sanitized Codex 0.144.5 PreToolUse shape: documented fields only, with no pointer or tracker state. */
 export const PACKED_CODEX_01445_NO_POINTER_NO_TRACKER_FIXTURE = Object.freeze({
@@ -354,10 +353,20 @@ function requireRecord(value: unknown, label: string): JsonRecord {
   return value;
 }
 
-function hasExactPinnedCodexVersionStdout(stdout: string): boolean {
-  return stdout === PINNED_CODEX_VERSION_OUTPUT
-    || stdout === `${PINNED_CODEX_VERSION_OUTPUT}\n`
-    || stdout === `${PINNED_CODEX_VERSION_OUTPUT}\r\n`;
+function parseCodexVersionStdout(stdout: string): string | null {
+  return /^codex-cli (\d+\.\d+\.\d+)\r?\n?$/.exec(stdout)?.[1] ?? null;
+}
+
+function codexVersionIsAtLeast(version: string, minimum: string): boolean {
+  const left = version.split('.').map((part) => Number(part));
+  const right = minimum.split('.').map((part) => Number(part));
+  for (let index = 0; index < 3; index += 1) {
+    const current = left[index] ?? 0;
+    const required = right[index] ?? 0;
+    if (current > required) return true;
+    if (current < required) return false;
+  }
+  return true;
 }
 
 function hasOnlyBenignCodexVersionStderr(stderr: string): boolean {
@@ -531,8 +540,9 @@ function resolvePinnedCodexExecutable(
 
     const stdout = String(result.stdout ?? '');
     const stderr = String(result.stderr ?? '');
-    if (hasExactPinnedCodexVersionStdout(stdout) && hasOnlyBenignCodexVersionStderr(stderr)) {
-      return { executable, version: PINNED_CODEX_VERSION_OUTPUT };
+    const version = parseCodexVersionStdout(stdout);
+    if (version !== null && codexVersionIsAtLeast(version, MIN_CODEX_VERSION) && hasOnlyBenignCodexVersionStderr(stderr)) {
+      return { executable, version: `codex-cli ${version}` };
     }
     observed.push(`${executable}: ${formatVersionProbeOutput(stdout, stderr)}`);
   }
@@ -540,7 +550,7 @@ function resolvePinnedCodexExecutable(
   if (Date.now() >= deadline) throw versionProbeDeadlineError();
   if (observed.length === 0) throw new CodexExecutableNotFoundError();
   throw new Error(
-    `Unsupported installed Codex version for the ${PINNED_CODEX_VERSION} boundary:\n${observed.join('\n')}`,
+    `Unsupported installed Codex version for the >=${MIN_CODEX_VERSION} boundary:\n${observed.join('\n')}`,
   );
 }
 
@@ -2750,7 +2760,7 @@ PY`],
     rmSync(packedNpmOmxShim);
     symlinkSync(workspacePackageCli, packedNpmOmxShim);
     const packedNpmPath = `${packedNpmBinDir}:${process.env.PATH || '/usr/bin:/bin'}`;
-    const packedNpmCommandPrefix = `PATH="${packedNpmBinDir}:/usr/bin:/bin"`;
+    const packedNpmCommandPrefix = `PATH="${packedNpmBinDir}:${dirname(process.execPath)}:/usr/bin:/bin"`;
     requireNativeHookPermissionDeny(
       'main-root boxed planning CLI poisoned state root',
       runActorProbe(
@@ -2810,7 +2820,7 @@ PY`],
       'cli state write system Node',
       'Bash',
       { command: cliStateWrite },
-      { PATH: `${packedNpmBinDir}:/usr/bin:/bin` },
+      { PATH: `${packedNpmBinDir}:${dirname(process.execPath)}:/usr/bin:/bin` },
     );
     if (Object.keys(systemNodeCliStateWriteProbe.output).length !== 0) {
       throw new Error(`packed main-root CLI state write should permit a trusted system Node: ${JSON.stringify(systemNodeCliStateWriteProbe.output)}\nactual stdout:\n${systemNodeCliStateWriteProbe.stdout}`);
@@ -4165,7 +4175,7 @@ async function main(): Promise<void> {
     const lifecycle = await smokePackedHookTrustLifecycle(omxPath);
     console.log(
       lifecycle.codexVersion !== null
-        ? `packed install smoke: installed Codex 0.142.5 lifecycle passed (${lifecycle.codexVersion})`
+        ? `packed install smoke: installed Codex >=${MIN_CODEX_VERSION} lifecycle passed (${lifecycle.codexVersion})`
         : 'packed install smoke: Codex executable absent; installed-Codex trust leg skipped after deterministic lifecycle',
     );
 
