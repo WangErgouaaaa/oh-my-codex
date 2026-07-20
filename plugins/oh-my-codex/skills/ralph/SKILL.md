@@ -34,7 +34,7 @@ Complex tasks often fail silently: partial implementations get declared "done", 
 - Use `run_in_background: true` for long operations (installs, builds, test suites)
 - Before adapted planner handoff, reviewer delegation, or role-authority work, inspect the native task surface. Keyword routing state is not authority. When the surface exposes `agent_type`, use typed routing. When it reports `role_routing_unavailable`, run `omx ralplan preflight --json`; on `unsupported_documented_leader_proof`, stop before planner/reviewer work that requires adapted authority and use a Codex surface with documented root proof or a reviewed alternative workflow. Do not infer root authority from `session_id`, undocumented `thread_id`, session/pointer/transcript/cwd state, absent child data, or prompt labels.
 - When the native surface exposes `agent_type` role routing, set `agent_type` to an installed OMX role and never omit it for OMX work; use `reasoning_effort` for per-dispatch intensity when needed.
-- **OMX adapted role-pass protocol:** when native routing is `role_routing_unavailable`, do not fabricate `agent_type`. On documented Codex 0.144.5 the adapted path is unavailable: run `omx ralplan preflight --json`, stop on `unsupported_documented_leader_proof`, and do not use prompt labels, task-name carriers, pending intents, markers, or `omx ralplan role-intent write` as substitutes.
+- **OMX adapted role-pass protocol:** when native routing is `role_routing_unavailable`, do not fabricate `agent_type`. On documented Codex surfaces that lack root proof, the adapted path is unavailable: run `omx ralplan preflight --json`, stop on `unsupported_documented_leader_proof`, and do not use prompt labels, task-name carriers, pending intents, markers, or `omx ralplan role-intent write` as substitutes.
 - Preserve legacy Ralph tier intent through native reasoning effort: LOW -> `low`, STANDARD -> `medium`, THOROUGH -> `xhigh`
 - Deliver the full implementation: no scope reduction, no partial completion, no deleting tests to make them pass
 - Apply the shared workflow guidance pattern: outcome-first framing, concise visible updates for multi-step execution, local overrides for the active workflow branch, validation proportional to risk, explicit stop rules, and automatic continuation for safe reversible steps. Ask only for material, destructive, credentialed, external-production, or preference-dependent branches.
@@ -80,7 +80,7 @@ Complex tasks often fail silently: partial implementations get declared "done", 
    - Standard changes: `task(agent_type="architect", reasoning_effort="medium", prompt="...")`
    - >20 files or security/architectural changes: `task(agent_type="architect", reasoning_effort="xhigh", prompt="...")`
    - Ralph floor: always run an explicit `architect` native subagent, even for small changes
-   - On `role_routing_unavailable`, do not invoke `omx ralplan role-intent write` or manufacture an Architect identity. On documented Codex 0.144.5, the adapted Architect path is unavailable; surface the leader-proof diagnostic/remediation from Execution Policy and stop. On a future or other surface, use an adapted route only after its documented positive root proof has been reviewed and implemented.
+   - On `role_routing_unavailable`, do not invoke `omx ralplan role-intent write` or manufacture an Architect identity. On documented Codex surfaces that lack root proof, the adapted Architect path is unavailable; surface the leader-proof diagnostic/remediation from Execution Policy and stop. On a future or other surface, use an adapted route only after its documented positive root proof has been reviewed and implemented.
 7.5 **Mandatory Deslop Pass**:
    - After Step 7 passes, run `oh-my-codex:ai-slop-cleaner` on **all files changed during the Ralph session**.
    - Scope the cleaner to **changed files only**; do not widen the pass beyond Ralph-owned edits.
@@ -204,7 +204,7 @@ Why bad: These are independent tasks that should run in parallel, not sequential
 - [ ] Fresh test run output shows all tests pass
 - [ ] Fresh build output shows success
 - [ ] lsp_diagnostics shows 0 errors on affected files
-- [ ] Architect verification passed: on a routing-capable surface via explicit `task(agent_type="architect", reasoning_effort="medium"...)` minimum. On documented Codex 0.144.5 role-routing-unavailable surfaces, no adapted Architect pass is valid; Ralplan-originated work must have stopped with the leader-proof diagnostic.
+- [ ] Architect verification passed: on a routing-capable surface via explicit `task(agent_type="architect", reasoning_effort="medium"...)` minimum. On documented role-routing-unavailable surfaces without root proof, no adapted Architect pass is valid; Ralplan-originated work must have stopped with the leader-proof diagnostic.
 - [ ] Codex goal-mode completion audit passed, and `update_goal({status: "complete"})` was called when an active goal exists
 - [ ] ai-slop-cleaner pass completed on changed files (or --no-deslop specified)
 - [ ] Post-deslop regression tests pass

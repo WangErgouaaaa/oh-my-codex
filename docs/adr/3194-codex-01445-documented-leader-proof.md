@@ -36,8 +36,10 @@ The explicit `omx ralplan preflight --json` result is exactly:
 A canonical standalone `omx ralplan role-intent write --role <role> --parent-thread "$CODEX_THREAD_ID" --json` request for an installed role is denied by `PreToolUse` with exactly:
 
 ```text
-unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.
+unsupported_documented_leader_proof: current Codex hooks do not expose documented root identity required for adapted Ralplan.
 ```
+
+If a newer hook payload reports an explicit Codex CLI version, the diagnostic may name that reported version instead of the generic `current Codex hooks` fallback.
 
 Its CLI JSON result is exactly:
 

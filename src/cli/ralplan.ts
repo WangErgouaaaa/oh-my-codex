@@ -7,7 +7,7 @@ Usage:
   omx ralplan preflight [--json]
   omx ralplan role-intent write --role <role> --parent-thread <id> [--session <id>] [--ttl-ms <n>] [--json]
 
-preflight and role-intent write fail closed on adapted Codex surfaces because Codex 0.144.5 does not document leader proof.
+preflight and adapted role-intent write fail closed unless the current Codex surface documents leader proof for typed role routing.
 `;
 
 type RoleIntentFailureReason = 'unknown_role' | 'unsupported_documented_leader_proof';

@@ -6,7 +6,7 @@ export const UNSUPPORTED_DOCUMENTED_LEADER_PRE_TOOL_USE = Object.freeze({
   hookSpecificOutput: Object.freeze({
     hookEventName: 'PreToolUse',
     permissionDecision: 'deny',
-    permissionDecisionReason: 'unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.',
+    permissionDecisionReason: 'unsupported_documented_leader_proof: current Codex hooks do not expose documented root identity required for adapted Ralplan.',
   }),
 });
 
@@ -18,7 +18,15 @@ export const UNKNOWN_RALPLAN_ROLE_PRE_TOOL_USE = Object.freeze({
   }),
 });
 
-type PreToolUseDenial = typeof UNSUPPORTED_DOCUMENTED_LEADER_PRE_TOOL_USE
+type UnsupportedDocumentedLeaderPreToolUse = Readonly<{
+  hookSpecificOutput: Readonly<{
+    hookEventName: 'PreToolUse';
+    permissionDecision: 'deny';
+    permissionDecisionReason: string;
+  }>;
+}>;
+
+type PreToolUseDenial = UnsupportedDocumentedLeaderPreToolUse
   | typeof UNKNOWN_RALPLAN_ROLE_PRE_TOOL_USE;
 
 export interface Codex01445PreToolUseDependencies {
@@ -37,6 +45,35 @@ function readCommand(payload: Record<string, unknown>): string | undefined {
   if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) return undefined;
   const command = (toolInput as Record<string, unknown>).command;
   return typeof command === 'string' ? command : undefined;
+}
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function readCodexVersion(payload: Record<string, unknown>): string {
+  const raw = readString(payload.codex_version)
+    || readString(payload.codexVersion)
+    || readString(payload.codex_cli_version)
+    || readString(payload.codexCliVersion)
+    || readString(payload.cli_version)
+    || readString(payload.cliVersion)
+    || readString((payload.codex as Record<string, unknown> | undefined)?.version)
+    || readString((payload.cli as Record<string, unknown> | undefined)?.version);
+  const match = raw.match(/\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b/);
+  return match?.[1] ?? '';
+}
+
+function unsupportedLeaderPreToolUseForPayload(payload: Record<string, unknown>): UnsupportedDocumentedLeaderPreToolUse {
+  const version = readCodexVersion(payload);
+  if (!version) return UNSUPPORTED_DOCUMENTED_LEADER_PRE_TOOL_USE;
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: `unsupported_documented_leader_proof: Codex ${version} hooks do not expose documented root identity required for adapted Ralplan.`,
+    },
+  };
 }
 
 /**
@@ -71,6 +108,6 @@ export function evaluateCodex01445PreToolUse(
   const parsed = parseCodex01445AdaptedRoleIntentCommand(command, dependencies.platform);
   if (!parsed) return undefined;
   return dependencies.resolveInstalledRoleName(parsed.role)
-    ? UNSUPPORTED_DOCUMENTED_LEADER_PRE_TOOL_USE
+    ? unsupportedLeaderPreToolUseForPayload(payload)
     : UNKNOWN_RALPLAN_ROLE_PRE_TOOL_USE;
 }

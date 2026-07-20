@@ -17,6 +17,12 @@ async function invoke(args: string[], deps: RalplanCommandDependencies = {}) {
 }
 
 describe('#3194 ralplan CLI unsupported-only surface', () => {
+  it('describes current documented leader-proof support without naming a stale Codex version', async () => {
+    const result = await invoke(['--help']);
+    assert.match(result.stdout.join('\n'), /current Codex surface documents leader proof/);
+    assert.doesNotMatch(result.stdout.join('\n'), /Codex 0\.144\.5/);
+  });
+
   it('fails the explicit adapted-surface preflight and neutralizes routing-only Ralplan state', async () => {
     let resolved = false;
     let cancelled = false;

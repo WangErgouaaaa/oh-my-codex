@@ -51,4 +51,19 @@ describe('Codex 0.144.5 adapted role-intent preflight', () => {
     }, { resolveInstalledRoleName, platform: 'linux' }), undefined);
     assert.equal(calls, 3);
   });
+
+  it('uses the reported Codex CLI version in unsupported leader-proof denials', () => {
+    const result = evaluateCodex01445PreToolUse({
+      tool_name: 'Bash',
+      codex_version: 'codex-cli 0.144.6',
+      tool_input: { command: posixCommand('architect') },
+    }, {
+      resolveInstalledRoleName: () => 'architect',
+      platform: 'linux',
+    });
+    assert.equal(
+      result?.hookSpecificOutput?.permissionDecisionReason,
+      'unsupported_documented_leader_proof: Codex 0.144.6 hooks do not expose documented root identity required for adapted Ralplan.',
+    );
+  });
 });
