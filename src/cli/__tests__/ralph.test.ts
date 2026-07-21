@@ -292,6 +292,9 @@ describe('ralph deslop launch wiring', () => {
     assert.match(instructions, /do not fabricate `agent_type`/);
     assert.match(instructions, /omx ralplan preflight --json/);
     assert.match(instructions, /unsupported_documented_leader_proof/);
+    assert.match(instructions, /Ralplan-originated action that requires adapted role authority/);
+    assert.match(instructions, /Do not apply that gate to unrelated guarded install\/sync, status\/health checks, or runtime work/);
+    assert.doesNotMatch(instructions, /before Ralplan-originated planning, state, HUD, runtime, or delegation work/i);
     assert.match(instructions, /never fake the role via a prompt label/i);
     assert.match(instructions, /use `reasoning_effort` instead of `tier`/);
     assert.match(instructions, /LOW -> `low`/);

@@ -33687,6 +33687,13 @@ describe("#3118 native role contract", () => {
 
 			assert.equal(result.outputJson?.decision, "block");
 			assert.equal(result.outputJson?.reason, unknownRoleReason);
+			const additionalContext = String(
+				(result.outputJson as { hookSpecificOutput?: { additionalContext?: string } } | null)?.hookSpecificOutput
+					?.additionalContext ?? "",
+			);
+			assert.match(additionalContext, /Ralplan-originated action that requires adapted role authority/);
+			assert.match(additionalContext, /Do not apply that gate to unrelated guarded install\/sync, status\/health checks, or runtime work/);
+			assert.doesNotMatch(additionalContext, /before Ralplan planning, state, HUD, runtime, or delegation work/i);
 		});
 	});
 
