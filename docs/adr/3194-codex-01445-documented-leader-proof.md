@@ -4,7 +4,7 @@
 
 ## Decision
 
-Treat adapted Ralplan role routing as unsupported on the documented Codex CLI 0.144.5 hook surface. The surface does not provide a documented, positive root-to-`PreToolUse` identity proof. When native role routing reports `role_routing_unavailable`, Ralplan runs an explicit fail-closed CLI preflight after keyword selection but before substantive planner/reviewer work, HUD/runtime activation, or adapted authority.
+Treat adapted Ralplan role routing as unsupported on the documented Codex CLI 0.144.5 hook surface. The surface does not provide a documented, positive root-to-`PreToolUse` identity proof. When native role routing reports `role_routing_unavailable`, Ralplan runs an explicit fail-closed CLI preflight after keyword selection but before any Ralplan-originated action that requires adapted role authority, such as adapted planner/reviewer handoff or role-intent work.
 
 Keep typed native routing as the preferred path where the native spawn surface exposes `agent_type`: callers select an installed OMX role explicitly. On a role-routing-unavailable surface, the adapted role path is unavailable rather than silently weakened. Do not substitute prompt labels, inferred identities, or unvalidated carriers.
 
@@ -75,7 +75,7 @@ Rollback is removal of this unsupported-only gate and associated guidance only a
 
 ## Future enablement criterion
 
-Enable adapted Ralplan only when the official documentation for the target Codex version and hook/spawn surface defines a positive, stable binding from the current `PreToolUse` event to the root leader identity required by the workflow, and the implementation can validate that binding before any planner, state, HUD, runtime, or role-intent work. The evidence must distinguish root and child contexts without using undocumented IDs, pointer/transcript/cwd state, or absence-based inference.
+Enable adapted Ralplan only when the official documentation for the target Codex version and hook/spawn surface defines a positive, stable binding from the current `PreToolUse` event to the root leader identity required by the workflow, and the implementation can validate that binding before any adapted planner/reviewer authority or role-intent work. The evidence must distinguish root and child contexts without using undocumented IDs, pointer/transcript/cwd state, or absence-based inference.
 
 ## Follow-ups
 

@@ -258,7 +258,7 @@ operator to clear incompatible state explicitly via `omx state ...` or the
 
 Codex CLI **0.144.5** documented hook payloads do not provide a positive proof that a `PreToolUse` event belongs to the root leader required by adapted Ralplan. `session_id` is shared with parent context and is not root identity. The undocumented `thread_id`, session files, session pointers, transcript state, cwd, and the absence of child markers are never authority evidence. OMX therefore does not infer, repair, or synthesize leader identity from them.
 
-Typed native role routing remains the preferred path when the task surface exposes `agent_type`; this boundary does not disable that path. When native role routing reports `role_routing_unavailable`, Ralplan must run `omx ralplan preflight --json` before planner, reviewer, HUD, runtime, or adapted role-intent work. The command neutralizes any routing-only Ralplan selection state so Stop cannot treat it as authority, then fails closed with:
+Typed native role routing remains the preferred path when the task surface exposes `agent_type`; this boundary does not disable that path. When native role routing reports `role_routing_unavailable`, Ralplan must run `omx ralplan preflight --json` before any Ralplan-originated action that requires adapted role authority, such as adapted planner/reviewer handoff or role-intent work. The command neutralizes any routing-only Ralplan selection state so Stop cannot treat it as authority, then fails closed with:
 
 ```json
 {"ok":false,"reason":"unsupported_documented_leader_proof"}

@@ -3486,7 +3486,7 @@ function buildNativeUnknownRolePreToolUseOutput(
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       additionalContext:
-        "Use an installed OMX role for native agent_type/agent_role dispatch. When the surface reports role_routing_unavailable, do not fabricate agent_type; run `omx ralplan preflight --json` before Ralplan planning, state, HUD, runtime, or delegation work and stop on `unsupported_documented_leader_proof`.",
+        "Use an installed OMX role for native agent_type/agent_role dispatch. When the surface reports role_routing_unavailable, do not fabricate agent_type; run `omx ralplan preflight --json` before any Ralplan-originated action that requires adapted role authority and stop on `unsupported_documented_leader_proof`. Do not apply that gate to unrelated guarded install/sync, status/health checks, or runtime work; those flows retain their own safety gates.",
     },
   };
 }
