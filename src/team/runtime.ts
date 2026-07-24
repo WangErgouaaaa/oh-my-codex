@@ -126,7 +126,7 @@ import {
   writeWorkerRoleInstructionsFile,
 } from './worker-bootstrap.js';
 import { buildTeamWorkerGoalInstruction } from './goal-workflow.js';
-import { synthesizeDelegationPlan } from './delegation-policy.js';
+import { resolveDelegationPlan } from './delegation-policy.js';
 import { coordinationPlansEqual, synthesizeCoordinationPlan, synthesizeCoordinationPlans } from './coordination-protocol.js';
 import { loadRolePrompt } from './role-router.js';
 import { composeRoleInstructionsForRole } from '../agents/native-config.js';
@@ -3506,7 +3506,7 @@ export async function startTeam(
         blocked_by: hasSymbolicDagIdentity ? undefined : t.blocked_by ?? t.depends_on,
         depends_on: hasSymbolicDagIdentity ? undefined : t.depends_on ?? t.blocked_by,
         role: t.role,
-        delegation: t.delegation ?? synthesizeDelegationPlan(t),
+        delegation: resolveDelegationPlan(t),
         coordination: t.coordination
           ? { ...t.coordination, source: 'explicit' }
           : coordinationPlans[taskIndex] ?? synthesizeCoordinationPlan(t),
@@ -4561,7 +4561,7 @@ export async function assignTask(
     const taskForInbox = task.delegation && hasCurrentCoordination
       ? task
       : (await updateTask(sanitized, taskId, {
-          delegation: task.delegation ?? synthesizeDelegationPlan(task),
+          delegation: resolveDelegationPlan(task),
           coordination: task.coordination?.source === 'explicit' ? task.coordination : currentCoordinationPlan,
         }, cwd)) ?? task;
     const inbox = generateTaskAssignmentInbox(workerName, sanitized, taskForInbox, { approvedContextSection });

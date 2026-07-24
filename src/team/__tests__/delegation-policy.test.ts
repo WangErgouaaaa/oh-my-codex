@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { synthesizeDelegationPlan } from '../delegation-policy.js';
+import { resolveDelegationPlan, synthesizeDelegationPlan } from '../delegation-policy.js';
 import type { TeamTask } from '../state.js';
 
 function task(overrides: Partial<TeamTask>): TeamTask {
@@ -49,6 +49,23 @@ describe('synthesizeDelegationPlan', () => {
     assert.equal(plan.child_report_format, 'bullets');
     assert.equal(plan.skip_allowed_reason_required, true);
     assert.ok((plan.subtask_candidates ?? []).some((candidate) => /debug|root-cause/i.test(candidate)));
+  });
+
+  it('suppresses an explicit delegation plan when the task prohibits spawning agents', () => {
+    const plan = resolveDelegationPlan(task({
+      subject: 'Review current changes',
+      description: 'Do not edit files, commit, dispatch providers, or spawn agents.',
+      delegation: {
+        mode: 'auto',
+        required_parallel_probe: true,
+        skip_allowed_reason_required: true,
+      },
+    }));
+
+    assert.deepEqual(plan, {
+      mode: 'none',
+      suppression_reason: 'explicit_task_no_spawn',
+    });
   });
 
   it('keeps narrow typo/copy tasks quiet', () => {

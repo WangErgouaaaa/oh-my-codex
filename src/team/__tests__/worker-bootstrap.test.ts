@@ -915,6 +915,29 @@ describe("worker bootstrap", () => {
     assert.doesNotMatch(inbox, /gpt-5\.6-terra/);
   });
 
+  it("generateInitialInbox suppresses a contradictory delegation contract for explicit no-spawn tasks", () => {
+    const tasks: TeamTask[] = [{
+      id: "9",
+      subject: "Review current changes",
+      description: "Do not edit files, commit, dispatch providers, or spawn agents.",
+      status: "pending",
+      created_at: new Date(0).toISOString(),
+      delegation: {
+        mode: "auto",
+        max_parallel_subtasks: 3,
+        required_parallel_probe: true,
+        skip_allowed_reason_required: true,
+      },
+    }];
+
+    const inbox = generateInitialInbox("worker-1", "team-no-spawn", "code-reviewer", tasks);
+
+    assert.doesNotMatch(inbox, /Native Subagent Delegation Contract/);
+    assert.doesNotMatch(inbox, /Before doing more than .* spawn up to/i);
+    assert.match(inbox, /Native Subagent Delegation Disabled — Task 9/);
+    assert.match(inbox, /Automatic skip reason: explicit_task_no_spawn/);
+  });
+
   it("generateTaskAssignmentInbox includes task ID and description", () => {
     const inbox = generateTaskAssignmentInbox(
       "worker-3",

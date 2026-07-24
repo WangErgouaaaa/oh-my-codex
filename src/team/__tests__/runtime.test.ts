@@ -11573,6 +11573,47 @@ esac
     }
   });
 
+  it('startTeam persists no-spawn task boundaries over synthesized delegation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-no-spawn-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    await mkdir(binDir, { recursive: true });
+    await writeFakePromptWorkerBinary(
+      fakeCodexPath,
+      `setTimeout(() => {}, 5000);`,
+    );
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      runtime = await withPromptModeCodexEnv(binDir, {}, () =>
+        withoutTeamWorkerEnv(() =>
+          startTeam(
+            'team-no-spawn-persist',
+            'no spawn persistence test',
+            'executor',
+            1,
+            [{
+              subject: 'Review current changes',
+              description: 'Do not edit files, commit, dispatch providers, or spawn agents.',
+            }],
+            cwd,
+          ),
+        ),
+      );
+
+      const task = await readTask(runtime.teamName, '1', cwd);
+      assert.deepEqual(task?.delegation, {
+        mode: 'none',
+        suppression_reason: 'explicit_task_no_spawn',
+      });
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('startTeam persists approved execution binding under the team state root', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-approved-binding-'));
     const binDir = join(cwd, 'bin');

@@ -26,8 +26,33 @@ const SIMPLE_SCOPE_PATTERNS = [
   /\brename\b.*\bsingle\b/i,
 ];
 
+const EXPLICIT_NO_SUBAGENT_PATTERNS = [
+  /\b(?:do not|don't|never|must not)\b[\s\S]{0,160}\b(?:spawn|launch|start|create)\b[\s\S]{0,80}\b(?:native\s+)?(?:sub-?)?agents?\b/i,
+  /\b(?:do not|don't|never|must not)\b[\s\S]{0,160}\b(?:use|invoke)\b[\s\S]{0,80}\b(?:native\s+)?(?:sub-?)?agents?\b/i,
+  /\b(?:no|without)\b[\s\S]{0,40}\b(?:native\s+)?(?:sub-?)?agents?\b/i,
+];
+
 function taskText(task: Pick<TeamTask, 'subject' | 'description' | 'role'>): string {
   return [task.subject, task.description, task.role].filter(Boolean).join('\n');
+}
+
+export function hasExplicitNoSubagentBoundary(
+  task: Pick<TeamTask, 'subject' | 'description' | 'role'>,
+): boolean {
+  return EXPLICIT_NO_SUBAGENT_PATTERNS.some((pattern) => pattern.test(taskText(task)));
+}
+
+function suppressedDelegationPlan(): TeamTaskDelegationPlan {
+  return {
+    mode: 'none',
+    suppression_reason: 'explicit_task_no_spawn',
+  };
+}
+
+export function delegationPlanForTask(
+  task: Pick<TeamTask, 'subject' | 'description' | 'role' | 'delegation'>,
+): TeamTaskDelegationPlan | undefined {
+  return hasExplicitNoSubagentBoundary(task) ? suppressedDelegationPlan() : task.delegation;
 }
 
 function isNarrowTask(text: string): boolean {
@@ -67,6 +92,10 @@ function roleAwareSubtaskCandidates(task: Pick<TeamTask, 'subject' | 'descriptio
 }
 
 export function synthesizeDelegationPlan(task: Pick<TeamTask, 'subject' | 'description' | 'role'>): TeamTaskDelegationPlan {
+  if (hasExplicitNoSubagentBoundary(task)) {
+    return suppressedDelegationPlan();
+  }
+
   const text = taskText(task);
 
   if (isNarrowTask(text)) {
@@ -93,4 +122,10 @@ export function synthesizeDelegationPlan(task: Pick<TeamTask, 'subject' | 'descr
     child_model_policy: 'standard',
     child_model: getTeamChildModel(),
   };
+}
+
+export function resolveDelegationPlan(
+  task: Pick<TeamTask, 'subject' | 'description' | 'role' | 'delegation'>,
+): TeamTaskDelegationPlan {
+  return delegationPlanForTask(task) ?? synthesizeDelegationPlan(task);
 }

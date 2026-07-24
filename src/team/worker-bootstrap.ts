@@ -19,6 +19,7 @@ import {
 import { normalizeTeamTaskCoordinationPlanForRender } from "./coordination-protocol.js";
 import { renderCodeGraphInstructions, type WorktreeToolContext } from "../utils/worktree-tool-context.js";
 import { getTeamChildModel } from "../config/models.js";
+import { delegationPlanForTask } from "./delegation-policy.js";
 
 
 const TEAM_OVERLAY_START = "<!-- OMX:TEAM:WORKER:START -->";
@@ -743,8 +744,18 @@ ${sections.join("\n")}`;
 }
 
 function renderDelegationContract(task: TeamTask): string {
-  const plan = task.delegation;
-  if (!plan || plan.mode === "none") return "";
+  const plan = delegationPlanForTask(task);
+  if (!plan) return "";
+  if (plan.mode === "none") {
+    return plan.suppression_reason === "explicit_task_no_spawn"
+      ? `
+### Native Subagent Delegation Disabled — Task ${task.id}
+
+- Do not spawn or invoke native subagents for this task.
+- Automatic skip reason: ${plan.suppression_reason}.
+`
+      : "";
+  }
 
   const threshold = plan.spawn_before_serial_search_threshold ?? 3;
   const maxParallel = plan.max_parallel_subtasks ?? 2;
@@ -785,8 +796,12 @@ Delegation compliance evidence (required for completion):
 function renderDelegationContracts(tasks: TeamTask[]): string {
   const sections = tasks.map(renderDelegationContract).filter((section) => section.trim().length > 0);
   if (sections.length === 0) return "";
+  const hasActiveDelegation = tasks.some((task) => {
+    const plan = delegationPlanForTask(task);
+    return plan && plan.mode !== "none";
+  });
   return `
-## Native Subagent Delegation Contract
+## Native Subagent Delegation${hasActiveDelegation ? " Contract" : ""}
 
 ${sections.join("\n")}`;
 }

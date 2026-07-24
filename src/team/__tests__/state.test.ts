@@ -1432,6 +1432,47 @@ exit 1
     }
   });
 
+  it('transitionTaskStatus permits an explicit no-spawn task to complete without delegation evidence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-no-spawn-'));
+    try {
+      await initTeamState('team-no-spawn', 't', 'executor', 1, cwd);
+      const t = await createTask('team-no-spawn', {
+        subject: 'Review current changes',
+        description: 'Do not edit files, commit, dispatch providers, or spawn agents.',
+        status: 'pending',
+        delegation: {
+          mode: 'auto',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      assert.deepEqual(t.delegation, {
+        mode: 'none',
+        suppression_reason: 'explicit_task_no_spawn',
+      });
+      const claim = await claimTask('team-no-spawn', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const completed = await transitionTaskStatus(
+        'team-no-spawn',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused review' },
+      );
+
+      assert.equal(completed.ok, true);
+      if (completed.ok) {
+        assert.equal(completed.task.delegation_compliance, undefined);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('transitionTaskStatus requires evidence when optional delegation carries required parallel probe', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-optional-required-probe-'));
     try {
