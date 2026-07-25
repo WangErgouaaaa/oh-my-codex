@@ -15,6 +15,7 @@ import type {
   ReclaimTaskResult,
   TeamMonitorSnapshotState,
 } from './types.js';
+import { delegationPlanForTask } from '../delegation-policy.js';
 
 interface TaskReadDeps {
   readTask: (teamName: string, taskId: string, cwd: string) => Promise<TeamTask | null>;
@@ -121,7 +122,7 @@ function extractDelegationComplianceEvidence(
   task: TeamTaskV2,
   terminalData: { result?: string; error?: string } | undefined,
 ): TeamTaskDelegationComplianceEvidence | null {
-  const plan = task.delegation;
+  const plan = delegationPlanForTask(task);
   if (!plan || plan.mode === 'none') return null;
   if (plan.mode === 'optional' && plan.required_parallel_probe !== true) return null;
 
@@ -145,7 +146,7 @@ function extractDelegationComplianceEvidence(
 }
 
 function requiresDelegationComplianceEvidence(task: TeamTaskV2): boolean {
-  const plan = task.delegation;
+  const plan = delegationPlanForTask(task);
   return !!plan && (plan.mode === 'auto' || plan.mode === 'required' || plan.required_parallel_probe === true);
 }
 

@@ -94,6 +94,7 @@ export interface TeamTaskCoordinationComplianceEvidence {
 
 export interface TeamTaskDelegationPlan {
   mode: TeamTaskDelegationMode;
+  suppression_reason?: 'explicit_task_no_spawn';
   max_parallel_subtasks?: number;
   required_parallel_probe?: boolean;
   spawn_before_serial_search_threshold?: number;

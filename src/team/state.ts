@@ -69,6 +69,7 @@ import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
+import { delegationPlanForTask } from './delegation-policy.js';
 
 export type { TeamDispatchRequestStatus, TeamWorkerIntegrationStatus } from './contracts.js';
 
@@ -181,6 +182,7 @@ export interface TeamTaskCoordinationComplianceEvidence {
 
 export interface TeamTaskDelegationPlan {
   mode: TeamTaskDelegationMode;
+  suppression_reason?: 'explicit_task_no_spawn';
   max_parallel_subtasks?: number;
   required_parallel_probe?: boolean;
   spawn_before_serial_search_threshold?: number;
@@ -643,10 +645,12 @@ async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv): Prom
 
 function normalizeTask(task: TeamTask): TeamTaskV2 {
   const normalizedCoordination = normalizeTeamTaskCoordinationPlanForStorage(task.coordination);
-  const { coordination: _coordination, ...rest } = task;
+  const normalizedDelegation = task.delegation ? delegationPlanForTask(task) : undefined;
+  const { coordination: _coordination, delegation: _delegation, ...rest } = task;
   return {
     ...rest,
     depends_on: task.depends_on ?? task.blocked_by ?? [],
+    ...(normalizedDelegation ? { delegation: normalizedDelegation } : {}),
     ...(normalizedCoordination ? { coordination: normalizedCoordination } : {}),
     version: Math.max(1, task.version ?? 1),
   };
