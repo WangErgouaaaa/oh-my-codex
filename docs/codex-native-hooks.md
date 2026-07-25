@@ -267,10 +267,18 @@ Typed native role routing remains the preferred path when the task surface expos
 A canonical standalone `omx ralplan role-intent write --role <role> --parent-thread "$CODEX_THREAD_ID" --json` Bash command is also denied before pointer, ledger, tracker, or runtime work. For an installed role, the exact `PreToolUse` denial reason is:
 
 ```text
-unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.
+unsupported_documented_leader_proof: current Codex hooks do not expose documented root identity required for adapted Ralplan.
 ```
 
 The direct CLI result for an installed role is likewise `{"ok":false,"reason":"unsupported_documented_leader_proof"}`. An unknown role remains separately denied as `unknown_role`; it is not a fallback or an authority probe. Wrappers, assignments, compounds, redirects, malformed commands, unrelated tools, and typed native spawn payloads are outside this narrow hook boundary and retain their existing handling.
+
+When the installed Codex app-server exposes its documented thread-tree fields,
+`omx ralplan preflight --json` queries `thread/read` for the inherited
+`CODEX_THREAD_ID`. It returns `ok:true` only when the returned thread id and
+session-tree id both equal that current id, `parentThreadId` is null, and the
+source is not a subagent. Missing fields, protocol errors, timeouts, and child
+threads still fail closed. This proof does not inspect or repair tmux state,
+session pointers, transcripts, or cwd-derived identity.
 
 
 ## UserPromptSubmit: session provenance

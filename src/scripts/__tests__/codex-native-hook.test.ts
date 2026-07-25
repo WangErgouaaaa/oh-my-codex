@@ -524,12 +524,16 @@ async function withIsolatedHome<T>(
 		join(tmpdir(), `omx-native-hook-home-${prefix}-`),
 	);
 	const previousHome = process.env.HOME;
+	const previousCodexHome = process.env.CODEX_HOME;
 	try {
 		process.env.HOME = homeDir;
+		process.env.CODEX_HOME = join(homeDir, ".codex");
 		return await run(homeDir);
 	} finally {
 		if (typeof previousHome === "string") process.env.HOME = previousHome;
 		else delete process.env.HOME;
+		if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
+		else delete process.env.CODEX_HOME;
 		await rm(homeDir, { recursive: true, force: true });
 	}
 }
@@ -30605,7 +30609,7 @@ PY`,
       const trustedPackageBin = join(cwd, "node_modules", ".bin", "omx");
       await mkdir(dirname(trustedPackageBin), { recursive: true });
       await symlink(workspacePackageCli, trustedPackageBin);
-      const trustedPackagePath = `${dirname(trustedPackageBin)}:/usr/bin:/bin`;
+      const trustedPackagePath = `${dirname(trustedPackageBin)}:${process.env.PATH || "/usr/bin:/bin"}`;
 
       const dispatchWrite = (identity: Record<string, unknown>) => dispatchCodexNativeHook(
         {
@@ -30773,6 +30777,20 @@ PY`,
       }, { cwd });
       assert.equal(identitylessNativeSessionRemote.outputJson?.decision, "block");
       assert.match(String(identitylessNativeSessionRemote.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED|Main-root Conductor mode is active/);
+      const identitylessNativeSessionRemoteBash = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_use_id: "identityless-native-session-remote-bash",
+        tool_input: { command: "PATH=/usr/bin:/bin gh issue create --title x --body y" },
+      }, { cwd });
+      assert.equal(identitylessNativeSessionRemoteBash.outputJson?.decision, "block");
+      assert.match(String(identitylessNativeSessionRemoteBash.outputJson?.reason ?? ""), /Main-root Conductor mode is active/);
+      assert.equal(
+        (identitylessNativeSessionRemoteBash.outputJson?.hookSpecificOutput as Record<string, unknown> | undefined)?.hookEventName,
+        "PreToolUse",
+      );
       for (const [name, toolInput] of [
         ["direct-state-write-foreign-routing", { mode: "ultragoal", workingDirectory: "src", session_id: "foreign", active: false }],
         ["direct-state-write-unknown-key", { mode: "ultragoal", active: true, child_marker: "forbidden" }],
@@ -30947,7 +30965,9 @@ PY`,
         const mainRootBash = await dispatchBash(`${name}-main`, { agent_id: leaderThreadId }, command);
         assert.equal(mainRootBash.outputJson, null, name);
       }
-      const compiledCliStateWrite = `omx state write --input '${JSON.stringify({ mode: "ultragoal", active: true, current_phase: "executing", session_id: sessionId, workingDirectory: cwd })}' --json`;
+      const zshFastStartupControl = await dispatchBash("zsh-fast-startup-control-main", { agent_id: leaderThreadId }, "zsh -f -c ':'");
+      assert.equal(zshFastStartupControl.outputJson, null, "zsh-fast-startup-control-main");
+      const compiledCliStateWrite = `OMX_SESSION_ID=${sessionId} omx state write --input '${JSON.stringify({ mode: "ultragoal", active: true, current_phase: "executing", session_id: sessionId, workingDirectory: cwd })}' --json`;
       const nativeChildCliStateWrite = await dispatchBashWithTrustedPackageCli(
         "cli-state-write-child",
         { agent_id: "agent-hook-native-cli-state-write" },
@@ -30955,6 +30975,12 @@ PY`,
       );
       assert.equal(nativeChildCliStateWrite.outputJson?.decision, "block", "cli-state-write-child");
       assert.match(String(nativeChildCliStateWrite.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "cli-state-write-child");
+      const mainRootCliStateWriteBash = await dispatchBashWithTrustedPackageCli(
+        "cli-state-write-main-bash",
+        { agent_id: leaderThreadId },
+        compiledCliStateWrite,
+      );
+      assert.equal(mainRootCliStateWriteBash.outputJson, null, "cli-state-write-main-bash");
       const mainRootCliStateWrite = await dispatchCodexNativeHook({
         hook_event_name: "PreToolUse",
         cwd,
@@ -32494,6 +32520,39 @@ PY`,
           { cwd },
         );
         assert.equal(result.outputJson, null, command);
+      }
+      const originalPythonUnbuffered = process.env.PYTHONUNBUFFERED;
+      try {
+        process.env.PYTHONUNBUFFERED = "1";
+        const inheritedUnbuffered = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: sessionId,
+            thread_id: "thread-conductor-bash-mutations",
+            agent_id: "thread-conductor-bash-mutations",
+            tool_name: "Bash",
+            tool_input: { command: "python3 -I -c \"print('ok')\"" },
+          },
+          { cwd },
+        );
+        assert.equal(inheritedUnbuffered.outputJson, null, "python inherited unbuffered read-only control");
+        const inheritedUnbufferedMetadata = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: sessionId,
+            thread_id: "thread-conductor-bash-mutations",
+            agent_id: "thread-conductor-bash-mutations",
+            tool_name: "Bash",
+            tool_input: { command: "python3 -I - <<'PY'\nimport shutil\nshutil.copyfile('a', '.omx/state/foo')\nPY" },
+          },
+          { cwd },
+        );
+        assert.equal(inheritedUnbufferedMetadata.outputJson, null, "python inherited unbuffered modeled metadata control");
+      } finally {
+        if (originalPythonUnbuffered === undefined) delete process.env.PYTHONUNBUFFERED;
+        else process.env.PYTHONUNBUFFERED = originalPythonUnbuffered;
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });

@@ -1,5 +1,9 @@
 import { resolveInstalledRoleName } from '../subagents/tracker.js';
 import { cancelMode } from '../modes/base.js';
+import {
+  verifyCodexDocumentedLeader,
+  type DocumentedLeaderProof,
+} from '../ralplan/documented-leader-preflight.js';
 
 export const RALPLAN_HELP = `omx ralplan - RALPLAN consensus support commands
 
@@ -7,7 +11,8 @@ Usage:
   omx ralplan preflight [--json]
   omx ralplan role-intent write --role <role> --parent-thread <id> [--session <id>] [--ttl-ms <n>] [--json]
 
-preflight and role-intent write fail closed on adapted Codex surfaces because Codex 0.144.5 does not document leader proof.
+preflight passes only when Codex app-server documents the current thread as the session-tree root; otherwise it fails closed.
+adapted role-intent write remains fail closed on unsupported hook surfaces.
 `;
 
 type RoleIntentFailureReason = 'unknown_role' | 'unsupported_documented_leader_proof';
@@ -25,6 +30,7 @@ export interface RalplanCommandDependencies {
   stderr?: (line: string) => void;
   resolveInstalledRoleName?: typeof resolveInstalledRoleName;
   cancelRalplan?: (cwd?: string) => Promise<void>;
+  verifyDocumentedLeader?: () => Promise<DocumentedLeaderProof>;
 }
 
 export async function ralplanCommand(
@@ -40,9 +46,14 @@ export async function ralplanCommand(
   if (args[0] === 'preflight') {
     const json = args.length === 2 && args[1] === '--json';
     if ((args.length !== 1 && !json)) throw new Error(`Unknown ralplan preflight argument: ${args.slice(1).join(' ')}`);
+    const proof = await (deps.verifyDocumentedLeader ?? verifyCodexDocumentedLeader)();
+    if (proof.ok) {
+      if (json) stdout(JSON.stringify(proof));
+      else stdout(`ralplan preflight passed: proof=${proof.proof}`);
+      return;
+    }
     await (deps.cancelRalplan ?? ((cwd?: string) => cancelMode('ralplan', cwd)))(process.cwd());
-    const failure = { ok: false, reason: 'unsupported_documented_leader_proof' as const };
-    if (json) stdout(JSON.stringify(failure));
+    if (json) stdout(JSON.stringify(proof));
     else stderr('ralplan preflight failed: unsupported_documented_leader_proof');
     process.exitCode = 1;
     return;

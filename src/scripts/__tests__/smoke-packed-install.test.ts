@@ -574,7 +574,7 @@ test('packed lifecycle deduplicates repeated PATH entries before enforcing the c
   }
 });
 
-test('packed lifecycle accepts only the exact stable pinned Codex version output', async () => {
+test('packed lifecycle accepts stable Codex versions at or above the supported minimum', async () => {
   if (process.platform === 'win32') return;
   const root = await mkdtemp(join(tmpdir(), 'omx-codex-version-'));
   const candidateDir = join(root, 'candidate');
@@ -582,6 +582,9 @@ test('packed lifecycle accepts only the exact stable pinned Codex version output
   const candidates = [
     { output: 'codex-cli 0.142.5', stderr: '', accepted: true },
     { output: 'codex-cli 0.142.5', stderr: 'warning: harmless test diagnostic', accepted: true },
+    { output: 'codex-cli 0.144.6', stderr: '', accepted: true },
+    { output: 'codex-cli 1.0.0', stderr: '', accepted: true },
+    { output: 'codex-cli 0.142.4', stderr: '', accepted: false },
     { output: 'codex-cli 0.142.5\nextra output', stderr: '', accepted: false },
     { output: 'codex-cli 0.142.5-beta', stderr: '', accepted: false },
     { output: 'codex-cli 0.142.5+meta', stderr: '', accepted: false },
@@ -599,11 +602,11 @@ test('packed lifecycle accepts only the exact stable pinned Codex version output
       );
       await chmod(executable, 0o755);
       if (candidate.accepted) {
-        assert.equal(probeCodexVersion(root, { PATH: candidateDir }), 'codex-cli 0.142.5');
+        assert.equal(probeCodexVersion(root, { PATH: candidateDir }), candidate.output);
       } else {
         assert.throws(
           () => probeCodexVersion(root, { PATH: candidateDir }),
-          /Unsupported installed Codex version for the 0\.142\.5 boundary/,
+          /Unsupported installed Codex version for the >=0\.142\.5 boundary/,
         );
       }
     }

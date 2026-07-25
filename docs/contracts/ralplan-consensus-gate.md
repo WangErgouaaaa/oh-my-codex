@@ -7,7 +7,7 @@ The `ralplan -> ultragoal` transition requires durable Architect and Critic appr
 Each review artifact used by the gate must include:
 
 - `agent_role`: `architect` or `critic`
-- `provenance_kind`: `native_subagent` from a routing-capable surface; `omx_adapted` is rejected on the documented Codex 0.144.5 boundary
+- `provenance_kind`: `native_subagent` from a routing-capable surface; `omx_adapted` is rejected on documented role-routing-unavailable surfaces without root proof
 - `session_id`: the current transition session id, unless supplied by the transition context
 - `thread_id`: the native subagent thread id for that review lane
 - `tracker_path`: `.omx/state/subagent-tracking.json`

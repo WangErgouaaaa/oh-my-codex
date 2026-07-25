@@ -25,7 +25,7 @@ describe('#3194 documented PreToolUse bootstrap', () => {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
-          permissionDecisionReason: 'unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.',
+          permissionDecisionReason: 'unsupported_documented_leader_proof: current Codex hooks do not expose documented root identity required for adapted Ralplan.',
         },
       });
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'session.json')), false);
@@ -67,7 +67,7 @@ describe('#3194 documented PreToolUse bootstrap', () => {
       }, { cwd, sessionOwnerPid: process.pid });
       assert.equal(
         (result.outputJson?.hookSpecificOutput as Record<string, unknown>)?.permissionDecisionReason,
-        'unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.',
+        'unsupported_documented_leader_proof: current Codex hooks do not expose documented root identity required for adapted Ralplan.',
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
