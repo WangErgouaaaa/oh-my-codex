@@ -16,10 +16,10 @@ async function invoke(args: string[], deps: RalplanCommandDependencies = {}) {
   }
 }
 
-describe('#3194 ralplan CLI unsupported-only surface', () => {
+describe('#3194 ralplan CLI documented leader-proof surface', () => {
   it('describes current documented leader-proof support without naming a stale Codex version', async () => {
     const result = await invoke(['--help']);
-    assert.match(result.stdout.join('\n'), /current Codex surface documents leader proof/);
+    assert.match(result.stdout.join('\n'), /Codex app-server documents the current thread as the session-tree root/);
     assert.doesNotMatch(result.stdout.join('\n'), /Codex 0\.144\.5/);
   });
 
@@ -29,6 +29,10 @@ describe('#3194 ralplan CLI unsupported-only surface', () => {
     const result = await invoke(['preflight', '--json'], {
       resolveInstalledRoleName: () => { resolved = true; return 'architect'; },
       cancelRalplan: async () => { cancelled = true; },
+      verifyDocumentedLeader: async () => ({
+        ok: false,
+        reason: 'unsupported_documented_leader_proof',
+      }),
     });
     assert.equal(result.exitCode, 1);
     assert.equal(resolved, false);
@@ -36,6 +40,24 @@ describe('#3194 ralplan CLI unsupported-only surface', () => {
     assert.deepEqual(result.stderr, []);
     assert.deepEqual(JSON.parse(result.stdout.join('\n')), { ok: false, reason: 'unsupported_documented_leader_proof' });
   });
+
+  it('accepts a current root proven by the documented Codex app-server thread tree', async () => {
+    let cancelled = false;
+    const result = await invoke(['preflight', '--json'], {
+      verifyDocumentedLeader: async () => ({
+        ok: true,
+        proof: 'codex_app_server_thread_tree',
+      }),
+      cancelRalplan: async () => { cancelled = true; },
+    });
+    assert.equal(result.exitCode, undefined);
+    assert.equal(cancelled, false);
+    assert.deepEqual(JSON.parse(result.stdout.join('\n')), {
+      ok: true,
+      proof: 'codex_app_server_thread_tree',
+    });
+  });
+
   it('validates malformed arguments before resolving a role', async () => {
     let resolved = false;
     await assert.rejects(() => invoke(['role-intent', 'write', '--role', 'architect', '--json'], {

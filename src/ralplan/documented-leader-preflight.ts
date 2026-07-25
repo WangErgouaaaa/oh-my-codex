@@ -1,6 +1,14 @@
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+
 import { resolveInstalledRoleName } from '../subagents/tracker.js';
+import { spawnPlatformCommand } from '../utils/platform-command.js';
 
 export const UNSUPPORTED_DOCUMENTED_LEADER_PROOF = 'unsupported_documented_leader_proof' as const;
+export const CODEX_APP_SERVER_THREAD_TREE_PROOF = 'codex_app_server_thread_tree' as const;
+
+export type DocumentedLeaderProof =
+  | { ok: true; proof: typeof CODEX_APP_SERVER_THREAD_TREE_PROOF }
+  | { ok: false; reason: typeof UNSUPPORTED_DOCUMENTED_LEADER_PROOF };
 
 export const UNSUPPORTED_DOCUMENTED_LEADER_PRE_TOOL_USE = Object.freeze({
   hookSpecificOutput: Object.freeze({
@@ -38,6 +46,121 @@ const defaultDependencies: Codex01445PreToolUseDependencies = {
   resolveInstalledRoleName,
   platform: process.platform,
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function isDocumentedRootThread(value: unknown, threadId: string): boolean {
+  if (!isRecord(value)) return false;
+  const source = value.source;
+  return value.id === threadId
+    && value.sessionId === threadId
+    && value.parentThreadId === null
+    && !(isRecord(source) && Object.hasOwn(source, 'subAgent'));
+}
+
+/**
+ * Codex app-server 0.145+ documents `sessionId` as the shared session-tree id
+ * and `parentThreadId` as subagent-only. Querying that protocol avoids using
+ * tmux, pointers, transcripts, cwd, or version numbers as identity evidence.
+ */
+export async function verifyCodexDocumentedLeader(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<DocumentedLeaderProof> {
+  const threadId = String(env.CODEX_THREAD_ID ?? '').trim();
+  const unsupported = (): DocumentedLeaderProof => ({
+    ok: false,
+    reason: UNSUPPORTED_DOCUMENTED_LEADER_PROOF,
+  });
+  if (!threadId) return unsupported();
+
+  return await new Promise<DocumentedLeaderProof>((resolveProof) => {
+    const { child: rawChild } = spawnPlatformCommand('codex', ['app-server', '--stdio'], {
+      env,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+    const child = rawChild as ChildProcessWithoutNullStreams;
+    let stdout = '';
+    let settled = false;
+
+    const finish = (proof: DocumentedLeaderProof): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (!child.stdin.destroyed) child.stdin.end();
+      const cleanup = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }, 250);
+      cleanup.unref();
+      resolveProof(proof);
+    };
+    const write = (envelope: Record<string, unknown>): void => {
+      child.stdin.write(`${JSON.stringify(envelope)}\n`, 'utf8', (error) => {
+        if (error) finish(unsupported());
+      });
+    };
+    const timeout = setTimeout(() => finish(unsupported()), 3_000);
+
+    child.once('error', () => finish(unsupported()));
+    child.once('close', () => finish(unsupported()));
+    child.stderr.resume();
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+      if (stdout.length > 1_048_576) {
+        finish(unsupported());
+        return;
+      }
+      for (;;) {
+        const newline = stdout.indexOf('\n');
+        if (newline < 0) return;
+        const line = stdout.slice(0, newline).trim();
+        stdout = stdout.slice(newline + 1);
+        if (!line) continue;
+        let envelope: unknown;
+        try {
+          envelope = JSON.parse(line);
+        } catch {
+          finish(unsupported());
+          return;
+        }
+        if (!isRecord(envelope)) continue;
+        if (envelope.id === 1 && Object.hasOwn(envelope, 'result')) {
+          write({ method: 'initialized', params: {} });
+          write({
+            id: 2,
+            method: 'thread/read',
+            params: { threadId, includeTurns: false },
+          });
+          continue;
+        }
+        if (envelope.id !== 2) continue;
+        const result = isRecord(envelope.result) ? envelope.result : undefined;
+        const thread = result?.thread;
+        finish(isDocumentedRootThread(thread, threadId)
+          ? { ok: true, proof: CODEX_APP_SERVER_THREAD_TREE_PROOF }
+          : unsupported());
+        return;
+      }
+    });
+    child.once('spawn', () => {
+      write({
+        id: 1,
+        method: 'initialize',
+        params: {
+          clientInfo: {
+            name: 'omx-ralplan-preflight',
+            title: 'OMX Ralplan preflight',
+            version: '1.0.0',
+          },
+          capabilities: { experimentalApi: true },
+        },
+      });
+    });
+  });
+}
 
 function readCommand(payload: Record<string, unknown>): string | undefined {
   if (payload.tool_name !== 'Bash') return undefined;

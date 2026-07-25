@@ -27,10 +27,18 @@ Structural routing carriers are routing data, not authority. The unsupported bou
 
 ## Exact output contract
 
-The explicit `omx ralplan preflight --json` result is exactly:
+When documented app-server root proof is unavailable, the explicit
+`omx ralplan preflight --json` result is exactly:
 
 ```json
 {"ok":false,"reason":"unsupported_documented_leader_proof"}
+```
+
+When `thread/read` proves that the current thread id is also the session-tree
+id, `parentThreadId` is null, and the source is not a subagent, the result is:
+
+```json
+{"ok":true,"proof":"codex_app_server_thread_tree"}
 ```
 
 A canonical standalone `omx ralplan role-intent write --role <role> --parent-thread "$CODEX_THREAD_ID" --json` request for an installed role is denied by `PreToolUse` with exactly:
@@ -62,13 +70,13 @@ Failing closed only after the runtime surface identifies the adapted path is the
 
 ## Compatibility and migration
 
-Existing routing-capable callers continue to use explicit `agent_type` with an installed OMX role. Callers on role-routing-unavailable documented 0.144.5 surfaces run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`; they must use a Codex surface with documented root proof or a reviewed alternative workflow. There is no compatibility shim that turns old session/thread/pointer evidence into authority.
+Existing routing-capable callers continue to use explicit `agent_type` with an installed OMX role. Callers on role-routing-unavailable surfaces run `omx ralplan preflight --json`; documented app-server root threads may proceed, while unsupported or child surfaces stop on `unsupported_documented_leader_proof`. There is no compatibility shim that turns old session/thread/pointer evidence into authority.
 
 ## Consequences
 
-- Adapted Ralplan is unavailable when the native surface reports `role_routing_unavailable`.
+- Adapted Ralplan remains unavailable when neither native routing nor documented app-server root proof is available.
 - Direct role-intent writes fail deterministically with `unsupported_documented_leader_proof` for installed roles.
-- Keyword routing may seed ordinary Ralplan selection state before the model can inspect the native task schema; that state is not authority. The explicit preflight neutralizes it before returning failure, so it cannot drive HUD/runtime or Stop enforcement. The direct hook denial creates no role intent, adapted tracker authority, routing marker, or reviewer work.
+- Keyword routing may seed ordinary Ralplan selection state before the model can inspect the native task schema; that state is not authority. A failing preflight neutralizes it before returning failure, so it cannot drive HUD/runtime or Stop enforcement. The direct hook denial creates no role intent, adapted tracker authority, routing marker, or reviewer work.
 - Typed native role-routing guidance remains valid where `agent_type` is exposed; it is not disabled by hook-payload heuristics.
 
 ## Rollback

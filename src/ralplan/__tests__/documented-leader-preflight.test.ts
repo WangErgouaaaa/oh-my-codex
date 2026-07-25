@@ -4,6 +4,7 @@ import {
   UNKNOWN_RALPLAN_ROLE_PRE_TOOL_USE,
   UNSUPPORTED_DOCUMENTED_LEADER_PRE_TOOL_USE,
   evaluateCodex01445PreToolUse,
+  isDocumentedRootThread,
   parseCodex01445AdaptedRoleIntentCommand,
 } from '../documented-leader-preflight.js';
 
@@ -12,7 +13,23 @@ const posixCommand = (role: string) =>
 const windowsCommand = (role: string) =>
   `omx ralplan role-intent write --role ${role} --parent-thread "%CODEX_THREAD_ID%" --json`;
 
-describe('Codex 0.144.5 adapted role-intent preflight', () => {
+describe('documented Ralplan leader preflight', () => {
+  it('accepts only a root whose thread id is the documented session-tree id', () => {
+    const root = {
+      id: 'root-thread',
+      sessionId: 'root-thread',
+      parentThreadId: null,
+      source: 'cli',
+    };
+    assert.equal(isDocumentedRootThread(root, 'root-thread'), true);
+    assert.equal(isDocumentedRootThread({
+      ...root,
+      id: 'child-thread',
+      parentThreadId: 'root-thread',
+      source: { subAgent: 'threadSpawn' },
+    }, 'child-thread'), false);
+  });
+
   it('recognizes only the canonical standalone POSIX and Windows forms', () => {
     assert.deepEqual(parseCodex01445AdaptedRoleIntentCommand(posixCommand('architect'), 'linux'), { role: 'architect' });
     assert.deepEqual(parseCodex01445AdaptedRoleIntentCommand(windowsCommand('critic'), 'win32'), { role: 'critic' });
